@@ -99,7 +99,9 @@ function assertSafeLinkHref(label: string, href: string | null | undefined, cont
 
 function assertClosedFencedCodeBlock(label: string, token: Tokens.Code): void {
   if (token.codeBlockStyle === "indented") {
-    return;
+    throw new Error(
+      `Mintlify MDX safety violation in ${label}: indented code blocks are not supported in MDX; use fenced code blocks instead.`,
+    );
   }
   const rawLines = token.raw.replace(/\r?\n$/, "").split(/\r?\n/);
   const openMatch = FENCE_OPEN_RE.exec(rawLines[0] ?? "");
@@ -143,6 +145,11 @@ function inspectMarkdownTokens(label: string, tokens: Token[]): void {
       case "link":
       case "image": {
         const linkToken = token as Tokens.Link | Tokens.Image;
+        if (linkToken.type === "link" && linkToken.raw.startsWith("<")) {
+          throw new Error(
+            `Mintlify MDX safety violation in ${label}: unescaped "<" outside code span: ${linkToken.raw.trim()}`,
+          );
+        }
         assertSafeLinkHref(label, linkToken.href, linkToken.raw);
         if (Array.isArray(linkToken.tokens)) {
           inspectMarkdownTokens(label, linkToken.tokens);

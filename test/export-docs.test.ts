@@ -100,6 +100,7 @@ describe("docs-reference export", () => {
           "| {projectId}` | four |",
           "",
           "Escaped comparisons like values \\< 10 are also safe.",
+          "Explicit links like [Example](https://example.com) and bare URLs like https://example.com are safe.",
           "",
           "```json",
           '{ "id": "prj_123" }',
@@ -107,6 +108,14 @@ describe("docs-reference export", () => {
         ].join("\n"),
       ),
     ).not.toThrow();
+
+    expect(() =>
+      validateMintlifyMdxSafety("bad-autolink.md", "See <https://example.com>."),
+    ).toThrow(/unescaped "<"/);
+
+    expect(() =>
+      validateMintlifyMdxSafety("bad-indented-code.md", "Example:\n\n    {projectId"),
+    ).toThrow(/indented code blocks are not supported in MDX/);
 
     expect(() => validateMintlifyMdxSafety("bad-list-blocks.md", "- `one\n- {projectId}`")).toThrow(
       /unescaped curly brace/,
