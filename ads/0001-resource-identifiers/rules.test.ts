@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
@@ -52,34 +52,29 @@ function runRedoclyLint(
   stderr: string;
   report: RedoclyJsonReport;
 } {
-  try {
-    const stdout = execFileSync(
-      REDOCLY_BIN,
-      ["lint", specPath, "--config", configPath, "--format=json"],
-      {
-        cwd,
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "pipe"],
-      },
-    );
-    return {
-      exitCode: 0,
-      stderr: "",
-      report: JSON.parse(stdout) as RedoclyJsonReport,
-    };
-  } catch (error) {
-    const execError = error as { status?: number; stdout?: string; stderr?: string };
-    const stdout = execError.stdout ?? "";
-    const stderr = execError.stderr ?? "";
-    if (!stdout.trim()) {
-      throw new Error(`Redocly failed without JSON output (exit ${execError.status}): ${stderr}`);
-    }
-    return {
-      exitCode: execError.status ?? 1,
-      stderr,
-      report: JSON.parse(stdout) as RedoclyJsonReport,
-    };
+  const result = spawnSync(
+    REDOCLY_BIN,
+    ["lint", specPath, "--config", configPath, "--format=json"],
+    {
+      cwd,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  if (result.error) {
+    throw result.error;
   }
+  const stdout = result.stdout ?? "";
+  const stderr = result.stderr ?? "";
+  const exitCode = result.status ?? 1;
+  if (!stdout.trim()) {
+    throw new Error(`Redocly failed without JSON output (exit ${exitCode}): ${stderr}`);
+  }
+  return {
+    exitCode,
+    stderr,
+    report: JSON.parse(stdout) as RedoclyJsonReport,
+  };
 }
 
 async function lintOpenApi(doc: Record<string, unknown>, configPath?: string, cwd?: string) {
@@ -650,10 +645,12 @@ describe("ADS-0001 end-to-end Redocly CLI enforcement", () => {
     expect(messages.some((msg) => msg.includes("{tokenID}"))).toBe(true);
     expect(messages.some((msg) => msg.includes("{guid}"))).toBe(true);
 
-    // Confirm $ref PathItem reports the template violation at the route declaration key.
+    // Confirm $ref PathItem reports the template violation on the route declaration key itself.
     expect(
       namingErrors.some((problem) =>
-        problem.location?.some((loc) => loc.pointer === "#/paths/~1v1~1projects~1{id}"),
+        problem.location?.some(
+          (loc) => loc.pointer === "#/paths/~1v1~1projects~1{id}" && loc.reportOnKey === true,
+        ),
       ),
     ).toBe(true);
 
@@ -1094,5 +1091,312 @@ describe("ADS-0001 end-to-end Redocly CLI enforcement", () => {
       ),
     );
     expect(projectReports).toHaveLength(1);
+  });
+
+  it("handles composed mixins, property-free union branches, large unions, percent-bearing pointers, and deep allOf DAGs", async () => {
+    const thirtyThreeVariants: Record<string, unknown>[] = [];
+    for (let index = 0; index < 32; index += 1) {
+      thirtyThreeVariants.push({
+        type: "object",
+        properties: {
+          id: { type: "string" },
+          variantIndex: { type: "integer", const: index },
+        },
+      });
+    }
+    thirtyThreeVariants.push({
+      type: "object",
+      properties: {
+        channelId: { type: "string" },
+        kind: { type: "string" },
+      },
+    });
+
+    const diamondSchemas: Record<string, unknown> = {
+      DiamondLeaf: {
+        type: "object",
+        properties: {
+          createdAt: { type: "string" },
+        },
+      },
+    };
+    for (let level = 1; level <= 24; level += 1) {
+      const prevA = level === 1 ? "DiamondLeaf" : `DiamondL${level - 1}A`;
+      const prevB = level === 1 ? "DiamondLeaf" : `DiamondL${level - 1}B`;
+      diamondSchemas[`DiamondL${level}A`] = {
+        allOf: [
+          { $ref: `#/components/schemas/${prevA}` },
+          { $ref: `#/components/schemas/${prevB}` },
+        ],
+      };
+      diamondSchemas[`DiamondL${level}B`] = {
+        allOf: [
+          { $ref: `#/components/schemas/${prevA}` },
+          { $ref: `#/components/schemas/${prevB}` },
+        ],
+      };
+    }
+
+    const { exitCode, report } = await lintOpenApi(
+      baseOpenApi({
+        paths: {
+          "/v1/snapshots/{projectId}": {
+            parameters: [
+              {
+                name: "projectId",
+                in: "path",
+                required: true,
+                description: "Project ID",
+                schema: { type: "string" },
+              },
+            ],
+            get: {
+              operationId: "getProjectSnapshot",
+              summary: "Get project snapshot composing a Status base",
+              responses: {
+                "200": {
+                  description: "OK",
+                  content: {
+                    "application/json": {
+                      schema: { $ref: "#/components/schemas/ProjectSnapshot" },
+                    },
+                  },
+                },
+                "404": { description: "Not found" },
+              },
+            },
+          },
+          "/v1/audited/{accountId}": {
+            parameters: [
+              {
+                name: "accountId",
+                in: "path",
+                required: true,
+                description: "Account ID",
+                schema: { type: "string" },
+              },
+            ],
+            get: {
+              operationId: "getAuditedAccount",
+              summary: "Inline resource with AuditMetadata mixin",
+              responses: {
+                "200": {
+                  description: "OK",
+                  content: {
+                    "application/json": {
+                      schema: {
+                        type: "object",
+                        properties: {
+                          accountId: { type: "string" },
+                        },
+                        allOf: [{ $ref: "#/components/schemas/AuditMetadata" }],
+                      },
+                    },
+                  },
+                },
+                "404": { description: "Not found" },
+              },
+            },
+          },
+          "/v1/constrained/{sessionId}": {
+            parameters: [
+              {
+                name: "sessionId",
+                in: "path",
+                required: true,
+                description: "Session ID",
+                schema: { type: "string" },
+              },
+            ],
+            get: {
+              operationId: "getConstrainedSession",
+              summary: "Object with property-free oneOf branch forbidding id",
+              responses: {
+                "200": {
+                  description: "OK",
+                  content: {
+                    "application/json": {
+                      schema: {
+                        type: "object",
+                        properties: {
+                          sessionId: { type: "string" },
+                        },
+                        oneOf: [
+                          {
+                            properties: { id: { type: "string" } },
+                            required: ["id"],
+                          },
+                          {
+                            not: { required: ["id"] },
+                          },
+                        ],
+                      },
+                    },
+                  },
+                },
+                "404": { description: "Not found" },
+              },
+            },
+          },
+          "/v1/channels/{channelId}": {
+            parameters: [
+              {
+                name: "channelId",
+                in: "path",
+                required: true,
+                description: "Channel ID",
+                schema: { type: "string" },
+              },
+            ],
+            get: {
+              operationId: "getChannel",
+              summary: "Union with 33 alternatives where the last violates ADS-0001",
+              responses: {
+                "200": {
+                  description: "OK",
+                  content: {
+                    "application/json": {
+                      schema: {
+                        oneOf: thirtyThreeVariants,
+                      },
+                    },
+                  },
+                },
+                "404": { description: "Not found" },
+              },
+            },
+          },
+          "/v1/diamonds/{diamondId}": {
+            parameters: [
+              {
+                name: "diamondId",
+                in: "path",
+                required: true,
+                description: "Diamond ID",
+                schema: { type: "string" },
+              },
+            ],
+            get: {
+              operationId: "getDiamond",
+              summary: "Deep shared allOf DAG",
+              responses: {
+                "200": {
+                  description: "OK",
+                  content: {
+                    "application/json": {
+                      schema: {
+                        allOf: [
+                          { $ref: "#/components/schemas/DiamondL24A" },
+                          {
+                            type: "object",
+                            properties: {
+                              diamondId: { type: "string" },
+                            },
+                          },
+                        ],
+                      },
+                    },
+                  },
+                },
+                "404": { description: "Not found" },
+              },
+            },
+          },
+          "/v1/prices/{priceId}": {
+            parameters: [
+              {
+                name: "priceId",
+                in: "path",
+                required: true,
+                description: "Price ID",
+                schema: { type: "string" },
+              },
+            ],
+            get: {
+              operationId: "getPrice",
+              summary: "Schema pointer containing literal percent character",
+              responses: {
+                "200": {
+                  description: "OK",
+                  content: {
+                    "application/json": {
+                      schema: { $ref: "#/components/schemas/Price%" },
+                    },
+                  },
+                },
+                "404": { description: "Not found" },
+              },
+            },
+          },
+        },
+        components: {
+          schemas: {
+            ...diamondSchemas,
+            ProjectStatus: {
+              type: "object",
+              properties: {
+                state: { type: "string" },
+              },
+            },
+            ProjectSnapshot: {
+              allOf: [
+                { $ref: "#/components/schemas/ProjectStatus" },
+                {
+                  type: "object",
+                  properties: {
+                    projectId: { type: "string" },
+                  },
+                },
+              ],
+            },
+            AuditMetadata: {
+              type: "object",
+              properties: {
+                createdAt: { type: "string" },
+              },
+            },
+            "Price%": {
+              type: "object",
+              properties: {
+                id: { type: "string" },
+                amountCents: { type: "integer" },
+              },
+            },
+          },
+        },
+      }),
+    );
+
+    expect(exitCode).toBe(1);
+    const primaryIdErrors = adsProblems(report).filter(
+      (problem) => problem.ruleId === "photon-ads/ads-0001-resource-primary-id",
+    );
+    const messages = primaryIdErrors.map((problem) => problem.message);
+
+    expect(
+      messages.some(
+        (msg) => msg.includes("/v1/snapshots/{projectId}") && msg.includes('"projectId"'),
+      ),
+    ).toBe(true);
+    expect(
+      messages.some(
+        (msg) => msg.includes("/v1/audited/{accountId}") && msg.includes('"accountId"'),
+      ),
+    ).toBe(true);
+    expect(
+      messages.some(
+        (msg) => msg.includes("/v1/constrained/{sessionId}") && msg.includes('"sessionId"'),
+      ),
+    ).toBe(true);
+    expect(
+      messages.some(
+        (msg) => msg.includes("/v1/channels/{channelId}") && msg.includes('"channelId"'),
+      ),
+    ).toBe(true);
+    expect(
+      messages.some(
+        (msg) => msg.includes("/v1/diamonds/{diamondId}") && msg.includes('"diamondId"'),
+      ),
+    ).toBe(true);
   });
 });

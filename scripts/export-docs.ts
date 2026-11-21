@@ -85,10 +85,15 @@ export function stripFrontmatterAndH1(markdown: string): {
   return { frontmatter, body: withoutH1 };
 }
 
+const BLOCKQUOTE_PREFIX_RE = /^((?:\s{0,3}>\s?)*)(.*)$/;
+const SINGLE_LINE_BLOCK_RE =
+  /^\s{0,3}(?:#{1,6}(?:\s|$)|(?:(?:\*\s*){3,}|(?:-\s*){3,}|(?:_\s*){3,})$|(?:=+|-+)\s*$|\|)/;
+const LIST_ITEM_START_RE = /^\s*(?:[-*+]|\d{1,9}[.)])(?:\s|$)/;
+
 /**
  * Strips fenced code blocks and inline code spans (including spans wrapped
- * across line breaks within a paragraph) while preserving line numbers so MDX
- * syntax validation inspects only prose and Markdown table text.
+ * across line breaks within a single Markdown block) while preserving line
+ * numbers so MDX syntax validation inspects only prose and Markdown table text.
  */
 function stripCodeFromMarkdown(markdown: string): string {
   const lines = markdown.split(/\r?\n/);
@@ -118,29 +123,49 @@ function stripCodeFromMarkdown(markdown: string): string {
 
   assertCondition(activeFence === null, "Unclosed fenced code block in Markdown document.");
 
-  // Strip inline code spans paragraph by paragraph (CommonMark code spans can
-  // cross single line breaks, but never blank lines).
+  // Strip inline code spans block by block (CommonMark code spans can cross
+  // line breaks within one paragraph/list-item block, never across block boundaries).
   const resultLines: string[] = [];
-  let paragraph: string[] = [];
+  let block: string[] = [];
+  let blockQuoteDepth = 0;
 
-  const flushParagraph = (): void => {
-    if (paragraph.length === 0) {
+  const flushBlock = (): void => {
+    if (block.length === 0) {
       return;
     }
-    const stripped = stripInlineCodeSpans(paragraph.join("\n"));
+    const stripped = stripInlineCodeSpans(block.join("\n"));
     resultLines.push(...stripped.split("\n"));
-    paragraph = [];
+    block = [];
   };
 
   for (const line of withoutFences) {
-    if (line.trim().length === 0) {
-      flushParagraph();
+    const quoteMatch = BLOCKQUOTE_PREFIX_RE.exec(line);
+    const quotePrefix = quoteMatch?.[1] ?? "";
+    const inner = quoteMatch?.[2] ?? line;
+    const quoteDepth = (quotePrefix.match(/>/g) ?? []).length;
+
+    if (inner.trim().length === 0) {
+      flushBlock();
       resultLines.push("");
-    } else {
-      paragraph.push(line);
+      blockQuoteDepth = 0;
+      continue;
     }
+
+    if (SINGLE_LINE_BLOCK_RE.test(inner)) {
+      flushBlock();
+      resultLines.push(stripInlineCodeSpans(line));
+      blockQuoteDepth = 0;
+      continue;
+    }
+
+    if (block.length > 0 && (quoteDepth !== blockQuoteDepth || LIST_ITEM_START_RE.test(inner))) {
+      flushBlock();
+    }
+
+    blockQuoteDepth = quoteDepth;
+    block.push(line);
   }
-  flushParagraph();
+  flushBlock();
 
   return resultLines.join("\n");
 }

@@ -65,7 +65,7 @@ ads/
 
 ## Running Checks Locally
 
-Requires Node.js 22+ (CI runs Node 24) and pnpm:
+Requires Node.js 22.12+ (CI runs Node 24) and pnpm:
 
 ```bash
 pnpm install

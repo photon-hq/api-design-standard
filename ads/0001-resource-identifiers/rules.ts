@@ -45,8 +45,7 @@ const FULL_PARAM_SEGMENT_RE = /^\{([^}]+)\}$/;
 const CUSTOM_METHOD_PARAM_SEGMENT_RE = /^\{([^}]+)\}:([a-zA-Z0-9_-]+)$/;
 const LEAF_ID_PARAM_RE = /\/\{([a-z][a-zA-Z0-9]*Id)\}$/;
 const JSON_MEDIA_TYPE_RE = /^application\/(?!problem\+json)(?:[^;]+\+)?json\b/i;
-const COMPONENT_SCHEMA_POINTER_RE = /^#\/components\/schemas\/([^/]+)$/;
-const MAX_SCHEMA_VARIANTS = 32;
+const COMPONENT_SCHEMA_POINTER_RE = /#\/components\/schemas\/([^/]+)$/;
 
 const NON_RESOURCE_SCHEMA_SUFFIXES = [
   "Request",
@@ -229,12 +228,31 @@ function isNonResourceSummarySchemaName(schemaName: string): boolean {
   );
 }
 
-function extractComponentSchemaNameFromPointer(pointer?: string): string | null {
+function unescapeJsonPointerToken(token: string): string {
+  return token.replaceAll("~1", "/").replaceAll("~0", "~");
+}
+
+function extractComponentSchemaNameFromLocation(pointer?: string): string | null {
   if (!pointer) {
     return null;
   }
   const match = COMPONENT_SCHEMA_POINTER_RE.exec(pointer);
-  return match?.[1] ? decodeURIComponent(match[1]) : null;
+  return match?.[1] ? unescapeJsonPointerToken(match[1]) : null;
+}
+
+function extractComponentSchemaNameFromRef(ref?: string): string | null {
+  if (!ref) {
+    return null;
+  }
+  const match = COMPONENT_SCHEMA_POINTER_RE.exec(ref);
+  if (!match?.[1]) {
+    return null;
+  }
+  try {
+    return unescapeJsonPointerToken(decodeURIComponent(match[1]));
+  } catch {
+    return unescapeJsonPointerToken(match[1]);
+  }
 }
 
 export function deriveResourceStem(schemaName: string): string {
@@ -251,10 +269,30 @@ interface CollectedProperty {
   location?: RedoclyLocation;
 }
 
-interface CollectedObjectSchema {
+type WrapperState =
+  | { kind: "none" }
+  | { kind: "single"; key: string; props: CollectedProperty[] }
+  | { kind: "multi" };
+
+interface CollectedVariant {
   isObjectLike: boolean;
-  properties: Map<string, CollectedProperty>;
-  schemaNames: Set<string>;
+  isExemptSummary: boolean;
+  hasId: boolean;
+  matchedTarget?: {
+    name: string;
+    location?: RedoclyLocation;
+  };
+  wrapper: WrapperState;
+}
+
+interface CollectVariantsResult {
+  variants: CollectedVariant[];
+  hitCycle: boolean;
+}
+
+interface CollectVariantsOptions {
+  matchTarget: (propName: string) => boolean;
+  trackWrapper: boolean;
 }
 
 type ResolverFn = RedoclyUserContext["resolve"];
@@ -278,146 +316,339 @@ function safeResolve(
   }
 }
 
-function isNullTypeSchema(node: unknown): boolean {
-  return isRecord(node) && node.type === "null";
+function isExplicitlyNonObjectSchema(node: unknown): boolean {
+  if (!isRecord(node)) {
+    return false;
+  }
+  if (typeof node.type === "string") {
+    return node.type !== "object";
+  }
+  if (Array.isArray(node.type)) {
+    return !node.type.includes("object");
+  }
+  return false;
 }
 
-function mergeCollectedObjects(
-  base: CollectedObjectSchema,
-  addition: CollectedObjectSchema,
-): CollectedObjectSchema {
-  const properties = new Map(base.properties);
-  for (const [key, value] of addition.properties.entries()) {
-    properties.set(key, value);
+function mergeWrapperState(base: WrapperState, addition: WrapperState): WrapperState {
+  if (base.kind === "none") {
+    return addition;
   }
-  const schemaNames = new Set(base.schemaNames);
-  for (const name of addition.schemaNames) {
-    schemaNames.add(name);
+  if (addition.kind === "none") {
+    return base;
   }
+  if (base.kind === "multi" || addition.kind === "multi") {
+    return { kind: "multi" };
+  }
+  if (base.key !== addition.key) {
+    return { kind: "multi" };
+  }
+  const mergedProps = [...base.props];
+  for (const prop of addition.props) {
+    if (!mergedProps.some((existing) => existing.schema === prop.schema)) {
+      mergedProps.push(prop);
+    }
+  }
+  return { kind: "single", key: base.key, props: mergedProps };
+}
+
+function mergeCollectedVariants(
+  base: CollectedVariant,
+  addition: CollectedVariant,
+  inheritExemption: boolean,
+  trackWrapper: boolean,
+): CollectedVariant {
+  const isObjectLike = base.isObjectLike || addition.isObjectLike;
+  const isExemptSummary = inheritExemption
+    ? base.isExemptSummary || addition.isExemptSummary
+    : base.isExemptSummary;
+  const hasId = base.hasId || addition.hasId;
+  const matchedTarget = base.matchedTarget ?? addition.matchedTarget;
+  const wrapper: WrapperState =
+    !trackWrapper || isExemptSummary || hasId || matchedTarget
+      ? { kind: "multi" }
+      : mergeWrapperState(base.wrapper, addition.wrapper);
+
   return {
-    isObjectLike: base.isObjectLike || addition.isObjectLike,
-    properties,
-    schemaNames,
+    isObjectLike,
+    isExemptSummary,
+    hasId,
+    ...(matchedTarget ? { matchedTarget } : {}),
+    wrapper,
   };
 }
 
 function collectObjectVariants(
   schema: unknown,
   resolve: ResolverFn,
+  options: CollectVariantsOptions,
   baseLocation?: RedoclyLocation,
-  seen: ReadonlySet<unknown> = new Set(),
-  followRef = true,
-): CollectedObjectSchema[] {
-  if (!isRecord(schema) || seen.has(schema)) {
-    return [];
-  }
+): CollectedVariant[] {
+  const memo = new Map<object, Map<string, CollectVariantsResult>>();
+  const objectIds = new WeakMap<object, number>();
+  let nextObjectId = 1;
 
-  const nextSeen = new Set(seen);
-  nextSeen.add(schema);
-
-  const initialSchemaNames = new Set<string>();
-  const directSchemaName = extractComponentSchemaNameFromPointer(baseLocation?.pointer);
-  if (directSchemaName) {
-    initialSchemaNames.add(directSchemaName);
-  }
-  if (typeof schema.$ref === "string") {
-    const refSchemaName = extractComponentSchemaNameFromPointer(schema.$ref);
-    if (refSchemaName) {
-      initialSchemaNames.add(refSchemaName);
+  const getObjectId = (value: unknown): string => {
+    if (typeof value !== "object" || value === null) {
+      return String(value);
     }
-  }
-
-  let variants: CollectedObjectSchema[] = [
-    { isObjectLike: false, properties: new Map(), schemaNames: initialSchemaNames },
-  ];
-
-  const combineVariants = (incoming: CollectedObjectSchema[]): void => {
-    if (incoming.length === 0) {
-      return;
+    const existing = objectIds.get(value);
+    if (existing !== undefined) {
+      return String(existing);
     }
-    const next: CollectedObjectSchema[] = [];
-    for (const current of variants) {
-      for (const part of incoming) {
-        next.push(mergeCollectedObjects(current, part));
-        if (next.length >= MAX_SCHEMA_VARIANTS) {
-          variants = next;
-          return;
-        }
-      }
-    }
-    variants = next;
+    const id = nextObjectId;
+    nextObjectId += 1;
+    objectIds.set(value, id);
+    return String(id);
   };
 
-  if (followRef && typeof schema.$ref === "string") {
-    const resolved = safeResolve(resolve, schema, baseLocation?.source?.absoluteRef);
-    if (resolved) {
-      if (resolved.node) {
-        combineVariants(collectObjectVariants(resolved.node, resolve, resolved.location, nextSeen));
+  const variantSignature = (variant: CollectedVariant): string => {
+    const objFlag = variant.isObjectLike ? "1" : "0";
+    if (variant.isExemptSummary) {
+      return `exempt:${objFlag}`;
+    }
+    if (variant.hasId) {
+      return `id:${objFlag}`;
+    }
+    if (variant.matchedTarget) {
+      const targetLoc = variant.matchedTarget.location
+        ? locationKey(variant.matchedTarget.location)
+        : "";
+      return `target:${objFlag}:${variant.matchedTarget.name}:${targetLoc}`;
+    }
+    if (!options.trackWrapper) {
+      return `plain:${objFlag}`;
+    }
+    if (variant.wrapper.kind === "single") {
+      const propIds = variant.wrapper.props.map((prop) => getObjectId(prop.schema)).join(",");
+      return `single:${objFlag}:${variant.wrapper.key}:${propIds}`;
+    }
+    return `plain:${objFlag}:${variant.wrapper.kind}`;
+  };
+
+  const dedupeVariants = (list: CollectedVariant[]): CollectedVariant[] => {
+    const bySignature = new Map<string, CollectedVariant>();
+    for (const variant of list) {
+      const sig = variantSignature(variant);
+      if (!bySignature.has(sig)) {
+        bySignature.set(sig, variant);
       }
-      for (const hop of resolved.chain ?? []) {
-        if (isRecord(hop.node)) {
-          combineVariants(collectObjectVariants(hop.node, resolve, hop.location, nextSeen, false));
+    }
+    return [...bySignature.values()];
+  };
+
+  const combineVariantSets = (
+    currentSet: CollectedVariant[],
+    incomingSet: CollectedVariant[],
+    inheritExemption: boolean,
+  ): CollectedVariant[] => {
+    if (incomingSet.length === 0) {
+      return currentSet;
+    }
+    const combined: CollectedVariant[] = [];
+    for (const current of currentSet) {
+      for (const incoming of incomingSet) {
+        combined.push(
+          mergeCollectedVariants(current, incoming, inheritExemption, options.trackWrapper),
+        );
+      }
+    }
+    return dedupeVariants(combined);
+  };
+
+  const visit = (
+    node: unknown,
+    location: RedoclyLocation | undefined,
+    seen: ReadonlySet<unknown>,
+    followRef: boolean,
+  ): CollectVariantsResult => {
+    if (!isRecord(node)) {
+      return { variants: [], hitCycle: false };
+    }
+    if (isExplicitlyNonObjectSchema(node)) {
+      return { variants: [], hitCycle: false };
+    }
+    if (seen.has(node)) {
+      return { variants: [], hitCycle: true };
+    }
+
+    const cacheKey = `${followRef ? 1 : 0}:${location?.source?.absoluteRef ?? ""}#${location?.pointer ?? ""}`;
+    const nodeCache = memo.get(node);
+    const cached = nodeCache?.get(cacheKey);
+    if (cached) {
+      return cached;
+    }
+
+    const nextSeen = new Set(seen);
+    nextSeen.add(node);
+
+    const ownSchemaName =
+      extractComponentSchemaNameFromLocation(location?.pointer) ??
+      (typeof node.$ref === "string" ? extractComponentSchemaNameFromRef(node.$ref) : null);
+    const isOwnExemptSummary =
+      ownSchemaName !== null && isNonResourceSummarySchemaName(ownSchemaName);
+    const isPureUnion =
+      ownSchemaName === null &&
+      typeof node.$ref !== "string" &&
+      !Array.isArray(node.allOf) &&
+      !isRecord(node.properties) &&
+      node.type === undefined;
+
+    let hitCycle = false;
+    let variants: CollectedVariant[] = [
+      {
+        isObjectLike: false,
+        isExemptSummary: isOwnExemptSummary,
+        hasId: false,
+        wrapper: { kind: "none" },
+      },
+    ];
+
+    if (followRef && typeof node.$ref === "string") {
+      const resolved = safeResolve(resolve, node, location?.source?.absoluteRef);
+      if (resolved) {
+        if (resolved.node) {
+          const targetResult = visit(resolved.node, resolved.location, nextSeen, true);
+          if (targetResult.hitCycle) {
+            hitCycle = true;
+          }
+          if (targetResult.variants.length === 0 && !targetResult.hitCycle) {
+            variants = [];
+          } else {
+            variants = combineVariantSets(variants, targetResult.variants, false);
+          }
+        }
+        for (const hop of resolved.chain ?? []) {
+          if (
+            variants.length === 0 ||
+            !isRecord(hop.node) ||
+            hop.node === node ||
+            hop.node === resolved.node
+          ) {
+            continue;
+          }
+          const hopResult = visit(hop.node, hop.location, nextSeen, false);
+          if (hopResult.hitCycle) {
+            hitCycle = true;
+          }
+          if (hopResult.variants.length === 0 && !hopResult.hitCycle) {
+            variants = [];
+          } else {
+            variants = combineVariantSets(variants, hopResult.variants, false);
+          }
         }
       }
     }
-  }
 
-  if (Array.isArray(schema.allOf)) {
-    for (const [index, branch] of schema.allOf.entries()) {
-      combineVariants(
-        collectObjectVariants(branch, resolve, baseLocation?.child(["allOf", index]), nextSeen),
-      );
-    }
-  }
-
-  const directProps = new Map<string, CollectedProperty>();
-  let directObjectLike =
-    schema.type === "object" || (Array.isArray(schema.type) && schema.type.includes("object"));
-
-  if (isRecord(schema.properties)) {
-    directObjectLike = true;
-    for (const [propName, propSchema] of Object.entries(schema.properties)) {
-      const propLocation = baseLocation?.child(["properties", propName]);
-      directProps.set(propName, {
-        schema: propSchema,
-        ...(propLocation ? { location: propLocation } : {}),
-      });
-    }
-  }
-
-  if (directObjectLike || directProps.size > 0) {
-    combineVariants([
-      {
-        isObjectLike: directObjectLike,
-        properties: directProps,
-        schemaNames: new Set(),
-      },
-    ]);
-  }
-
-  for (const unionKey of ["oneOf", "anyOf"] as const) {
-    const branches = schema[unionKey];
-    if (!Array.isArray(branches) || branches.length === 0) {
-      continue;
-    }
-    const branchVariants: CollectedObjectSchema[] = [];
-    for (const [index, branch] of branches.entries()) {
-      if (isNullTypeSchema(branch)) {
-        continue;
-      }
-      branchVariants.push(
-        ...collectObjectVariants(branch, resolve, baseLocation?.child([unionKey, index]), nextSeen),
-      );
-      if (branchVariants.length >= MAX_SCHEMA_VARIANTS) {
-        break;
+    if (variants.length > 0 && Array.isArray(node.allOf)) {
+      for (const [index, branch] of node.allOf.entries()) {
+        const branchResult = visit(branch, location?.child(["allOf", index]), nextSeen, true);
+        if (branchResult.hitCycle) {
+          hitCycle = true;
+        }
+        if (branchResult.variants.length === 0 && !branchResult.hitCycle) {
+          variants = [];
+          break;
+        }
+        variants = combineVariantSets(variants, branchResult.variants, false);
       }
     }
-    if (branchVariants.length > 0) {
-      combineVariants(branchVariants);
-    }
-  }
 
-  return variants.filter((variant) => variant.isObjectLike || variant.properties.size > 0);
+    if (variants.length > 0) {
+      let directObjectLike =
+        node.type === "object" || (Array.isArray(node.type) && node.type.includes("object"));
+      let directHasId = false;
+      let directMatchedTarget: { name: string; location?: RedoclyLocation } | undefined;
+      let directWrapper: WrapperState = { kind: "none" };
+
+      if (isRecord(node.properties)) {
+        directObjectLike = true;
+        const propEntries = Object.entries(node.properties);
+        for (const [propName, propSchema] of propEntries) {
+          const propLocation = location?.child(["properties", propName]);
+          if (propName === "id") {
+            directHasId = true;
+          } else if (!directMatchedTarget && options.matchTarget(propName)) {
+            directMatchedTarget = {
+              name: propName,
+              ...(propLocation ? { location: propLocation } : {}),
+            };
+          }
+          if (options.trackWrapper) {
+            directWrapper = mergeWrapperState(directWrapper, {
+              kind: "single",
+              key: propName,
+              props: [
+                {
+                  schema: propSchema,
+                  ...(propLocation ? { location: propLocation } : {}),
+                },
+              ],
+            });
+          }
+        }
+      }
+
+      if (directObjectLike || directHasId || directMatchedTarget || directWrapper.kind !== "none") {
+        variants = combineVariantSets(
+          variants,
+          [
+            {
+              isObjectLike: directObjectLike,
+              isExemptSummary: false,
+              hasId: directHasId,
+              ...(directMatchedTarget ? { matchedTarget: directMatchedTarget } : {}),
+              wrapper: directWrapper,
+            },
+          ],
+          false,
+        );
+      }
+    }
+
+    if (variants.length > 0) {
+      for (const unionKey of ["oneOf", "anyOf"] as const) {
+        const branches = node[unionKey];
+        if (!Array.isArray(branches) || branches.length === 0) {
+          continue;
+        }
+        const branchVariants: CollectedVariant[] = [];
+        let hasObjectCompatibleBranch = false;
+        for (const [index, branch] of branches.entries()) {
+          if (isExplicitlyNonObjectSchema(branch)) {
+            continue;
+          }
+          hasObjectCompatibleBranch = true;
+          const branchResult = visit(branch, location?.child([unionKey, index]), nextSeen, true);
+          if (branchResult.hitCycle) {
+            hitCycle = true;
+          }
+          branchVariants.push(...branchResult.variants);
+        }
+        if (!hasObjectCompatibleBranch) {
+          variants = [];
+          break;
+        }
+        if (branchVariants.length > 0) {
+          variants = combineVariantSets(variants, dedupeVariants(branchVariants), isPureUnion);
+        }
+      }
+    }
+
+    const result: CollectVariantsResult = { variants, hitCycle };
+    if (!hitCycle) {
+      let existingCache = memo.get(node);
+      if (!existingCache) {
+        existingCache = new Map();
+        memo.set(node, existingCache);
+      }
+      existingCache.set(cacheKey, result);
+    }
+    return result;
+  };
+
+  return visit(schema, baseLocation, new Set(), true).variants.filter(
+    (variant) => variant.isObjectLike,
+  );
 }
 
 export const ads0001PathParamNaming: RedoclyOas3Rule = () => {
@@ -607,29 +838,32 @@ export const ads0001ResourcePrimaryId: RedoclyOas3Rule = () => {
               continue;
             }
             const schemaLocation = ctx.location.child(["components", "schemas", schemaName]);
-            const variants = collectObjectVariants(rawSchema, ctx.resolve, schemaLocation);
             const normalizedStem = stem.toLowerCase();
-
-            for (const variant of variants) {
-              if (!variant.isObjectLike || variant.properties.has("id")) {
-                continue;
-              }
-              for (const [propName, propEntry] of variant.properties.entries()) {
-                if (
+            const variants = collectObjectVariants(
+              rawSchema,
+              ctx.resolve,
+              {
+                matchTarget: (propName) =>
                   propName.length > 2 &&
                   propName.endsWith("Id") &&
-                  propName.slice(0, -2).toLowerCase() === normalizedStem
-                ) {
-                  const reportLocation = propEntry.location
-                    ? propEntry.location.key()
-                    : schemaLocation.key();
-                  reportPrimaryIdOnce(
-                    ctx,
-                    reportLocation,
-                    `Resource schema "${schemaName}" defines resource-prefixed identifier "${propName}" without "id". Resource objects must use "id" as their primary identifier field (ADS-0001).`,
-                  );
-                }
+                  propName.slice(0, -2).toLowerCase() === normalizedStem,
+                trackWrapper: false,
+              },
+              schemaLocation,
+            );
+
+            for (const variant of variants) {
+              if (!variant.isObjectLike || variant.hasId || !variant.matchedTarget) {
+                continue;
               }
+              const reportLocation = variant.matchedTarget.location
+                ? variant.matchedTarget.location.key()
+                : schemaLocation.key();
+              reportPrimaryIdOnce(
+                ctx,
+                reportLocation,
+                `Resource schema "${schemaName}" defines resource-prefixed identifier "${variant.matchedTarget.name}" without "id". Resource objects must use "id" as their primary identifier field (ADS-0001).`,
+              );
             }
           }
         }
@@ -719,24 +953,21 @@ export const ads0001ResourcePrimaryId: RedoclyOas3Rule = () => {
             }
 
             const schemaLocation = responseLocation.child(["content", mediaType, "schema"]);
-            const topVariants = collectObjectVariants(mediaObj.schema, ctx.resolve, schemaLocation);
+            const topVariants = collectObjectVariants(
+              mediaObj.schema,
+              ctx.resolve,
+              { matchTarget: (propName) => propName === leafParam, trackWrapper: true },
+              schemaLocation,
+            );
 
             for (const top of topVariants) {
-              if (!top.isObjectLike) {
-                continue;
-              }
-              if (
-                [...top.schemaNames].some((schemaName) =>
-                  isNonResourceSummarySchemaName(schemaName),
-                )
-              ) {
+              if (!top.isObjectLike || top.isExemptSummary || top.hasId) {
                 continue;
               }
 
-              if (!top.properties.has("id") && top.properties.has(leafParam)) {
-                const propEntry = top.properties.get(leafParam);
-                const reportLocation = propEntry?.location
-                  ? propEntry.location.key()
+              if (top.matchedTarget) {
+                const reportLocation = top.matchedTarget.location
+                  ? top.matchedTarget.location.key()
                   : schemaLocation.key();
                 reportPrimaryIdOnce(
                   ctx,
@@ -746,31 +977,38 @@ export const ads0001ResourcePrimaryId: RedoclyOas3Rule = () => {
                 continue;
               }
 
-              if (!top.properties.has("id") && top.properties.size === 1) {
-                const entry = [...top.properties.entries()][0];
-                if (!entry) {
-                  continue;
+              if (top.wrapper.kind === "single") {
+                const wrapperKey = top.wrapper.key;
+                let innerVariants: CollectedVariant[] = [];
+                for (const wrapperProp of top.wrapper.props) {
+                  const partVariants = collectObjectVariants(
+                    wrapperProp.schema,
+                    ctx.resolve,
+                    { matchTarget: (propName) => propName === leafParam, trackWrapper: false },
+                    wrapperProp.location,
+                  );
+                  if (innerVariants.length === 0) {
+                    innerVariants = partVariants;
+                  } else if (partVariants.length > 0) {
+                    const combined: CollectedVariant[] = [];
+                    for (const current of innerVariants) {
+                      for (const part of partVariants) {
+                        combined.push(mergeCollectedVariants(current, part, false, false));
+                      }
+                    }
+                    innerVariants = combined;
+                  }
                 }
-                const [wrapperKey, wrapperProp] = entry;
-                const innerVariants = collectObjectVariants(
-                  wrapperProp.schema,
-                  ctx.resolve,
-                  wrapperProp.location,
-                );
+                const fallbackLocation =
+                  top.wrapper.props[0]?.location?.key() ?? schemaLocation.key();
                 for (const inner of innerVariants) {
-                  if (
-                    !inner.isObjectLike ||
-                    [...inner.schemaNames].some((schemaName) =>
-                      isNonResourceSummarySchemaName(schemaName),
-                    )
-                  ) {
+                  if (!inner.isObjectLike || inner.isExemptSummary || inner.hasId) {
                     continue;
                   }
-                  if (!inner.properties.has("id") && inner.properties.has(leafParam)) {
-                    const innerProp = inner.properties.get(leafParam);
-                    const reportLocation = innerProp?.location
-                      ? innerProp.location.key()
-                      : (wrapperProp.location?.key() ?? schemaLocation.key());
+                  if (inner.matchedTarget) {
+                    const reportLocation = inner.matchedTarget.location
+                      ? inner.matchedTarget.location.key()
+                      : fallbackLocation;
                     reportPrimaryIdOnce(
                       ctx,
                       reportLocation,

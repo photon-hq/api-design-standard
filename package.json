@@ -5,7 +5,7 @@
   "license": "Apache-2.0",
   "type": "module",
   "engines": {
-    "node": ">=22"
+    "node": ">=22.12.0"
   },
   "packageManager": "pnpm@12.11.2",
   "repository": {
@@ -58,7 +58,7 @@
     "check": "pnpm typecheck && pnpm lint && pnpm build && pnpm test && redocly lint test/fixtures/valid-openapi.yaml --config redocly.yaml && pnpm docs:export && pnpm check:public"
   },
   "peerDependencies": {
-    "@redocly/cli": "^2.0.0"
+    "@redocly/cli": "^2.72.1"
   },
   "peerDependenciesMeta": {
     "@redocly/cli": {

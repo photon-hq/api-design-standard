@@ -90,6 +90,8 @@ describe("docs-reference export", () => {
           "Use `{projectId}` and `<resource>Id` inside inline code.",
           "Wrapped spans like `/v1/projects/{",
           "projectId}` across a single line break are valid CommonMark.",
+          "- Wrapped spans inside a single list item like `/v1/projects/{",
+          "  projectId}` are also valid.",
           "Escaped comparisons like values \\< 10 are also safe.",
           "",
           "```json",
@@ -98,6 +100,14 @@ describe("docs-reference export", () => {
         ].join("\n"),
       ),
     ).not.toThrow();
+
+    expect(() => validateMintlifyMdxSafety("bad-list-blocks.md", "- `one\n- {projectId}`")).toThrow(
+      /unescaped curly brace/,
+    );
+
+    expect(() =>
+      validateMintlifyMdxSafety("bad-table-blocks.md", "| `one | two |\n| {projectId}` | four |"),
+    ).toThrow(/unescaped curly brace/);
 
     expect(() =>
       validateMintlifyMdxSafety("bad-brace.md", "Never write raw {projectId} in prose."),
