@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import { access, mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { Lexer, type Token, type Tokens } from "marked";
 import { parse as parseYaml } from "yaml";
 import { ADS_STANDARDS, PLUGIN_ID } from "../src/catalog.js";
 import { createPhotonAdsPlugin } from "../src/plugin.js";
@@ -49,8 +50,9 @@ const ADS_FOLDER_RE = /^(\d{4})-([a-z0-9]+(?:-[a-z0-9]+)*)$/;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const FRONTMATTER_RE = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/;
 const LEADING_H1_RE = /^\s*#\s+[^\r\n]+\r?\n?/;
-const INLINE_RELATIVE_MD_LINK_RE = /\]\(\.\.?\/[^)]+\.md(?:#[^)]*)?\)/;
-const REF_RELATIVE_MD_LINK_RE = /^\s*\[[^\]]+\]:\s*<?\.\.?\/[^\s>]+\.md(?:#[^\s>]*)?>?(?:\s|$)/;
+const EXTERNAL_OR_ANCHOR_HREF_RE = /^(?:https?:|mailto:|#)/i;
+const MARKDOWN_HREF_RE = /\.md(?:#.*)?$/i;
+const FENCE_OPEN_RE = /^\s{0,3}(`{3,}|~{3,})/;
 const CANONICAL_REPOSITORY = "photon-hq/api-design-standards";
 const OVERVIEW_TITLE = "API Design Standards";
 const OVERVIEW_SIDEBAR_TITLE = "Overview";
@@ -85,168 +87,120 @@ export function stripFrontmatterAndH1(markdown: string): {
   return { frontmatter, body: withoutH1 };
 }
 
-const BLOCKQUOTE_PREFIX_RE = /^((?:\s{0,3}>\s?)*)(.*)$/;
-const SINGLE_LINE_BLOCK_RE =
-  /^\s{0,3}(?:#{1,6}(?:\s|$)|(?:(?:\*\s*){3,}|(?:-\s*){3,}|(?:_\s*){3,})$|(?:=+|-+)\s*$|\|)/;
-const LIST_ITEM_START_RE = /^\s*(?:[-*+]|\d{1,9}[.)])(?:\s|$)/;
-
-/**
- * Strips fenced code blocks and inline code spans (including spans wrapped
- * across line breaks within a single Markdown block) while preserving line
- * numbers so MDX syntax validation inspects only prose and Markdown table text.
- */
-function stripCodeFromMarkdown(markdown: string): string {
-  const lines = markdown.split(/\r?\n/);
-  const withoutFences: string[] = [];
-  let activeFence: { char: string; length: number } | null = null;
-
-  for (const line of lines) {
-    const trimmed = line.trimStart();
-    if (activeFence) {
-      const closeRe = new RegExp(`^${activeFence.char}{${activeFence.length},}\\s*$`);
-      if (closeRe.test(trimmed)) {
-        activeFence = null;
-      }
-      withoutFences.push("");
-      continue;
-    }
-
-    const openMatch = /^(`{3,}|~{3,})/.exec(trimmed);
-    if (openMatch?.[1]) {
-      activeFence = { char: openMatch[1][0] ?? "`", length: openMatch[1].length };
-      withoutFences.push("");
-      continue;
-    }
-
-    withoutFences.push(line);
+function assertSafeLinkHref(label: string, href: string | null | undefined, context: string): void {
+  if (!href) {
+    return;
   }
-
-  assertCondition(activeFence === null, "Unclosed fenced code block in Markdown document.");
-
-  // Strip inline code spans block by block (CommonMark code spans can cross
-  // line breaks within one paragraph/list-item block, never across block boundaries).
-  const resultLines: string[] = [];
-  let block: string[] = [];
-  let blockQuoteDepth = 0;
-
-  const flushBlock = (): void => {
-    if (block.length === 0) {
-      return;
-    }
-    const stripped = stripInlineCodeSpans(block.join("\n"));
-    resultLines.push(...stripped.split("\n"));
-    block = [];
-  };
-
-  for (const line of withoutFences) {
-    const quoteMatch = BLOCKQUOTE_PREFIX_RE.exec(line);
-    const quotePrefix = quoteMatch?.[1] ?? "";
-    const inner = quoteMatch?.[2] ?? line;
-    const quoteDepth = (quotePrefix.match(/>/g) ?? []).length;
-
-    if (inner.trim().length === 0) {
-      flushBlock();
-      resultLines.push("");
-      blockQuoteDepth = 0;
-      continue;
-    }
-
-    if (SINGLE_LINE_BLOCK_RE.test(inner)) {
-      flushBlock();
-      resultLines.push(stripInlineCodeSpans(line));
-      blockQuoteDepth = 0;
-      continue;
-    }
-
-    if (block.length > 0 && (quoteDepth !== blockQuoteDepth || LIST_ITEM_START_RE.test(inner))) {
-      flushBlock();
-    }
-
-    blockQuoteDepth = quoteDepth;
-    block.push(line);
+  const trimmed = href.trim();
+  if (!EXTERNAL_OR_ANCHOR_HREF_RE.test(trimmed) && MARKDOWN_HREF_RE.test(trimmed)) {
+    throw new Error(`Invalid relative .md link in ${label}: ${context.trim()}`);
   }
-  flushBlock();
-
-  return resultLines.join("\n");
 }
 
-function stripInlineCodeSpans(text: string): string {
-  let result = "";
-  let index = 0;
-
-  while (index < text.length) {
-    if (text[index] === "`") {
-      let tickEnd = index;
-      while (tickEnd < text.length && text[tickEnd] === "`") {
-        tickEnd += 1;
-      }
-      const tickCount = tickEnd - index;
-      let searchFrom = tickEnd;
-      let closingStart = -1;
-
-      while (searchFrom < text.length) {
-        const nextTick = text.indexOf("`", searchFrom);
-        if (nextTick === -1) {
-          break;
-        }
-        let closeEnd = nextTick;
-        while (closeEnd < text.length && text[closeEnd] === "`") {
-          closeEnd += 1;
-        }
-        if (closeEnd - nextTick === tickCount) {
-          closingStart = nextTick;
-          break;
-        }
-        searchFrom = closeEnd;
-      }
-
-      if (closingStart !== -1) {
-        // Preserve newlines inside multi-line code spans so line numbers stay exact.
-        const span = text.slice(index, closingStart + tickCount);
-        result += span.replace(/[^\n]/g, "");
-        index = closingStart + tickCount;
-        continue;
-      }
-
-      result += text.slice(index, tickEnd);
-      index = tickEnd;
-      continue;
-    }
-    result += text[index];
-    index += 1;
+function assertClosedFencedCodeBlock(label: string, token: Tokens.Code): void {
+  if (token.codeBlockStyle === "indented") {
+    return;
   }
+  const rawLines = token.raw.replace(/\r?\n$/, "").split(/\r?\n/);
+  const openMatch = FENCE_OPEN_RE.exec(rawLines[0] ?? "");
+  if (!openMatch?.[1]) {
+    return;
+  }
+  const fenceChar = openMatch[1][0] ?? "`";
+  const fenceLen = openMatch[1].length;
+  const closeRe = new RegExp(`^\\s{0,3}${fenceChar}{${fenceLen},}\\s*$`);
+  const lastLine = rawLines[rawLines.length - 1] ?? "";
+  assertCondition(
+    rawLines.length >= 2 && closeRe.test(lastLine),
+    `Unclosed fenced code block in ${label}.`,
+  );
+}
 
-  return result;
+function inspectMarkdownTokens(label: string, tokens: Token[]): void {
+  for (const token of tokens) {
+    switch (token.type) {
+      case "code": {
+        assertClosedFencedCodeBlock(label, token as Tokens.Code);
+        break;
+      }
+      case "codespan":
+      case "escape":
+      case "space":
+      case "hr":
+      case "br": {
+        break;
+      }
+      case "html": {
+        throw new Error(
+          `Mintlify MDX safety violation in ${label}: unescaped "<" outside code span: ${token.raw.trim()}`,
+        );
+      }
+      case "def": {
+        const defToken = token as Tokens.Def;
+        assertSafeLinkHref(label, defToken.href, defToken.raw);
+        break;
+      }
+      case "link":
+      case "image": {
+        const linkToken = token as Tokens.Link | Tokens.Image;
+        assertSafeLinkHref(label, linkToken.href, linkToken.raw);
+        if (Array.isArray(linkToken.tokens)) {
+          inspectMarkdownTokens(label, linkToken.tokens);
+        }
+        break;
+      }
+      case "table": {
+        const tableToken = token as Tokens.Table;
+        for (const headerCell of tableToken.header) {
+          inspectMarkdownTokens(label, headerCell.tokens);
+        }
+        for (const row of tableToken.rows) {
+          for (const cell of row) {
+            inspectMarkdownTokens(label, cell.tokens);
+          }
+        }
+        break;
+      }
+      case "list": {
+        const listToken = token as Tokens.List;
+        for (const item of listToken.items) {
+          inspectMarkdownTokens(label, item.tokens);
+        }
+        break;
+      }
+      case "text": {
+        const textToken = token as Tokens.Text;
+        if (Array.isArray(textToken.tokens)) {
+          inspectMarkdownTokens(label, textToken.tokens);
+          break;
+        }
+        if (/[{}]/.test(textToken.raw)) {
+          throw new Error(
+            `Mintlify MDX safety violation in ${label}: unescaped curly brace outside code span: ${textToken.raw.trim()}`,
+          );
+        }
+        if (textToken.raw.includes("<")) {
+          throw new Error(
+            `Mintlify MDX safety violation in ${label}: unescaped "<" outside code span: ${textToken.raw.trim()}`,
+          );
+        }
+        break;
+      }
+      default: {
+        if ("tokens" in token && Array.isArray(token.tokens)) {
+          inspectMarkdownTokens(label, token.tokens);
+        }
+        break;
+      }
+    }
+  }
 }
 
 export function validateMintlifyMdxSafety(label: string, markdown: string): void {
-  const prose = stripCodeFromMarkdown(markdown);
-  const lines = prose.split("\n");
-
-  for (const [index, line] of lines.entries()) {
-    const lineNum = index + 1;
-    // Allow escaped braces (\{ or \}) but reject any raw { or } outside code.
-    const unescapedBraces = line.replace(/\\[{}]/g, "");
-    if (/[{}]/.test(unescapedBraces)) {
-      throw new Error(
-        `Mintlify MDX safety violation in ${label} (line ${lineNum}): unescaped curly brace outside code span: ${line.trim()}`,
-      );
-    }
-
-    // Reject any unescaped "<" outside code spans (preserving "\<" escapes),
-    // preventing broken JSX tags or literal angle brackets in Mintlify MDX.
-    const unescapedAngles = line.replace(/\\</g, "");
-    if (unescapedAngles.includes("<")) {
-      throw new Error(
-        `Mintlify MDX safety violation in ${label} (line ${lineNum}): unescaped "<" outside code span: ${line.trim()}`,
-      );
-    }
-
-    // Reject repo-relative .md links (both inline and reference-style definitions)
-    // that would break once rendered in Mintlify.
-    if (INLINE_RELATIVE_MD_LINK_RE.test(line) || REF_RELATIVE_MD_LINK_RE.test(line)) {
-      throw new Error(`Invalid relative .md link in ${label} (line ${lineNum}): ${line.trim()}`);
-    }
+  const tokenList = Lexer.lex(markdown, { gfm: true });
+  inspectMarkdownTokens(label, tokenList);
+  for (const [tag, link] of Object.entries(tokenList.links)) {
+    assertSafeLinkHref(label, link.href, `[${tag}]: ${link.href}`);
   }
 }
 

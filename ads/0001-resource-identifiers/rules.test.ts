@@ -1328,6 +1328,222 @@ describe("ADS-0001 end-to-end Redocly CLI enforcement", () => {
               },
             },
           },
+          "/v1/boolean-union/{tokenId}": {
+            parameters: [
+              {
+                name: "tokenId",
+                in: "path",
+                required: true,
+                description: "Token ID",
+                schema: { type: "string" },
+              },
+            ],
+            get: {
+              operationId: "getBooleanUnionToken",
+              summary: "Boolean true branch in anyOf must not hide missing id",
+              responses: {
+                "200": {
+                  description: "OK",
+                  content: {
+                    "application/json": {
+                      schema: {
+                        type: "object",
+                        properties: {
+                          tokenId: { type: "string" },
+                        },
+                        anyOf: [
+                          {
+                            properties: { id: { type: "string" } },
+                            required: ["id"],
+                          },
+                          true,
+                        ],
+                      },
+                    },
+                  },
+                },
+                "404": { description: "Not found" },
+              },
+            },
+          },
+          "/v1/boolean-allof/{keyId}": {
+            parameters: [
+              {
+                name: "keyId",
+                in: "path",
+                required: true,
+                description: "Key ID",
+                schema: { type: "string" },
+              },
+            ],
+            get: {
+              operationId: "getBooleanAllOfKey",
+              summary: "Boolean true in allOf must not discard sibling properties",
+              responses: {
+                "200": {
+                  description: "OK",
+                  content: {
+                    "application/json": {
+                      schema: {
+                        allOf: [
+                          true,
+                          {
+                            type: "object",
+                            properties: {
+                              keyId: { type: "string" },
+                            },
+                          },
+                        ],
+                      },
+                    },
+                  },
+                },
+                "404": { description: "Not found" },
+              },
+            },
+          },
+          "/v1/summary-union-allof/{tenantId}": {
+            parameters: [
+              {
+                name: "tenantId",
+                in: "path",
+                required: true,
+                description: "Tenant ID",
+                schema: { type: "string" },
+              },
+            ],
+            get: {
+              operationId: "getSummaryUnionAllOf",
+              summary: "allOf composing anyOf of two summary schemas preserves identifier facts",
+              responses: {
+                "200": {
+                  description: "OK",
+                  content: {
+                    "application/json": {
+                      schema: {
+                        allOf: [
+                          {
+                            anyOf: [
+                              { $ref: "#/components/schemas/TenantIdStatus" },
+                              { $ref: "#/components/schemas/TenantKeyStatus" },
+                            ],
+                          },
+                          {
+                            type: "object",
+                            properties: {
+                              region: { type: "string" },
+                            },
+                          },
+                        ],
+                      },
+                    },
+                  },
+                },
+                "404": { description: "Not found" },
+              },
+            },
+          },
+          "/v1/null-wrapper/{badgeId}": {
+            parameters: [
+              {
+                name: "badgeId",
+                in: "path",
+                required: true,
+                description: "Composed wrapper where non-object constraint intersects to null",
+                schema: { type: "string" },
+              },
+            ],
+            get: {
+              operationId: "getNullWrapper",
+              summary: "string|null intersected with object|null yields no object variant",
+              responses: {
+                "200": {
+                  description: "OK",
+                  content: {
+                    "application/json": {
+                      schema: {
+                        allOf: [
+                          {
+                            type: "object",
+                            properties: {
+                              data: { type: ["string", "null"] },
+                            },
+                          },
+                          {
+                            type: "object",
+                            properties: {
+                              data: {
+                                type: ["object", "null"],
+                                properties: {
+                                  badgeId: { type: "string" },
+                                },
+                              },
+                            },
+                          },
+                        ],
+                      },
+                    },
+                  },
+                },
+                "404": { description: "Not found" },
+              },
+            },
+          },
+          "/v1/wrapper-product/{envelopeId}": {
+            parameters: [
+              {
+                name: "envelopeId",
+                in: "path",
+                required: true,
+                description: "Envelope ID",
+                schema: { type: "string" },
+              },
+            ],
+            get: {
+              operationId: "getWrapperProduct",
+              summary: "20-mixin allOf with two data schemas each stays bounded",
+              responses: {
+                "200": {
+                  description: "OK",
+                  content: {
+                    "application/json": {
+                      schema: {
+                        allOf: Array.from({ length: 20 }, (_, mixinIndex) => ({
+                          oneOf: [
+                            {
+                              type: "object",
+                              properties: {
+                                data: {
+                                  description: `Variant A ${mixinIndex}`,
+                                  type: "object",
+                                  properties: {
+                                    envelopeId: { type: "string" },
+                                  },
+                                },
+                              },
+                            },
+                            {
+                              type: "object",
+                              properties: {
+                                data: {
+                                  description: `Variant B ${mixinIndex}`,
+                                  type: "object",
+                                  properties: {
+                                    label: { type: "string" },
+                                  },
+                                },
+                              },
+                            },
+                          ],
+                        })),
+                      },
+                    },
+                  },
+                },
+                "404": { description: "Not found" },
+              },
+            },
+          },
         },
         components: {
           schemas: {
@@ -1355,10 +1571,22 @@ describe("ADS-0001 end-to-end Redocly CLI enforcement", () => {
                 createdAt: { type: "string" },
               },
             },
-            "Price%": {
+            TenantIdStatus: {
               type: "object",
               properties: {
                 id: { type: "string" },
+              },
+            },
+            TenantKeyStatus: {
+              type: "object",
+              properties: {
+                tenantId: { type: "string" },
+              },
+            },
+            "Price%": {
+              type: "object",
+              properties: {
+                priceId: { type: "string" },
                 amountCents: { type: "integer" },
               },
             },
@@ -1398,5 +1626,28 @@ describe("ADS-0001 end-to-end Redocly CLI enforcement", () => {
         (msg) => msg.includes("/v1/diamonds/{diamondId}") && msg.includes('"diamondId"'),
       ),
     ).toBe(true);
+    expect(
+      messages.some((msg) => msg.includes("/v1/prices/{priceId}") && msg.includes('"priceId"')),
+    ).toBe(true);
+    expect(
+      messages.some(
+        (msg) => msg.includes("/v1/boolean-union/{tokenId}") && msg.includes('"tokenId"'),
+      ),
+    ).toBe(true);
+    expect(
+      messages.some((msg) => msg.includes("/v1/boolean-allof/{keyId}") && msg.includes('"keyId"')),
+    ).toBe(true);
+    expect(
+      messages.some(
+        (msg) => msg.includes("/v1/summary-union-allof/{tenantId}") && msg.includes('"tenantId"'),
+      ),
+    ).toBe(true);
+    expect(
+      messages.some(
+        (msg) => msg.includes("/v1/wrapper-product/{envelopeId}") && msg.includes('"envelopeId"'),
+      ),
+    ).toBe(true);
+    // Composed wrapper where string|null intersects with object|null has no object variant.
+    expect(messages.some((msg) => msg.includes("/v1/null-wrapper/{badgeId}"))).toBe(false);
   });
 });

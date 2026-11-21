@@ -264,14 +264,9 @@ export function deriveResourceStem(schemaName: string): string {
   return schemaName;
 }
 
-interface CollectedProperty {
-  schema: unknown;
-  location?: RedoclyLocation;
-}
-
 type WrapperState =
   | { kind: "none" }
-  | { kind: "single"; key: string; props: CollectedProperty[] }
+  | { kind: "single"; key: string; inner: CollectedVariant[]; fallbackLocation?: RedoclyLocation }
   | { kind: "multi" };
 
 interface CollectedVariant {
@@ -293,6 +288,7 @@ interface CollectVariantsResult {
 interface CollectVariantsOptions {
   matchTarget: (propName: string) => boolean;
   trackWrapper: boolean;
+  dedupeTargetByLocation?: boolean;
 }
 
 type ResolverFn = RedoclyUserContext["resolve"];
@@ -316,6 +312,29 @@ function safeResolve(
   }
 }
 
+function safeResolveSchema(
+  resolve: ResolverFn,
+  node: UnknownRecord,
+  from?: string,
+): RedoclyResolveResult<UnknownRecord | boolean> | null {
+  if (typeof node.$ref !== "string") {
+    return null;
+  }
+  try {
+    const resolved = resolve<UnknownRecord | boolean>({ $ref: node.$ref }, from);
+    if (
+      !resolved ||
+      resolved.error ||
+      (!isRecord(resolved.node) && typeof resolved.node !== "boolean")
+    ) {
+      return null;
+    }
+    return resolved;
+  } catch {
+    return null;
+  }
+}
+
 function isExplicitlyNonObjectSchema(node: unknown): boolean {
   if (!isRecord(node)) {
     return false;
@@ -327,6 +346,66 @@ function isExplicitlyNonObjectSchema(node: unknown): boolean {
     return !node.type.includes("object");
   }
   return false;
+}
+
+function variantSignature(
+  variant: CollectedVariant,
+  trackWrapper: boolean,
+  dedupeTargetByLocation: boolean,
+): string {
+  const prefix = `${variant.isObjectLike ? "1" : "0"}:${variant.isExemptSummary ? "1" : "0"}`;
+  if (variant.hasId) {
+    return `${prefix}:id`;
+  }
+  if (variant.matchedTarget) {
+    const targetLoc =
+      dedupeTargetByLocation && variant.matchedTarget.location
+        ? locationKey(variant.matchedTarget.location)
+        : "";
+    return `${prefix}:target:${variant.matchedTarget.name}:${targetLoc}`;
+  }
+  if (!trackWrapper) {
+    return `${prefix}:plain`;
+  }
+  if (variant.wrapper.kind === "single") {
+    const innerKey = variant.wrapper.inner
+      .map((inner) => variantSignature(inner, false, false))
+      .sort()
+      .join("|");
+    return `${prefix}:single:${variant.wrapper.key}:[${innerKey}]`;
+  }
+  return `${prefix}:plain:${variant.wrapper.kind}`;
+}
+
+function dedupeVariants(
+  list: CollectedVariant[],
+  trackWrapper: boolean,
+  dedupeTargetByLocation: boolean,
+): CollectedVariant[] {
+  const bySignature = new Map<string, CollectedVariant>();
+  for (const variant of list) {
+    const sig = variantSignature(variant, trackWrapper, dedupeTargetByLocation);
+    if (!bySignature.has(sig)) {
+      bySignature.set(sig, variant);
+    }
+  }
+  return [...bySignature.values()];
+}
+
+function mergeInnerVariants(
+  base: CollectedVariant[],
+  addition: CollectedVariant[],
+): CollectedVariant[] {
+  if (base.length === 0 || addition.length === 0) {
+    return [];
+  }
+  const combined: CollectedVariant[] = [];
+  for (const current of base) {
+    for (const incoming of addition) {
+      combined.push(mergeCollectedVariants(current, incoming, false, false));
+    }
+  }
+  return dedupeVariants(combined, false, false);
 }
 
 function mergeWrapperState(base: WrapperState, addition: WrapperState): WrapperState {
@@ -342,13 +421,13 @@ function mergeWrapperState(base: WrapperState, addition: WrapperState): WrapperS
   if (base.key !== addition.key) {
     return { kind: "multi" };
   }
-  const mergedProps = [...base.props];
-  for (const prop of addition.props) {
-    if (!mergedProps.some((existing) => existing.schema === prop.schema)) {
-      mergedProps.push(prop);
-    }
-  }
-  return { kind: "single", key: base.key, props: mergedProps };
+  const fallbackLocation = base.fallbackLocation ?? addition.fallbackLocation;
+  return {
+    kind: "single",
+    key: base.key,
+    inner: mergeInnerVariants(base.inner, addition.inner),
+    ...(fallbackLocation ? { fallbackLocation } : {}),
+  };
 }
 
 function mergeCollectedVariants(
@@ -364,7 +443,7 @@ function mergeCollectedVariants(
   const hasId = base.hasId || addition.hasId;
   const matchedTarget = base.matchedTarget ?? addition.matchedTarget;
   const wrapper: WrapperState =
-    !trackWrapper || isExemptSummary || hasId || matchedTarget
+    !trackWrapper || hasId || matchedTarget
       ? { kind: "multi" }
       : mergeWrapperState(base.wrapper, addition.wrapper);
 
@@ -377,64 +456,14 @@ function mergeCollectedVariants(
   };
 }
 
-function collectObjectVariants(
+function collectRawObjectVariants(
   schema: unknown,
   resolve: ResolverFn,
   options: CollectVariantsOptions,
   baseLocation?: RedoclyLocation,
 ): CollectedVariant[] {
+  const dedupeTargetByLocation = options.dedupeTargetByLocation ?? true;
   const memo = new Map<object, Map<string, CollectVariantsResult>>();
-  const objectIds = new WeakMap<object, number>();
-  let nextObjectId = 1;
-
-  const getObjectId = (value: unknown): string => {
-    if (typeof value !== "object" || value === null) {
-      return String(value);
-    }
-    const existing = objectIds.get(value);
-    if (existing !== undefined) {
-      return String(existing);
-    }
-    const id = nextObjectId;
-    nextObjectId += 1;
-    objectIds.set(value, id);
-    return String(id);
-  };
-
-  const variantSignature = (variant: CollectedVariant): string => {
-    const objFlag = variant.isObjectLike ? "1" : "0";
-    if (variant.isExemptSummary) {
-      return `exempt:${objFlag}`;
-    }
-    if (variant.hasId) {
-      return `id:${objFlag}`;
-    }
-    if (variant.matchedTarget) {
-      const targetLoc = variant.matchedTarget.location
-        ? locationKey(variant.matchedTarget.location)
-        : "";
-      return `target:${objFlag}:${variant.matchedTarget.name}:${targetLoc}`;
-    }
-    if (!options.trackWrapper) {
-      return `plain:${objFlag}`;
-    }
-    if (variant.wrapper.kind === "single") {
-      const propIds = variant.wrapper.props.map((prop) => getObjectId(prop.schema)).join(",");
-      return `single:${objFlag}:${variant.wrapper.key}:${propIds}`;
-    }
-    return `plain:${objFlag}:${variant.wrapper.kind}`;
-  };
-
-  const dedupeVariants = (list: CollectedVariant[]): CollectedVariant[] => {
-    const bySignature = new Map<string, CollectedVariant>();
-    for (const variant of list) {
-      const sig = variantSignature(variant);
-      if (!bySignature.has(sig)) {
-        bySignature.set(sig, variant);
-      }
-    }
-    return [...bySignature.values()];
-  };
 
   const combineVariantSets = (
     currentSet: CollectedVariant[],
@@ -452,7 +481,7 @@ function collectObjectVariants(
         );
       }
     }
-    return dedupeVariants(combined);
+    return dedupeVariants(combined, options.trackWrapper, dedupeTargetByLocation);
   };
 
   const visit = (
@@ -461,7 +490,20 @@ function collectObjectVariants(
     seen: ReadonlySet<unknown>,
     followRef: boolean,
   ): CollectVariantsResult => {
-    if (!isRecord(node)) {
+    if (node === true) {
+      return {
+        variants: [
+          {
+            isObjectLike: false,
+            isExemptSummary: false,
+            hasId: false,
+            wrapper: { kind: "none" },
+          },
+        ],
+        hitCycle: false,
+      };
+    }
+    if (node === false || !isRecord(node)) {
       return { variants: [], hitCycle: false };
     }
     if (isExplicitlyNonObjectSchema(node)) {
@@ -504,9 +546,9 @@ function collectObjectVariants(
     ];
 
     if (followRef && typeof node.$ref === "string") {
-      const resolved = safeResolve(resolve, node, location?.source?.absoluteRef);
+      const resolved = safeResolveSchema(resolve, node, location?.source?.absoluteRef);
       if (resolved) {
-        if (resolved.node) {
+        if (resolved.node !== undefined) {
           const targetResult = visit(resolved.node, resolved.location, nextSeen, true);
           if (targetResult.hitCycle) {
             hitCycle = true;
@@ -563,7 +605,7 @@ function collectObjectVariants(
       if (isRecord(node.properties)) {
         directObjectLike = true;
         const propEntries = Object.entries(node.properties);
-        for (const [propName, propSchema] of propEntries) {
+        for (const [propName] of propEntries) {
           const propLocation = location?.child(["properties", propName]);
           if (propName === "id") {
             directHasId = true;
@@ -573,17 +615,32 @@ function collectObjectVariants(
               ...(propLocation ? { location: propLocation } : {}),
             };
           }
-          if (options.trackWrapper) {
-            directWrapper = mergeWrapperState(directWrapper, {
-              kind: "single",
-              key: propName,
-              props: [
+        }
+        if (options.trackWrapper && !directHasId && !directMatchedTarget) {
+          if (propEntries.length === 1) {
+            const singleEntry = propEntries[0];
+            if (singleEntry) {
+              const [wrapperKey, wrapperSchema] = singleEntry;
+              const propLocation = location?.child(["properties", wrapperKey]);
+              const inner = collectRawObjectVariants(
+                wrapperSchema,
+                resolve,
                 {
-                  schema: propSchema,
-                  ...(propLocation ? { location: propLocation } : {}),
+                  matchTarget: options.matchTarget,
+                  trackWrapper: false,
+                  dedupeTargetByLocation: false,
                 },
-              ],
-            });
+                propLocation,
+              );
+              directWrapper = {
+                kind: "single",
+                key: wrapperKey,
+                inner,
+                ...(propLocation ? { fallbackLocation: propLocation } : {}),
+              };
+            }
+          } else if (propEntries.length > 1) {
+            directWrapper = { kind: "multi" };
           }
         }
       }
@@ -612,24 +669,26 @@ function collectObjectVariants(
           continue;
         }
         const branchVariants: CollectedVariant[] = [];
-        let hasObjectCompatibleBranch = false;
+        let branchHitCycle = false;
         for (const [index, branch] of branches.entries()) {
-          if (isExplicitlyNonObjectSchema(branch)) {
-            continue;
-          }
-          hasObjectCompatibleBranch = true;
           const branchResult = visit(branch, location?.child([unionKey, index]), nextSeen, true);
           if (branchResult.hitCycle) {
             hitCycle = true;
+            branchHitCycle = true;
           }
           branchVariants.push(...branchResult.variants);
         }
-        if (!hasObjectCompatibleBranch) {
-          variants = [];
-          break;
-        }
-        if (branchVariants.length > 0) {
-          variants = combineVariantSets(variants, dedupeVariants(branchVariants), isPureUnion);
+        if (branchVariants.length === 0) {
+          if (!branchHitCycle) {
+            variants = [];
+            break;
+          }
+        } else {
+          variants = combineVariantSets(
+            variants,
+            dedupeVariants(branchVariants, options.trackWrapper, dedupeTargetByLocation),
+            isPureUnion,
+          );
         }
       }
     }
@@ -646,7 +705,16 @@ function collectObjectVariants(
     return result;
   };
 
-  return visit(schema, baseLocation, new Set(), true).variants.filter(
+  return visit(schema, baseLocation, new Set(), true).variants;
+}
+
+function collectObjectVariants(
+  schema: unknown,
+  resolve: ResolverFn,
+  options: CollectVariantsOptions,
+  baseLocation?: RedoclyLocation,
+): CollectedVariant[] {
+  return collectRawObjectVariants(schema, resolve, options, baseLocation).filter(
     (variant) => variant.isObjectLike,
   );
 }
@@ -979,29 +1047,9 @@ export const ads0001ResourcePrimaryId: RedoclyOas3Rule = () => {
 
               if (top.wrapper.kind === "single") {
                 const wrapperKey = top.wrapper.key;
-                let innerVariants: CollectedVariant[] = [];
-                for (const wrapperProp of top.wrapper.props) {
-                  const partVariants = collectObjectVariants(
-                    wrapperProp.schema,
-                    ctx.resolve,
-                    { matchTarget: (propName) => propName === leafParam, trackWrapper: false },
-                    wrapperProp.location,
-                  );
-                  if (innerVariants.length === 0) {
-                    innerVariants = partVariants;
-                  } else if (partVariants.length > 0) {
-                    const combined: CollectedVariant[] = [];
-                    for (const current of innerVariants) {
-                      for (const part of partVariants) {
-                        combined.push(mergeCollectedVariants(current, part, false, false));
-                      }
-                    }
-                    innerVariants = combined;
-                  }
-                }
                 const fallbackLocation =
-                  top.wrapper.props[0]?.location?.key() ?? schemaLocation.key();
-                for (const inner of innerVariants) {
+                  top.wrapper.fallbackLocation?.key() ?? schemaLocation.key();
+                for (const inner of top.wrapper.inner) {
                   if (!inner.isObjectLike || inner.isExemptSummary || inner.hasId) {
                     continue;
                   }

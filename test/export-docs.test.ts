@@ -92,6 +92,13 @@ describe("docs-reference export", () => {
           "projectId}` across a single line break are valid CommonMark.",
           "- Wrapped spans inside a single list item like `/v1/projects/{",
           "  projectId}` are also valid.",
+          "",
+          "> Lazy blockquote continuation `/v1/projects/{",
+          "projectId}` is valid CommonMark.",
+          "",
+          "| `one | two |",
+          "| {projectId}` | four |",
+          "",
           "Escaped comparisons like values \\< 10 are also safe.",
           "",
           "```json",
@@ -106,8 +113,22 @@ describe("docs-reference export", () => {
     );
 
     expect(() =>
-      validateMintlifyMdxSafety("bad-table-blocks.md", "| `one | two |\n| {projectId}` | four |"),
+      validateMintlifyMdxSafety(
+        "bad-piped-table-blocks.md",
+        "| Col A | Col B |\n| --- | --- |\n| `one | two |\n| {projectId}` | four |",
+      ),
     ).toThrow(/unescaped curly brace/);
+
+    expect(() =>
+      validateMintlifyMdxSafety(
+        "bad-pipeless-table-blocks.md",
+        "Field | Note\n--- | ---\n`a | b\n{projectId}` | c",
+      ),
+    ).toThrow(/unescaped curly brace/);
+
+    expect(() =>
+      validateMintlifyMdxSafety("bad-unclosed-fence.md", '```json\n{ "id": "prj_123" }'),
+    ).toThrow(/Unclosed fenced code block/);
 
     expect(() =>
       validateMintlifyMdxSafety("bad-brace.md", "Never write raw {projectId} in prose."),
