@@ -21,6 +21,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0
           persist-credentials: false
       - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -46,4 +47,15 @@ jobs:
           pnpm docs:export
           diff -u "$RUNNER_TEMP/docs-reference-1.json" artifacts/docs-reference.json
       - name: Check public content
-        run: node tools/public-content/check.mjs --commit-message
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          if [ "$EVENT_NAME" = "pull_request" ] && git rev-parse --verify -q HEAD^2 >/dev/null; then
+            node tools/public-content/check.mjs --commit-range HEAD^1..HEAD^2
+          elif [ "$EVENT_NAME" = "push" ] && [ -n "$PUSH_BEFORE" ] && [ "$PUSH_BEFORE" != "0000000000000000000000000000000000000000" ] && git cat-file -e "${PUSH_BEFORE}^{commit}" 2>/dev/null; then
+            node tools/public-content/check.mjs --commit-range "${PUSH_BEFORE}..${HEAD_SHA}"
+          else
+            node tools/public-content/check.mjs --commit-message
+          fi

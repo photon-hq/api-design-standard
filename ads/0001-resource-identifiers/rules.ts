@@ -25,7 +25,7 @@ export const ADS_0001_METADATA: AdsStandardMetadata = {
       id: `${PLUGIN_ID}/ads-0001-path-param-naming`,
       severity: "error",
       summary:
-        "URL path parameters must use lowerCamelCase resource-qualified names (for example `{projectId}`), never generic `{id}`.",
+        "URL path parameters must use lowerCamelCase, with resource-qualified names for resource identifiers (for example `{projectId}`), never generic `{id}`.",
     },
     {
       name: "ads-0001-path-param-consistency",
@@ -45,6 +45,8 @@ const FULL_PARAM_SEGMENT_RE = /^\{([^}]+)\}$/;
 const CUSTOM_METHOD_PARAM_SEGMENT_RE = /^\{([^}]+)\}:([a-zA-Z0-9_-]+)$/;
 const LEAF_ID_PARAM_RE = /\/\{([a-z][a-zA-Z0-9]*Id)\}$/;
 const JSON_MEDIA_TYPE_RE = /^application\/(?!problem\+json)(?:[^;]+\+)?json\b/i;
+const COMPONENT_SCHEMA_POINTER_RE = /^#\/components\/schemas\/([^/]+)$/;
+const MAX_SCHEMA_VARIANTS = 32;
 
 const NON_RESOURCE_SCHEMA_SUFFIXES = [
   "Request",
@@ -77,6 +79,8 @@ const NON_RESOURCE_SCHEMA_SUFFIXES = [
   "Meta",
   "Metadata",
 ] as const;
+
+const ENVELOPE_SCHEMA_SUFFIXES = ["Envelope", "Wrapper"] as const;
 
 const RESOURCE_SCHEMA_SUFFIXES = [
   "Resource",
@@ -152,7 +156,15 @@ export interface PathParamSlot {
 }
 
 export function extractPathParamSlots(pathTemplate: string): PathParamSlot[] {
-  const segments = pathTemplate.split("/").filter((segment) => segment.length > 0);
+  let trimmed = pathTemplate.startsWith("/") ? pathTemplate.slice(1) : pathTemplate;
+  if (trimmed.length > 1 && trimmed.endsWith("/") && !trimmed.endsWith("//")) {
+    trimmed = trimmed.slice(0, -1);
+  }
+  if (trimmed.length === 0) {
+    return [];
+  }
+
+  const segments = trimmed.split("/");
   const normalizedSegments: string[] = [];
   const slots: PathParamSlot[] = [];
 
@@ -210,6 +222,21 @@ export function isNonResourceSchemaName(schemaName: string): boolean {
   return NON_RESOURCE_SCHEMA_SUFFIXES.some((suffix) => schemaName.endsWith(suffix));
 }
 
+function isNonResourceSummarySchemaName(schemaName: string): boolean {
+  return (
+    isNonResourceSchemaName(schemaName) &&
+    !ENVELOPE_SCHEMA_SUFFIXES.some((suffix) => schemaName.endsWith(suffix))
+  );
+}
+
+function extractComponentSchemaNameFromPointer(pointer?: string): string | null {
+  if (!pointer) {
+    return null;
+  }
+  const match = COMPONENT_SCHEMA_POINTER_RE.exec(pointer);
+  return match?.[1] ? decodeURIComponent(match[1]) : null;
+}
+
 export function deriveResourceStem(schemaName: string): string {
   for (const suffix of RESOURCE_SCHEMA_SUFFIXES) {
     if (schemaName.length > suffix.length && schemaName.endsWith(suffix)) {
@@ -227,6 +254,7 @@ interface CollectedProperty {
 interface CollectedObjectSchema {
   isObjectLike: boolean;
   properties: Map<string, CollectedProperty>;
+  schemaNames: Set<string>;
 }
 
 type ResolverFn = RedoclyUserContext["resolve"];
@@ -254,86 +282,142 @@ function isNullTypeSchema(node: unknown): boolean {
   return isRecord(node) && node.type === "null";
 }
 
-function unwrapNullableUnion(
-  branches: unknown[],
-  baseLocation: RedoclyLocation | undefined,
-  unionKey: "oneOf" | "anyOf",
-): { schema: unknown; location?: RedoclyLocation } | null {
-  if (branches.length !== 2) {
-    return null;
+function mergeCollectedObjects(
+  base: CollectedObjectSchema,
+  addition: CollectedObjectSchema,
+): CollectedObjectSchema {
+  const properties = new Map(base.properties);
+  for (const [key, value] of addition.properties.entries()) {
+    properties.set(key, value);
   }
-  const firstIsNull = isNullTypeSchema(branches[0]);
-  const secondIsNull = isNullTypeSchema(branches[1]);
-  if (firstIsNull === secondIsNull) {
-    return null;
+  const schemaNames = new Set(base.schemaNames);
+  for (const name of addition.schemaNames) {
+    schemaNames.add(name);
   }
-  const targetIndex = firstIsNull ? 1 : 0;
   return {
-    schema: branches[targetIndex],
-    ...(baseLocation ? { location: baseLocation.child([unionKey, targetIndex]) } : {}),
+    isObjectLike: base.isObjectLike || addition.isObjectLike,
+    properties,
+    schemaNames,
   };
 }
 
-function collectObjectProperties(
+function collectObjectVariants(
   schema: unknown,
   resolve: ResolverFn,
   baseLocation?: RedoclyLocation,
-  seen: Set<unknown> = new Set(),
-): CollectedObjectSchema {
-  const properties = new Map<string, CollectedProperty>();
-  let isObjectLike = false;
+  seen: ReadonlySet<unknown> = new Set(),
+  followRef = true,
+): CollectedObjectSchema[] {
+  if (!isRecord(schema) || seen.has(schema)) {
+    return [];
+  }
 
-  const visit = (node: unknown, loc?: RedoclyLocation): void => {
-    if (!isRecord(node) || seen.has(node)) {
+  const nextSeen = new Set(seen);
+  nextSeen.add(schema);
+
+  const initialSchemaNames = new Set<string>();
+  const directSchemaName = extractComponentSchemaNameFromPointer(baseLocation?.pointer);
+  if (directSchemaName) {
+    initialSchemaNames.add(directSchemaName);
+  }
+  if (typeof schema.$ref === "string") {
+    const refSchemaName = extractComponentSchemaNameFromPointer(schema.$ref);
+    if (refSchemaName) {
+      initialSchemaNames.add(refSchemaName);
+    }
+  }
+
+  let variants: CollectedObjectSchema[] = [
+    { isObjectLike: false, properties: new Map(), schemaNames: initialSchemaNames },
+  ];
+
+  const combineVariants = (incoming: CollectedObjectSchema[]): void => {
+    if (incoming.length === 0) {
       return;
     }
-    seen.add(node);
-
-    if (typeof node.$ref === "string") {
-      const resolved = safeResolve(resolve, node, loc?.source?.absoluteRef);
-      if (resolved?.node) {
-        visit(resolved.node, resolved.location);
+    const next: CollectedObjectSchema[] = [];
+    for (const current of variants) {
+      for (const part of incoming) {
+        next.push(mergeCollectedObjects(current, part));
+        if (next.length >= MAX_SCHEMA_VARIANTS) {
+          variants = next;
+          return;
+        }
       }
     }
-
-    if (Array.isArray(node.allOf)) {
-      for (const [index, branch] of node.allOf.entries()) {
-        visit(branch, loc?.child(["allOf", index]));
-      }
-    }
-
-    if (Array.isArray(node.oneOf)) {
-      const unwrapped = unwrapNullableUnion(node.oneOf, loc, "oneOf");
-      if (unwrapped) {
-        visit(unwrapped.schema, unwrapped.location);
-      }
-    }
-
-    if (Array.isArray(node.anyOf)) {
-      const unwrapped = unwrapNullableUnion(node.anyOf, loc, "anyOf");
-      if (unwrapped) {
-        visit(unwrapped.schema, unwrapped.location);
-      }
-    }
-
-    if (node.type === "object" || (Array.isArray(node.type) && node.type.includes("object"))) {
-      isObjectLike = true;
-    }
-
-    if (isRecord(node.properties)) {
-      isObjectLike = true;
-      for (const [propName, propSchema] of Object.entries(node.properties)) {
-        const propLocation = loc?.child(["properties", propName]);
-        properties.set(propName, {
-          schema: propSchema,
-          ...(propLocation ? { location: propLocation } : {}),
-        });
-      }
-    }
+    variants = next;
   };
 
-  visit(schema, baseLocation);
-  return { isObjectLike, properties };
+  if (followRef && typeof schema.$ref === "string") {
+    const resolved = safeResolve(resolve, schema, baseLocation?.source?.absoluteRef);
+    if (resolved) {
+      if (resolved.node) {
+        combineVariants(collectObjectVariants(resolved.node, resolve, resolved.location, nextSeen));
+      }
+      for (const hop of resolved.chain ?? []) {
+        if (isRecord(hop.node)) {
+          combineVariants(collectObjectVariants(hop.node, resolve, hop.location, nextSeen, false));
+        }
+      }
+    }
+  }
+
+  if (Array.isArray(schema.allOf)) {
+    for (const [index, branch] of schema.allOf.entries()) {
+      combineVariants(
+        collectObjectVariants(branch, resolve, baseLocation?.child(["allOf", index]), nextSeen),
+      );
+    }
+  }
+
+  const directProps = new Map<string, CollectedProperty>();
+  let directObjectLike =
+    schema.type === "object" || (Array.isArray(schema.type) && schema.type.includes("object"));
+
+  if (isRecord(schema.properties)) {
+    directObjectLike = true;
+    for (const [propName, propSchema] of Object.entries(schema.properties)) {
+      const propLocation = baseLocation?.child(["properties", propName]);
+      directProps.set(propName, {
+        schema: propSchema,
+        ...(propLocation ? { location: propLocation } : {}),
+      });
+    }
+  }
+
+  if (directObjectLike || directProps.size > 0) {
+    combineVariants([
+      {
+        isObjectLike: directObjectLike,
+        properties: directProps,
+        schemaNames: new Set(),
+      },
+    ]);
+  }
+
+  for (const unionKey of ["oneOf", "anyOf"] as const) {
+    const branches = schema[unionKey];
+    if (!Array.isArray(branches) || branches.length === 0) {
+      continue;
+    }
+    const branchVariants: CollectedObjectSchema[] = [];
+    for (const [index, branch] of branches.entries()) {
+      if (isNullTypeSchema(branch)) {
+        continue;
+      }
+      branchVariants.push(
+        ...collectObjectVariants(branch, resolve, baseLocation?.child([unionKey, index]), nextSeen),
+      );
+      if (branchVariants.length >= MAX_SCHEMA_VARIANTS) {
+        break;
+      }
+    }
+    if (branchVariants.length > 0) {
+      combineVariants(branchVariants);
+    }
+  }
+
+  return variants.filter((variant) => variant.isObjectLike || variant.properties.size > 0);
 }
 
 export const ads0001PathParamNaming: RedoclyOas3Rule = () => {
@@ -350,7 +434,7 @@ export const ads0001PathParamNaming: RedoclyOas3Rule = () => {
             if (error) {
               ctx.report({
                 message: error,
-                location: ctx.location.key(),
+                location: (ctx.rawLocation ?? ctx.location).key(),
               });
             }
           }
@@ -523,30 +607,28 @@ export const ads0001ResourcePrimaryId: RedoclyOas3Rule = () => {
               continue;
             }
             const schemaLocation = ctx.location.child(["components", "schemas", schemaName]);
-            const { isObjectLike, properties } = collectObjectProperties(
-              rawSchema,
-              ctx.resolve,
-              schemaLocation,
-            );
-            if (!isObjectLike || properties.has("id")) {
-              continue;
-            }
-
+            const variants = collectObjectVariants(rawSchema, ctx.resolve, schemaLocation);
             const normalizedStem = stem.toLowerCase();
-            for (const [propName, propEntry] of properties.entries()) {
-              if (
-                propName.length > 2 &&
-                propName.endsWith("Id") &&
-                propName.slice(0, -2).toLowerCase() === normalizedStem
-              ) {
-                const reportLocation = propEntry.location
-                  ? propEntry.location.key()
-                  : schemaLocation.key();
-                reportPrimaryIdOnce(
-                  ctx,
-                  reportLocation,
-                  `Resource schema "${schemaName}" defines resource-prefixed identifier "${propName}" without "id". Resource objects must use "id" as their primary identifier field (ADS-0001).`,
-                );
+
+            for (const variant of variants) {
+              if (!variant.isObjectLike || variant.properties.has("id")) {
+                continue;
+              }
+              for (const [propName, propEntry] of variant.properties.entries()) {
+                if (
+                  propName.length > 2 &&
+                  propName.endsWith("Id") &&
+                  propName.slice(0, -2).toLowerCase() === normalizedStem
+                ) {
+                  const reportLocation = propEntry.location
+                    ? propEntry.location.key()
+                    : schemaLocation.key();
+                  reportPrimaryIdOnce(
+                    ctx,
+                    reportLocation,
+                    `Resource schema "${schemaName}" defines resource-prefixed identifier "${propName}" without "id". Resource objects must use "id" as their primary identifier field (ADS-0001).`,
+                  );
+                }
               }
             }
           }
@@ -594,33 +676,41 @@ export const ads0001ResourcePrimaryId: RedoclyOas3Rule = () => {
             continue;
           }
 
-          const rawResponse200 = getOp.responses["200"];
-          if (!isRecord(rawResponse200)) {
+          const responseKey = isRecord(getOp.responses["200"])
+            ? "200"
+            : isRecord(getOp.responses["2XX"])
+              ? "2XX"
+              : null;
+          if (!responseKey) {
+            continue;
+          }
+          const rawSuccessResponse = getOp.responses[responseKey];
+          if (!isRecord(rawSuccessResponse)) {
             continue;
           }
 
-          let responseLocation = pathItemLocation.child(["get", "responses", "200"]);
-          let response200: UnknownRecord = rawResponse200;
-          if (typeof rawResponse200.$ref === "string") {
+          let responseLocation = pathItemLocation.child(["get", "responses", responseKey]);
+          let successResponse: UnknownRecord = rawSuccessResponse;
+          if (typeof rawSuccessResponse.$ref === "string") {
             const resolved = safeResolve(
               ctx.resolve,
-              rawResponse200,
+              rawSuccessResponse,
               responseLocation.source?.absoluteRef,
             );
             if (!resolved?.node) {
               continue;
             }
-            response200 = resolved.node;
+            successResponse = resolved.node;
             if (resolved.location) {
               responseLocation = resolved.location;
             }
           }
 
-          if (!isRecord(response200.content)) {
+          if (!isRecord(successResponse.content)) {
             continue;
           }
 
-          for (const [mediaType, mediaObj] of Object.entries(response200.content)) {
+          for (const [mediaType, mediaObj] of Object.entries(successResponse.content)) {
             if (!JSON_MEDIA_TYPE_RE.test(mediaType)) {
               continue;
             }
@@ -629,49 +719,65 @@ export const ads0001ResourcePrimaryId: RedoclyOas3Rule = () => {
             }
 
             const schemaLocation = responseLocation.child(["content", mediaType, "schema"]);
-            const top = collectObjectProperties(mediaObj.schema, ctx.resolve, schemaLocation);
-            if (!top.isObjectLike) {
-              continue;
-            }
+            const topVariants = collectObjectVariants(mediaObj.schema, ctx.resolve, schemaLocation);
 
-            if (!top.properties.has("id") && top.properties.has(leafParam)) {
-              const propEntry = top.properties.get(leafParam);
-              const reportLocation = propEntry?.location
-                ? propEntry.location.key()
-                : schemaLocation.key();
-              reportPrimaryIdOnce(
-                ctx,
-                reportLocation,
-                `GET item endpoint "${pathTemplate}" returns "${leafParam}" without "id". Single-resource responses must use "id" as the resource primary identifier field (ADS-0001).`,
-              );
-              continue;
-            }
-
-            if (!top.properties.has("id") && top.properties.size === 1) {
-              const entry = [...top.properties.entries()][0];
-              if (!entry) {
+            for (const top of topVariants) {
+              if (!top.isObjectLike) {
                 continue;
               }
-              const [wrapperKey, wrapperProp] = entry;
-              const inner = collectObjectProperties(
-                wrapperProp.schema,
-                ctx.resolve,
-                wrapperProp.location,
-              );
               if (
-                inner.isObjectLike &&
-                !inner.properties.has("id") &&
-                inner.properties.has(leafParam)
+                [...top.schemaNames].some((schemaName) =>
+                  isNonResourceSummarySchemaName(schemaName),
+                )
               ) {
-                const innerProp = inner.properties.get(leafParam);
-                const reportLocation = innerProp?.location
-                  ? innerProp.location.key()
-                  : (wrapperProp.location?.key() ?? schemaLocation.key());
+                continue;
+              }
+
+              if (!top.properties.has("id") && top.properties.has(leafParam)) {
+                const propEntry = top.properties.get(leafParam);
+                const reportLocation = propEntry?.location
+                  ? propEntry.location.key()
+                  : schemaLocation.key();
                 reportPrimaryIdOnce(
                   ctx,
                   reportLocation,
-                  `GET item endpoint "${pathTemplate}" returns wrapped resource "${wrapperKey}" with "${leafParam}" instead of "id". Resource objects must use "id" as their primary identifier field (ADS-0001).`,
+                  `GET item endpoint "${pathTemplate}" returns "${leafParam}" without "id". Single-resource responses must use "id" as the resource primary identifier field (ADS-0001).`,
                 );
+                continue;
+              }
+
+              if (!top.properties.has("id") && top.properties.size === 1) {
+                const entry = [...top.properties.entries()][0];
+                if (!entry) {
+                  continue;
+                }
+                const [wrapperKey, wrapperProp] = entry;
+                const innerVariants = collectObjectVariants(
+                  wrapperProp.schema,
+                  ctx.resolve,
+                  wrapperProp.location,
+                );
+                for (const inner of innerVariants) {
+                  if (
+                    !inner.isObjectLike ||
+                    [...inner.schemaNames].some((schemaName) =>
+                      isNonResourceSummarySchemaName(schemaName),
+                    )
+                  ) {
+                    continue;
+                  }
+                  if (!inner.properties.has("id") && inner.properties.has(leafParam)) {
+                    const innerProp = inner.properties.get(leafParam);
+                    const reportLocation = innerProp?.location
+                      ? innerProp.location.key()
+                      : (wrapperProp.location?.key() ?? schemaLocation.key());
+                    reportPrimaryIdOnce(
+                      ctx,
+                      reportLocation,
+                      `GET item endpoint "${pathTemplate}" returns wrapped resource "${wrapperKey}" with "${leafParam}" instead of "id". Resource objects must use "id" as their primary identifier field (ADS-0001).`,
+                    );
+                  }
+                }
               }
             }
           }

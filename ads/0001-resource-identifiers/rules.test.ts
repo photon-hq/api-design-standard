@@ -1,6 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync } from "node:fs";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -47,6 +46,7 @@ let specCounter = 0;
 function runRedoclyLint(
   specPath: string,
   configPath: string = REDOCLY_CONFIG,
+  cwd: string = REPO_ROOT,
 ): {
   exitCode: number;
   stderr: string;
@@ -57,7 +57,7 @@ function runRedoclyLint(
       REDOCLY_BIN,
       ["lint", specPath, "--config", configPath, "--format=json"],
       {
-        cwd: REPO_ROOT,
+        cwd,
         encoding: "utf8",
         stdio: ["ignore", "pipe", "pipe"],
       },
@@ -82,11 +82,11 @@ function runRedoclyLint(
   }
 }
 
-async function lintOpenApi(doc: Record<string, unknown>, configPath?: string) {
+async function lintOpenApi(doc: Record<string, unknown>, configPath?: string, cwd?: string) {
   specCounter += 1;
   const specPath = join(tempDir, `spec-${specCounter}.yaml`);
   await writeFile(specPath, stringifyYaml(doc), "utf8");
-  return runRedoclyLint(specPath, configPath);
+  return runRedoclyLint(specPath, configPath, cwd);
 }
 
 function baseOpenApi(overrides: {
@@ -116,12 +116,11 @@ function adsProblems(report: RedoclyJsonReport): RedoclyJsonProblem[] {
 
 beforeAll(async () => {
   tempDir = await mkdtemp(join(tmpdir(), "photon-ads-0001-"));
-  if (!existsSync(PLUGIN_DIST)) {
-    execFileSync(resolve(REPO_ROOT, "node_modules/.bin/tsc"), ["-p", "tsconfig.build.json"], {
-      cwd: REPO_ROOT,
-      stdio: "inherit",
-    });
-  }
+  // Always compile from current source so standalone `pnpm test` never exercises stale dist/.
+  execFileSync(resolve(REPO_ROOT, "node_modules/.bin/tsc"), ["-p", "tsconfig.build.json"], {
+    cwd: REPO_ROOT,
+    stdio: "inherit",
+  });
 });
 
 afterAll(async () => {
@@ -158,7 +157,7 @@ describe("ADS-0001 unit helpers", () => {
     }
   });
 
-  it("extracts normalized path parameter prefix slots", () => {
+  it("extracts normalized path parameter prefix slots while preserving interior empty segments", () => {
     expect(extractPathParamSlots("/v1/projects/{projectId}/api-keys/{apiKeyId}")).toEqual([
       { prefixKey: "/v1/projects/{*}", paramName: "projectId" },
       { prefixKey: "/v1/projects/{*}/api-keys/{*}", paramName: "apiKeyId" },
@@ -166,6 +165,10 @@ describe("ADS-0001 unit helpers", () => {
 
     expect(extractPathParamSlots("/v1/projects/{projectId}:archive")).toEqual([
       { prefixKey: "/v1/projects/{*}", paramName: "projectId" },
+    ]);
+
+    expect(extractPathParamSlots("/v1/projects//{archiveId}/history")).toEqual([
+      { prefixKey: "/v1/projects//{*}", paramName: "archiveId" },
     ]);
   });
 
@@ -214,7 +217,7 @@ describe("ADS-0001 unit helpers", () => {
 });
 
 describe("ADS-0001 end-to-end Redocly CLI enforcement", () => {
-  it("loads the plugin via package export specifier and redocly.yaml without deprecation warnings", () => {
+  it("loads the plugin via local config and consumer package specifier without deprecation warnings", async () => {
     const require = createRequire(import.meta.url);
     expect(require.resolve("@photon-ai/api-design-standards/redocly")).toBe(PLUGIN_DIST);
 
@@ -224,6 +227,50 @@ describe("ADS-0001 end-to-end Redocly CLI enforcement", () => {
     expect(report.totals.errors).toBe(0);
     expect(report.totals.warnings).toBe(0);
     expect(adsProblems(report)).toEqual([]);
+
+    // Exercise the documented consumer setup using `@photon-ai/api-design-standards/redocly`.
+    const consumerDir = join(tempDir, "consumer");
+    const scopeDir = join(consumerDir, "node_modules", "@photon-ai");
+    await mkdir(scopeDir, { recursive: true });
+    await symlink(REPO_ROOT, join(scopeDir, "api-design-standards"), "dir");
+    const consumerConfig = join(consumerDir, "redocly.yaml");
+    await writeFile(
+      consumerConfig,
+      'plugins:\n  - "@photon-ai/api-design-standards/redocly"\nextends:\n  - photon-ads/recommended\n',
+      "utf8",
+    );
+
+    const consumerResult = await lintOpenApi(
+      baseOpenApi({
+        paths: {
+          "/v1/projects/{id}": {
+            parameters: [
+              {
+                name: "id",
+                in: "path",
+                required: true,
+                description: "Generic id",
+                schema: { type: "string" },
+              },
+            ],
+            get: {
+              operationId: "getProject",
+              summary: "Get project",
+              responses: { "200": { description: "OK" } },
+            },
+          },
+        },
+      }),
+      consumerConfig,
+      consumerDir,
+    );
+    expect(consumerResult.exitCode).toBe(1);
+    expect(consumerResult.stderr).not.toContain("Deprecated plugin format");
+    expect(
+      adsProblems(consumerResult.report).some(
+        (problem) => problem.ruleId === "photon-ads/ads-0001-path-param-naming",
+      ),
+    ).toBe(true);
   });
 
   it("passes valid patterns without false positives", async () => {
@@ -352,6 +399,51 @@ describe("ADS-0001 end-to-end Redocly CLI enforcement", () => {
               },
             },
           },
+          "/v1/project-usage/{projectId}": {
+            parameters: [
+              {
+                name: "projectId",
+                in: "path",
+                required: true,
+                description: "Project ID",
+                schema: { type: "string" },
+              },
+            ],
+            get: {
+              operationId: "getUsageSummaryByProject",
+              summary: "Get usage summary by project",
+              responses: {
+                "200": {
+                  description: "Usage summary",
+                  content: {
+                    "application/json": {
+                      schema: { $ref: "#/components/schemas/ProjectUsage" },
+                    },
+                  },
+                },
+                "404": { description: "Not found" },
+              },
+            },
+          },
+          "/v1/projects//{archiveId}/history": {
+            parameters: [
+              {
+                name: "archiveId",
+                in: "path",
+                required: true,
+                description: "Archive ID",
+                schema: { type: "string" },
+              },
+            ],
+            get: {
+              operationId: "getArchiveHistory",
+              summary: "Get archive history with preserved interior empty segment",
+              responses: {
+                "200": { description: "OK" },
+                "404": { description: "Not found" },
+              },
+            },
+          },
           "/v1/themes/{slug}": {
             parameters: [
               {
@@ -395,6 +487,13 @@ describe("ADS-0001 end-to-end Redocly CLI enforcement", () => {
                 name: { type: "string" },
               },
             },
+            ProjectUsage: {
+              type: "object",
+              properties: {
+                projectId: { type: "string" },
+                totalCents: { type: "integer" },
+              },
+            },
             ProblemDetails: {
               type: "object",
               properties: {
@@ -412,25 +511,12 @@ describe("ADS-0001 end-to-end Redocly CLI enforcement", () => {
     expect(adsProblems(report)).toEqual([]);
   });
 
-  it("rejects generic, snake_case, kebab-case, PascalCase, and uppercase ID path parameters", async () => {
+  it("rejects generic, snake_case, kebab-case, PascalCase, and uppercase ID path parameters including $ref PathItems", async () => {
     const { exitCode, report } = await lintOpenApi(
       baseOpenApi({
         paths: {
           "/v1/projects/{id}": {
-            parameters: [
-              {
-                name: "id",
-                in: "path",
-                required: true,
-                description: "Generic id",
-                schema: { type: "string" },
-              },
-            ],
-            get: {
-              operationId: "getProject",
-              summary: "Get project",
-              responses: { "200": { description: "OK" }, "404": { description: "Not found" } },
-            },
+            $ref: "#/components/pathItems/SharedProjectPath",
           },
           "/v1/organizations/{uuid}": {
             parameters: [
@@ -514,6 +600,24 @@ describe("ADS-0001 end-to-end Redocly CLI enforcement", () => {
           },
         },
         components: {
+          pathItems: {
+            SharedProjectPath: {
+              parameters: [
+                {
+                  name: "id",
+                  in: "path",
+                  required: true,
+                  description: "Generic id",
+                  schema: { type: "string" },
+                },
+              ],
+              get: {
+                operationId: "getProject",
+                summary: "Get project",
+                responses: { "200": { description: "OK" }, "404": { description: "Not found" } },
+              },
+            },
+          },
           parameters: {
             BadReusablePathParam: {
               name: "guid",
@@ -545,6 +649,14 @@ describe("ADS-0001 end-to-end Redocly CLI enforcement", () => {
     expect(messages.some((msg) => msg.includes("{ApiKeyId}"))).toBe(true);
     expect(messages.some((msg) => msg.includes("{tokenID}"))).toBe(true);
     expect(messages.some((msg) => msg.includes("{guid}"))).toBe(true);
+
+    // Confirm $ref PathItem reports the template violation at the route declaration key.
+    expect(
+      namingErrors.some((problem) =>
+        problem.location?.some((loc) => loc.pointer === "#/paths/~1v1~1projects~1{id}"),
+      ),
+    ).toBe(true);
+
     expect(
       namingErrors.some((problem) =>
         problem.location?.some((loc) => loc.pointer?.includes("AllowedQueryIdParam")),
@@ -701,7 +813,7 @@ describe("ADS-0001 end-to-end Redocly CLI enforcement", () => {
     ).toBe(true);
   });
 
-  it("rejects resource-prefixed primary IDs on named schemas, allOf, GET item responses, envelopes, and bad ID casing", async () => {
+  it("rejects resource-prefixed primary IDs across named schemas, allOf, $ref chains, oneOf/anyOf variants, 2XX responses, envelopes, and bad ID casing", async () => {
     const { exitCode, report } = await lintOpenApi(
       baseOpenApi({
         paths: {
@@ -750,9 +862,9 @@ describe("ADS-0001 end-to-end Redocly CLI enforcement", () => {
             ],
             get: {
               operationId: "getApiKey",
-              summary: "Get API key",
+              summary: "Get API key via 2XX fallback",
               responses: {
-                "200": {
+                "2XX": {
                   description: "OK",
                   content: {
                     "application/json": {
@@ -819,7 +931,7 @@ describe("ADS-0001 end-to-end Redocly CLI enforcement", () => {
             ],
             get: {
               operationId: "getOrganization",
-              summary: "Get organization with nullable union",
+              summary: "Get organization with multi-variant oneOf",
               responses: {
                 "200": {
                   description: "OK",
@@ -830,13 +942,45 @@ describe("ADS-0001 end-to-end Redocly CLI enforcement", () => {
                           {
                             type: "object",
                             properties: {
+                              id: { type: "string" },
+                              kind: { type: "string" },
+                            },
+                          },
+                          {
+                            type: "object",
+                            properties: {
                               organizationId: { type: "string" },
                               name: { type: "string" },
                             },
                           },
-                          { type: "null" },
                         ],
                       },
+                    },
+                  },
+                },
+                "404": { description: "Not found" },
+              },
+            },
+          },
+          "/v1/workspaces/{workspaceId}": {
+            parameters: [
+              {
+                name: "workspaceId",
+                in: "path",
+                required: true,
+                description: "Workspace ID",
+                schema: { type: "string" },
+              },
+            ],
+            get: {
+              operationId: "getWorkspace",
+              summary: "Get workspace through chained $ref with sibling properties",
+              responses: {
+                "200": {
+                  description: "OK",
+                  content: {
+                    "application/json": {
+                      schema: { $ref: "#/components/schemas/WorkspaceShape" },
                     },
                   },
                 },
@@ -851,6 +995,12 @@ describe("ADS-0001 end-to-end Redocly CLI enforcement", () => {
               type: "object",
               properties: {
                 createdAt: { type: "string" },
+              },
+            },
+            WorkspaceShape: {
+              $ref: "#/components/schemas/Timestamped",
+              properties: {
+                workspaceId: { type: "string" },
               },
             },
             Project: {
@@ -903,7 +1053,7 @@ describe("ADS-0001 end-to-end Redocly CLI enforcement", () => {
       ),
     ).toBe(true);
 
-    // Inline GET item response, envelope-wrapped GET item response, nullable union GET item response
+    // 2XX fallback GET item response, envelope-wrapped GET item response, multi-variant oneOf, intermediate $ref chain
     expect(
       messages.some(
         (msg) =>
@@ -923,6 +1073,11 @@ describe("ADS-0001 end-to-end Redocly CLI enforcement", () => {
       messages.some(
         (msg) =>
           msg.includes("/v1/organizations/{organizationId}") && msg.includes('"organizationId"'),
+      ),
+    ).toBe(true);
+    expect(
+      messages.some(
+        (msg) => msg.includes("/v1/workspaces/{workspaceId}") && msg.includes('"workspaceId"'),
       ),
     ).toBe(true);
 

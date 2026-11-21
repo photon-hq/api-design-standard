@@ -13,3 +13,8 @@ export declare function checkText(
   text: string,
   options?: ContentFindingsOptions,
 ): void;
+export declare function checkCommitRange(
+  root: string,
+  revRange: string,
+  gitRunner?: (root: string, args: string[]) => string,
+): number;

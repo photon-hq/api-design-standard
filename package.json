@@ -52,10 +52,10 @@
     "lint": "biome check .",
     "format": "biome check --write .",
     "test": "vitest run",
-    "redocly:check": "redocly lint test/fixtures/valid-openapi.yaml --config redocly.yaml",
+    "redocly:check": "pnpm build && redocly lint test/fixtures/valid-openapi.yaml --config redocly.yaml",
     "docs:export": "tsx scripts/export-docs.ts",
     "check:public": "node tools/public-content/check.mjs",
-    "check": "pnpm typecheck && pnpm lint && pnpm build && pnpm test && pnpm redocly:check && pnpm docs:export && pnpm check:public"
+    "check": "pnpm typecheck && pnpm lint && pnpm build && pnpm test && redocly lint test/fixtures/valid-openapi.yaml --config redocly.yaml && pnpm docs:export && pnpm check:public"
   },
   "peerDependencies": {
     "@redocly/cli": "^2.0.0"

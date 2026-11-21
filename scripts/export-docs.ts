@@ -49,6 +49,8 @@ const ADS_FOLDER_RE = /^(\d{4})-([a-z0-9]+(?:-[a-z0-9]+)*)$/;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const FRONTMATTER_RE = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/;
 const LEADING_H1_RE = /^\s*#\s+[^\r\n]+\r?\n?/;
+const INLINE_RELATIVE_MD_LINK_RE = /\]\(\.\.?\/[^)]+\.md(?:#[^)]*)?\)/;
+const REF_RELATIVE_MD_LINK_RE = /^\s*\[[^\]]+\]:\s*<?\.\.?\/[^\s>]+\.md(?:#[^\s>]*)?>?(?:\s|$)/;
 const CANONICAL_REPOSITORY = "photon-hq/api-design-standards";
 const OVERVIEW_TITLE = "API Design Standards";
 const OVERVIEW_SIDEBAR_TITLE = "Overview";
@@ -84,12 +86,13 @@ export function stripFrontmatterAndH1(markdown: string): {
 }
 
 /**
- * Strips fenced code blocks and inline code spans so MDX syntax validation
- * inspects only prose and Markdown table text.
+ * Strips fenced code blocks and inline code spans (including spans wrapped
+ * across line breaks within a paragraph) while preserving line numbers so MDX
+ * syntax validation inspects only prose and Markdown table text.
  */
 function stripCodeFromMarkdown(markdown: string): string {
   const lines = markdown.split(/\r?\n/);
-  const proseLines: string[] = [];
+  const withoutFences: string[] = [];
   let activeFence: { char: string; length: number } | null = null;
 
   for (const line of lines) {
@@ -99,40 +102,92 @@ function stripCodeFromMarkdown(markdown: string): string {
       if (closeRe.test(trimmed)) {
         activeFence = null;
       }
+      withoutFences.push("");
       continue;
     }
 
     const openMatch = /^(`{3,}|~{3,})/.exec(trimmed);
     if (openMatch?.[1]) {
       activeFence = { char: openMatch[1][0] ?? "`", length: openMatch[1].length };
+      withoutFences.push("");
       continue;
     }
 
-    proseLines.push(stripInlineCodeSpans(line));
+    withoutFences.push(line);
   }
 
   assertCondition(activeFence === null, "Unclosed fenced code block in Markdown document.");
-  return proseLines.join("\n");
+
+  // Strip inline code spans paragraph by paragraph (CommonMark code spans can
+  // cross single line breaks, but never blank lines).
+  const resultLines: string[] = [];
+  let paragraph: string[] = [];
+
+  const flushParagraph = (): void => {
+    if (paragraph.length === 0) {
+      return;
+    }
+    const stripped = stripInlineCodeSpans(paragraph.join("\n"));
+    resultLines.push(...stripped.split("\n"));
+    paragraph = [];
+  };
+
+  for (const line of withoutFences) {
+    if (line.trim().length === 0) {
+      flushParagraph();
+      resultLines.push("");
+    } else {
+      paragraph.push(line);
+    }
+  }
+  flushParagraph();
+
+  return resultLines.join("\n");
 }
 
-function stripInlineCodeSpans(line: string): string {
+function stripInlineCodeSpans(text: string): string {
   let result = "";
   let index = 0;
 
-  while (index < line.length) {
-    if (line[index] === "`") {
+  while (index < text.length) {
+    if (text[index] === "`") {
       let tickEnd = index;
-      while (tickEnd < line.length && line[tickEnd] === "`") {
+      while (tickEnd < text.length && text[tickEnd] === "`") {
         tickEnd += 1;
       }
-      const fence = line.slice(index, tickEnd);
-      const closing = line.indexOf(fence, tickEnd);
-      if (closing !== -1) {
-        index = closing + fence.length;
+      const tickCount = tickEnd - index;
+      let searchFrom = tickEnd;
+      let closingStart = -1;
+
+      while (searchFrom < text.length) {
+        const nextTick = text.indexOf("`", searchFrom);
+        if (nextTick === -1) {
+          break;
+        }
+        let closeEnd = nextTick;
+        while (closeEnd < text.length && text[closeEnd] === "`") {
+          closeEnd += 1;
+        }
+        if (closeEnd - nextTick === tickCount) {
+          closingStart = nextTick;
+          break;
+        }
+        searchFrom = closeEnd;
+      }
+
+      if (closingStart !== -1) {
+        // Preserve newlines inside multi-line code spans so line numbers stay exact.
+        const span = text.slice(index, closingStart + tickCount);
+        result += span.replace(/[^\n]/g, "");
+        index = closingStart + tickCount;
         continue;
       }
+
+      result += text.slice(index, tickEnd);
+      index = tickEnd;
+      continue;
     }
-    result += line[index];
+    result += text[index];
     index += 1;
   }
 
@@ -149,24 +204,23 @@ export function validateMintlifyMdxSafety(label: string, markdown: string): void
     const unescapedBraces = line.replace(/\\[{}]/g, "");
     if (/[{}]/.test(unescapedBraces)) {
       throw new Error(
-        `Mintlify MDX safety violation in ${label} (prose line ${lineNum}): unescaped curly brace outside code span: ${line.trim()}`,
+        `Mintlify MDX safety violation in ${label} (line ${lineNum}): unescaped curly brace outside code span: ${line.trim()}`,
       );
     }
 
-    // Reject raw angle-bracket placeholders or HTML-like tags outside code
-    // (for example <resource> or <num>) that MDX would parse as JSX elements.
-    const unescapedAngles = line.replace(/\\[<>]/g, "");
-    if (/<\/?[A-Za-z][^>]*>/.test(unescapedAngles)) {
+    // Reject any unescaped "<" outside code spans (preserving "\<" escapes),
+    // preventing broken JSX tags or literal angle brackets in Mintlify MDX.
+    const unescapedAngles = line.replace(/\\</g, "");
+    if (unescapedAngles.includes("<")) {
       throw new Error(
-        `Mintlify MDX safety violation in ${label} (prose line ${lineNum}): unescaped angle-bracket tag outside code span: ${line.trim()}`,
+        `Mintlify MDX safety violation in ${label} (line ${lineNum}): unescaped "<" outside code span: ${line.trim()}`,
       );
     }
 
-    // Reject repo-relative .md links that would break once rendered in Mintlify.
-    if (/\]\(\.\.?\/[^)]+\.md(?:#[^)]*)?\)/.test(line)) {
-      throw new Error(
-        `Invalid relative .md link in ${label} (prose line ${lineNum}): ${line.trim()}`,
-      );
+    // Reject repo-relative .md links (both inline and reference-style definitions)
+    // that would break once rendered in Mintlify.
+    if (INLINE_RELATIVE_MD_LINK_RE.test(line) || REF_RELATIVE_MD_LINK_RE.test(line)) {
+      throw new Error(`Invalid relative .md link in ${label} (line ${lineNum}): ${line.trim()}`);
     }
   }
 }

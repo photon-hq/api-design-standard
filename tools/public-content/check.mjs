@@ -133,10 +133,16 @@ export function contentFindings(text, { checkIssueKeys = true, depth = 0 } = {})
       )) {
         inspect(Buffer.from(match[1], "base64").toString("utf8"), level + 1);
       }
-      if (value.includes("\\u")) {
+      const trimmed = value.trimStart();
+      if (
+        trimmed.startsWith("{") ||
+        trimmed.startsWith("[") ||
+        trimmed.startsWith('"') ||
+        value.includes("\\u")
+      ) {
         try {
           const decoded = JSON.parse(value);
-          if (decoded !== value) {
+          if (decoded !== value && (typeof decoded === "string" || typeof decoded === "object")) {
             inspect(decoded, level + 1);
           }
         } catch (error) {
@@ -164,6 +170,24 @@ export function contentFindings(text, { checkIssueKeys = true, depth = 0 } = {})
 export function checkText(label, text, options = {}) {
   const findings = contentFindings(text, options);
   assert.deepEqual(findings, [], `Blocked content in ${label}: ${findings.join(", ")}`);
+}
+
+const defaultGitRunner = (root, args) =>
+  execFileSync("git", args, {
+    cwd: root,
+    encoding: "utf8",
+    maxBuffer: 16 * 1024 * 1024,
+  });
+
+export function checkCommitRange(root, revRange, gitRunner = defaultGitRunner) {
+  const output = gitRunner(root, ["rev-list", revRange]);
+  const commits = output.split(/\r?\n/).filter(Boolean);
+  assert.ok(commits.length > 0, `No commits found in range ${revRange}`);
+  for (const sha of commits) {
+    const message = gitRunner(root, ["log", "-1", "--format=%B", sha]);
+    checkText(`commit ${sha.slice(0, 12)} message`, message, { checkIssueKeys: false });
+  }
+  return commits.length;
 }
 
 async function walk(root, prefix = "") {
@@ -202,12 +226,20 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
       checkIssueKeys: true,
     });
   }
-  if (process.argv.includes("--commit-message")) {
+  const commitRangeIndex = process.argv.indexOf("--commit-range");
+  let checkedCommits = 0;
+  if (commitRangeIndex !== -1) {
+    const revRange = process.argv[commitRangeIndex + 1];
+    assert.ok(revRange, "--commit-range requires a git revision range");
+    checkedCommits = checkCommitRange(root, revRange);
+  } else if (process.argv.includes("--commit-message")) {
     checkText(
       "the HEAD commit message",
       execFileSync("git", ["log", "-1", "--format=%B"], { cwd: root, encoding: "utf8" }),
       { checkIssueKeys: false },
     );
+    checkedCommits = 1;
   }
-  console.log(`Public content check passed (${paths.length} files).`);
+  const commitNote = checkedCommits > 0 ? `, ${checkedCommits} commit message(s)` : "";
+  console.log(`Public content check passed (${paths.length} files${commitNote}).`);
 }

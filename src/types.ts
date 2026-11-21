@@ -35,9 +35,15 @@ export interface RedoclyReport {
   from?: RedoclyLocation;
 }
 
+export interface RedoclyResolveChainItem<T = unknown> {
+  node?: T;
+  location?: RedoclyLocation;
+}
+
 export interface RedoclyResolveResult<T = unknown> {
   node?: T;
   location?: RedoclyLocation;
+  chain?: readonly RedoclyResolveChainItem<T>[];
   error?: unknown;
 }
 

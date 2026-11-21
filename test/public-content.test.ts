@@ -1,5 +1,9 @@
+import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { checkText, contentFindings } from "../tools/public-content/check.mjs";
+import { checkCommitRange, checkText, contentFindings } from "../tools/public-content/check.mjs";
+
+const REPO_ROOT = resolve(fileURLToPath(new URL("..", import.meta.url)));
 
 describe("public-content guard", () => {
   it("allows clean public ADS documentation and identifiers", () => {
@@ -15,14 +19,18 @@ describe("public-content guard", () => {
     expect(() => checkText("sample", sample)).not.toThrow();
   });
 
-  it("blocks local filesystem paths", () => {
+  it("blocks local filesystem paths including JSON-serialized Windows paths", () => {
     const unixPath = ["/", "Users", "/developer/repo/file.ts"].join("");
     const linuxPath = ["/", "home", "/runner/work/repo"].join("");
     const wsPath = ["/", "workspace", "/repo/file.ts"].join("");
+    const winJsonPath = JSON.stringify({
+      path: ["C:", "\\", "Users", "\\", "alice", "\\", "repo"].join(""),
+    });
 
     expect(contentFindings(unixPath)).toContain("local-filesystem-path");
     expect(contentFindings(linuxPath)).toContain("local-filesystem-path");
     expect(contentFindings(wsPath)).toContain("local-filesystem-path");
+    expect(contentFindings(winJsonPath)).toContain("local-filesystem-path");
   });
 
   it("blocks credential-shaped values", () => {
@@ -66,6 +74,32 @@ describe("public-content guard", () => {
     ).toString("base64");
     expect(contentFindings(`data:application/json;base64,${encoded}`)).toContain(
       "credential-shaped-value",
+    );
+  });
+
+  it("scans every commit message in a git revision range", () => {
+    // Exercise the live git path against the current checkout history.
+    expect(checkCommitRange(REPO_ROOT, "HEAD")).toBeGreaterThanOrEqual(1);
+
+    // Verify an earlier commit carrying a blocked token is caught even when HEAD is clean.
+    const leakedToken = ["ghp", "_", "Z".repeat(36)].join("");
+    const messages: Record<string, string> = {
+      "2222222222222222222222222222222222222222": "chore: clean head commit\n",
+      "1111111111111111111111111111111111111111": `feat: leaked ${leakedToken}\n`,
+    };
+    const fakeGit = (_root: string, args: string[]): string => {
+      if (args[0] === "rev-list") {
+        return Object.keys(messages).join("\n");
+      }
+      if (args[0] === "log") {
+        const sha = args[3] ?? "";
+        return messages[sha] ?? "";
+      }
+      throw new Error(`Unexpected git args: ${args.join(" ")}`);
+    };
+
+    expect(() => checkCommitRange(REPO_ROOT, "base..head", fakeGit)).toThrow(
+      /credential-shaped-value/,
     );
   });
 });

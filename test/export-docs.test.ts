@@ -58,7 +58,7 @@ describe("docs-reference export", () => {
         id: "photon-ads/ads-0001-path-param-naming",
         severity: "error",
         summary:
-          "URL path parameters must use lowerCamelCase resource-qualified names (for example `{projectId}`), never generic `{id}`.",
+          "URL path parameters must use lowerCamelCase, with resource-qualified names for resource identifiers (for example `{projectId}`), never generic `{id}`.",
       },
       {
         id: "photon-ads/ads-0001-path-param-consistency",
@@ -82,12 +82,15 @@ describe("docs-reference export", () => {
     expect(content1.endsWith("\n")).toBe(true);
   });
 
-  it("validates Mintlify MDX safety for braces, angle brackets, and code spans", () => {
+  it("validates Mintlify MDX safety for braces, angle brackets, wrapped code spans, and links", () => {
     expect(() =>
       validateMintlifyMdxSafety(
         "safe.md",
         [
           "Use `{projectId}` and `<resource>Id` inside inline code.",
+          "Wrapped spans like `/v1/projects/{",
+          "projectId}` across a single line break are valid CommonMark.",
+          "Escaped comparisons like values \\< 10 are also safe.",
           "",
           "```json",
           '{ "id": "prj_123" }',
@@ -102,10 +105,18 @@ describe("docs-reference export", () => {
 
     expect(() =>
       validateMintlifyMdxSafety("bad-tag.md", "Never write raw <resource>Id in prose."),
-    ).toThrow(/unescaped angle-bracket tag/);
+    ).toThrow(/unescaped "<"/);
+
+    expect(() =>
+      validateMintlifyMdxSafety("bad-lt.md", "Values must be < 10 without escaping."),
+    ).toThrow(/unescaped "<"/);
 
     expect(() =>
       validateMintlifyMdxSafety("bad-link.md", "See [ADS-0001](./ads/0001/index.md)."),
+    ).toThrow(/Invalid relative \.md link/);
+
+    expect(() =>
+      validateMintlifyMdxSafety("bad-ref-link.md", "See [Guide][guide].\n\n[guide]: ./guide.md"),
     ).toThrow(/Invalid relative \.md link/);
   });
 

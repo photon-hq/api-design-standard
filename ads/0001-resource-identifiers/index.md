@@ -76,18 +76,20 @@ Resource identifiers **SHOULD** be opaque, immutable, type-prefixed strings (for
 
 ### Non-resource payloads
 
-Non-resource payloads such as request bodies, aggregate summaries, and error responses are not required to define `id`, while still qualifying foreign keys in `lowerCamelCase`:
+Non-resource payloads such as request bodies, aggregate summaries, and error responses are not required to define `id`, while still qualifying foreign keys in `lowerCamelCase`.
+
+Request body for `POST /v1/projects`:
 
 ```json
-// POST /v1/projects request body
 {
   "organizationId": "org_01h455vb4pex5vsknk084sn02s",
   "name": "Acme Billing"
 }
 ```
 
+Response body for `GET /v1/projects/{projectId}/usage`:
+
 ```json
-// GET /v1/projects/{projectId}/usage response body
 {
   "projectId": "prj_01h455vb4pex5vsknk084sn02q",
   "totalCents": 4200
