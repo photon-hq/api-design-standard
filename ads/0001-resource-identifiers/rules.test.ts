@@ -214,7 +214,7 @@ describe("ADS-0001 unit helpers", () => {
 describe("ADS-0001 end-to-end Redocly CLI enforcement", () => {
   it("loads the plugin via local config and consumer package specifier without deprecation warnings", async () => {
     const require = createRequire(import.meta.url);
-    expect(require.resolve("@photon-ai/api-design-standards/redocly")).toBe(PLUGIN_DIST);
+    expect(require.resolve("@photon-hq/api-design-standards/redocly")).toBe(PLUGIN_DIST);
 
     const { exitCode, stderr, report } = runRedoclyLint(VALID_FIXTURE);
     expect(exitCode).toBe(0);
@@ -223,15 +223,15 @@ describe("ADS-0001 end-to-end Redocly CLI enforcement", () => {
     expect(report.totals.warnings).toBe(0);
     expect(adsProblems(report)).toEqual([]);
 
-    // Exercise the documented consumer setup using `@photon-ai/api-design-standards/redocly`.
+    // Exercise the documented consumer setup using `@photon-hq/api-design-standards/redocly`.
     const consumerDir = join(tempDir, "consumer");
-    const scopeDir = join(consumerDir, "node_modules", "@photon-ai");
+    const scopeDir = join(consumerDir, "node_modules", "@photon-hq");
     await mkdir(scopeDir, { recursive: true });
     await symlink(REPO_ROOT, join(scopeDir, "api-design-standards"), "dir");
     const consumerConfig = join(consumerDir, "redocly.yaml");
     await writeFile(
       consumerConfig,
-      'plugins:\n  - "@photon-ai/api-design-standards/redocly"\nextends:\n  - photon-ads/recommended\n',
+      'plugins:\n  - "@photon-hq/api-design-standards/redocly"\nextends:\n  - photon-ads/recommended\n',
       "utf8",
     );
 

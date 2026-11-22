@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import {
   buildDocsReference,
   exportDocsReference,
+  resolveExportVersion,
   rewriteOverviewLinksForDocs,
   stripFrontmatterAndH1,
   validateMintlifyMdxSafety,
@@ -20,7 +21,7 @@ describe("docs-reference export", () => {
     expect(first).toEqual(second);
     expect(first.schemaVersion).toBe(1);
     expect(first.family).toBe("ads");
-    expect(first.source.package).toBe("@photon-ai/api-design-standards");
+    expect(first.source.package).toBe("@photon-hq/api-design-standards");
     expect(first.source.repository).toBe("photon-hq/api-design-standards");
     expect(first.source.revision).toMatch(/^[a-f0-9]{40}$/);
     expect(first.source.version).toMatch(/^\d+\.\d+\.\d+$/);
@@ -172,5 +173,40 @@ describe("docs-reference export", () => {
     ).toBe(
       "See [ADS-0001](./ads-0001) and [LICENSE](https://github.com/photon-hq/api-design-standards/blob/main/LICENSE).",
     );
+  });
+
+  it("supports RELEASE_VERSION override and rejects invalid versions", async () => {
+    expect(resolveExportVersion("0.1.0", undefined)).toBe("0.1.0");
+    expect(resolveExportVersion("0.1.0", "0.2.0")).toBe("0.2.0");
+    expect(resolveExportVersion("0.1.0", "0.2.0-staging.123.1")).toBe("0.2.0-staging.123.1");
+    expect(resolveExportVersion("0.1.0", "1.2.3-rc.1+build.7")).toBe("1.2.3-rc.1+build.7");
+    expect(() => resolveExportVersion("0.1.0", "")).toThrow(/Invalid RELEASE_VERSION/);
+    expect(() => resolveExportVersion("0.1.0", "v0.2.0")).toThrow(/Invalid RELEASE_VERSION/);
+    expect(() => resolveExportVersion("0.1.0", "not-a-version")).toThrow(/Invalid RELEASE_VERSION/);
+
+    const previous = process.env.RELEASE_VERSION;
+    const previousSha = process.env.GITHUB_SHA;
+    try {
+      const baseline = await buildDocsReference(REPO_ROOT);
+      process.env.RELEASE_VERSION = "0.2.0";
+      process.env.GITHUB_SHA = "0".repeat(40);
+      const overridden = await buildDocsReference(REPO_ROOT);
+      expect(overridden.source.version).toBe("0.2.0");
+      expect(overridden.source.revision).toBe(baseline.source.revision);
+
+      process.env.RELEASE_VERSION = "invalid";
+      await expect(buildDocsReference(REPO_ROOT)).rejects.toThrow(/Invalid RELEASE_VERSION/);
+    } finally {
+      if (previous === undefined) {
+        delete process.env.RELEASE_VERSION;
+      } else {
+        process.env.RELEASE_VERSION = previous;
+      }
+      if (previousSha === undefined) {
+        delete process.env.GITHUB_SHA;
+      } else {
+        process.env.GITHUB_SHA = previousSha;
+      }
+    }
   });
 });

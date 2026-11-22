@@ -10,7 +10,8 @@ describe("public-content guard", () => {
     const sample = [
       "ADS-0001: Resource Identifiers and Path Parameter Naming",
       "RFC-2119, UTF-8, SHA-256, ISO-8601, Apache-2.0",
-      "@photon-ai/api-design-standards",
+      "@photon-hq/api-design-standards",
+      "@photon-hq:registry=https://npm.pkg.github.com",
       "https://github.com/photon-hq/api-design-standards",
       "https://api.example.com/v1/projects/{projectId}/api-keys/{apiKeyId}",
     ].join("\n");
@@ -43,9 +44,32 @@ describe("public-content guard", () => {
     expect(contentFindings(fakeAws)).toContain("credential-shaped-value");
   });
 
-  it("blocks internal package dependencies", () => {
-    const dep = ['import x from "@photon-', 'hq/internal-pkg";'].join("");
-    expect(contentFindings(dep)).toContain("internal-package-dependency");
+  it("allows this public package while blocking other @photon-hq internal package dependencies", () => {
+    const allowedOwnPackage = [
+      'import plugin from "@photon-hq/api-design-standards";',
+      'import redocly from "@photon-hq/api-design-standards/redocly";',
+      'require.resolve("@photon-hq/api-design-standards/redocly");',
+      '{"devDependencies": {"@photon-hq/api-design-standards": "^0.1.0"}}',
+      "node_modules/@photon-hq/api-design-standards/dist/src/redocly-plugin.js",
+      "https://npm.pkg.github.com/@photon-hq/api-design-standards",
+      "https://npm.pkg.github.com/@photon-hq/api-design-standards/-/api-design-standards-0.1.0.tgz",
+    ].join("\n");
+    expect(contentFindings(allowedOwnPackage)).toEqual([]);
+
+    const blockedSamples = [
+      ['import x from "@photon-', 'hq/internal-pkg";'].join(""),
+      ['import x from "@photon-', 'hq/other-pkg/subpath";'].join(""),
+      ['import x from "@photon-', 'hq/api-design-standards-internal";'].join(""),
+      ['require.resolve("@photon-', 'hq/other-pkg");'].join(""),
+      ['{"dependencies": {"@photon-', 'hq/other-pkg": "^1.0.0"}}'].join(""),
+      ["node_modules/@photon-", "hq/other-pkg/index.js"].join(""),
+      ["https://npm.pkg.github.com/@photon-", "hq/other-pkg"].join(""),
+      ["https://npm.pkg.github.com/@photon-", "hq/api-design-standards-extra"].join(""),
+      ["https://npm.pkg.github.com/@photon-", "hq%2Fother-pkg"].join(""),
+    ];
+    for (const sample of blockedSamples) {
+      expect(contentFindings(sample)).toContain("internal-package-dependency");
+    }
   });
 
   it("blocks internal issue keys and tracker URLs in tracked files while allowing them in commit messages", () => {

@@ -19,41 +19,35 @@ Each standard in **Photon API Design Standards (ADS)** defines a service-agnosti
 
 ## Reporting Non-Conformant Photon APIs
 
-If you find any Photon API endpoint that does not follow these standards, please open an issue in [photon-hq/api-design-standards](https://github.com/photon-hq/api-design-standards/issues/new). Include the HTTP method, path, the standard or rule that is violated, and an example request or response payload when available.
+If you find any Photon API endpoint that does not follow these standards, please open an issue in [photon-hq/api-design-standards](https://github.com/photon-hq/api-design-standards/issues/new). Include the HTTP method, path, the standard or rule that is violated, and a sanitized or synthetic example request or response payload (with any credentials, tokens, or sensitive customer data removed) when available.
 
 Pull requests are restricted to repository collaborators, while [GitHub Issues](https://github.com/photon-hq/api-design-standards/issues) are open to everyone for violation reports, questions, and standard proposals.
 
 ## Using the Redocly Plugin
 
-Releases are currently distributed through [GitHub Releases](https://github.com/photon-hq/api-design-standards/releases); the `@photon-ai/api-design-standards` package is not yet published to npm.
+`@photon-hq/api-design-standards` is published to GitHub Packages alongside [GitHub Releases](https://github.com/photon-hq/api-design-standards/releases). Configure your project's `.npmrc` to resolve the `@photon-hq` scope from GitHub Packages (authentication requires a GitHub token with `read:packages` scope):
 
-Clone [photon-hq/api-design-standards](https://github.com/photon-hq/api-design-standards) (or check out a release tag) and build the plugin locally:
-
-```bash
-git clone https://github.com/photon-hq/api-design-standards.git
-cd api-design-standards
-pnpm install
-pnpm build
+```ini
+@photon-hq:registry=https://npm.pkg.github.com
+//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}
 ```
 
-Install `@redocly/cli` (v2) in your project if you do not already have it:
+Install `@photon-hq/api-design-standards` alongside `@redocly/cli` (v2):
 
 ```bash
-pnpm add -D @redocly/cli@2
+pnpm add -D @photon-hq/api-design-standards @redocly/cli
 ```
 
-Register the compiled `photon-ads` plugin entrypoint (adjusting the path to your local clone) and extend `photon-ads/recommended` in your `redocly.yaml`:
+Register the `photon-ads` plugin and extend `photon-ads/recommended` in your `redocly.yaml`:
 
 ```yaml
 plugins:
-  - ../api-design-standards/dist/src/redocly-plugin.js
+  - "@photon-hq/api-design-standards/redocly"
 
 extends:
   - recommended
   - photon-ads/recommended
 ```
-
-If you link or install the built checkout locally as `@photon-ai/api-design-standards`, you can reference `"@photon-ai/api-design-standards/redocly"` under `plugins:` instead.
 
 You can also override individual rule severities under `rules:`:
 

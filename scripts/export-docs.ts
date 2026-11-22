@@ -48,6 +48,7 @@ export interface DocsReferenceDocument {
 const VALID_STATUSES = new Set<AdsStatus>(["Draft", "Reviewing", "Approved", "Deprecated"]);
 const ADS_FOLDER_RE = /^(\d{4})-([a-z0-9]+(?:-[a-z0-9]+)*)$/;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const SEMVER_RE = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
 const FRONTMATTER_RE = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/;
 const LEADING_H1_RE = /^\s*#\s+[^\r\n]+\r?\n?/;
 const EXTERNAL_OR_ANCHOR_HREF_RE = /^(?:https?:|mailto:|#)/i;
@@ -223,17 +224,43 @@ export function rewriteOverviewLinksForDocs(markdown: string): string {
     );
 }
 
-function readGitRevision(rootDir: string): string {
-  const envSha = process.env.GITHUB_SHA?.trim();
-  if (envSha && /^[a-f0-9]{40}$/.test(envSha)) {
-    return envSha;
+export function resolveExportVersion(
+  packageVersion: string,
+  releaseVersion: string | undefined = process.env.RELEASE_VERSION,
+): string {
+  if (releaseVersion === undefined) {
+    assertCondition(
+      SEMVER_RE.test(packageVersion),
+      `package.json version "${packageVersion}" must be a valid semver string.`,
+    );
+    return packageVersion;
   }
-  const sha = execFileSync("git", ["rev-parse", "HEAD"], {
-    cwd: rootDir,
-    encoding: "utf8",
-  }).trim();
-  assertCondition(/^[a-f0-9]{40}$/.test(sha), `Expected 40-char git revision SHA, got "${sha}".`);
-  return sha;
+  const trimmed = releaseVersion.trim();
+  assertCondition(
+    SEMVER_RE.test(trimmed),
+    `Invalid RELEASE_VERSION "${releaseVersion}". Expected semver matching X.Y.Z (with optional prerelease/build suffix).`,
+  );
+  return trimmed;
+}
+
+function readGitRevision(rootDir: string): string {
+  try {
+    const sha = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: rootDir,
+      encoding: "utf8",
+    }).trim();
+    if (/^[a-f0-9]{40}$/.test(sha)) {
+      return sha;
+    }
+  } catch {
+    // Fall back to GITHUB_SHA when running outside a git checkout.
+  }
+  const envSha = process.env.GITHUB_SHA?.trim();
+  assertCondition(
+    envSha && /^[a-f0-9]{40}$/.test(envSha),
+    "Expected 40-char git revision SHA from git rev-parse HEAD or GITHUB_SHA.",
+  );
+  return envSha;
 }
 
 async function assertFileExists(path: string, message: string): Promise<void> {
@@ -272,6 +299,7 @@ export async function buildDocsReference(rootDir: string): Promise<DocsReference
     "package.json must define version.",
   );
 
+  const version = resolveExportVersion(pkg.version);
   const revision = readGitRevision(rootDir);
 
   const readmePath = resolve(rootDir, "README.md");
@@ -437,7 +465,7 @@ export async function buildDocsReference(rootDir: string): Promise<DocsReference
       package: pkg.name,
       repository: CANONICAL_REPOSITORY,
       revision,
-      version: pkg.version,
+      version,
     },
     overview: {
       title: OVERVIEW_TITLE,

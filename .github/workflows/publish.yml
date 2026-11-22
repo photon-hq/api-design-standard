@@ -1,0 +1,38 @@
+name: Publish staging
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        type: boolean
+        default: true
+        description: Verify and package only
+
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('publish-staging-{0}', github.ref) || 'publish-staging' }}
+  queue: max
+
+permissions:
+  contents: read
+
+jobs:
+  stage:
+    uses: photon-hq/buildspace/.github/workflows/package-stage.yml@1941484be11615e956f5cc819f391a0e58457b71
+    permissions:
+      contents: write
+      pull-requests: read
+      packages: write
+      actions: read
+      attestations: write
+      id-token: write
+    with:
+      package: "@photon-hq/api-design-standards"
+      ci-workflow: ci.yml
+      verify: pnpm check
+      pack: node scripts/pack-release.ts
+      dry-run: ${{ github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.dry_run) }}

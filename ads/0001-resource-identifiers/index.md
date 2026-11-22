@@ -139,7 +139,7 @@ paths:
 
 ## Lint Rules
 
-The `@photon-ai/api-design-standards` Redocly plugin (`photon-ads`) enforces ADS-0001 with the following deterministic OpenAPI 3 rules:
+The `@photon-hq/api-design-standards` Redocly plugin (`photon-ads`) enforces ADS-0001 with the following deterministic OpenAPI 3 rules:
 
 | Rule ID | Default Severity | What it enforces |
 | --- | --- | --- |
