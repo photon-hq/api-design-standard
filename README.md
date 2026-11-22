@@ -17,11 +17,14 @@ Each standard in **Photon API Design Standards (ADS)** defines a service-agnosti
 - **Approved**: Binding default for new and redesigned Photon public HTTP APIs.
 - **Deprecated**: Superseded by a newer standard.
 
-## Reporting Non-Conformant Photon APIs
+Proposals are developed through collaborator pull requests in this repository, and only **Approved** standards are published to the developer docs.
 
-If you find any Photon API endpoint that does not follow these standards, please open an issue in [photon-hq/api-design-standards](https://github.com/photon-hq/api-design-standards/issues/new). Include the HTTP method, path, the standard or rule that is violated, and a sanitized or synthetic example request or response payload (with any credentials, tokens, or sensitive customer data removed) when available.
+## Feedback & Reporting Issues
 
-Pull requests are restricted to repository collaborators, while [GitHub Issues](https://github.com/photon-hq/api-design-standards/issues) are open to everyone for violation reports, questions, and standard proposals.
+We do not accept external pull requests to this repository. Instead, [GitHub Issues](https://github.com/photon-hq/api-design-standards/issues) are open to everyone:
+
+- **Report a non-conformant Photon API**: If you find any Photon API endpoint that does not follow these standards, please [open an issue](https://github.com/photon-hq/api-design-standards/issues/new) with the HTTP method, path, the standard or rule that is violated, and a sanitized or synthetic example request or response payload (with any credentials, tokens, or sensitive customer data removed) when available.
+- **Suggest improvements or new standards**: [Open an issue](https://github.com/photon-hq/api-design-standards/issues/new) describing the problem, proposed convention, and motivating examples.
 
 ## Using the Redocly Plugin
 
@@ -66,10 +69,11 @@ npx redocly lint openapi.yaml --config redocly.yaml
 
 ## Repository Layout
 
-Each standard lives in its own co-located folder under `ads/`:
+The external developer documentation overview and each standard live under `ads/`:
 
 ```text
 ads/
+  overview.md      # External developer documentation overview
   0001-resource-identifiers/
     index.md       # Authoritative Markdown specification and rule table
     rules.ts       # Deterministic Redocly OpenAPI 3 rules
@@ -97,7 +101,7 @@ Individual commands:
 
 ## Proposing a New Standard
 
-To propose a new API Design Standard or suggest a change to an existing one, [open a GitHub issue](https://github.com/photon-hq/api-design-standards/issues/new) describing the problem, proposed contract rules, and motivating examples. Pull requests are restricted to repository collaborators.
+We do not accept external pull requests. To propose a new API Design Standard or suggest a change to an existing one, [open a GitHub issue](https://github.com/photon-hq/api-design-standards/issues/new) describing the problem, proposed contract rules, and motivating examples. Proposals are developed through collaborator pull requests in this repository, and only **Approved** standards are published to the developer docs.
 
 ### Collaborator Authoring Checklist
 

@@ -6,7 +6,12 @@ import { Lexer, type Token, type Tokens } from "marked";
 import { parse as parseYaml } from "yaml";
 import { ADS_STANDARDS, PLUGIN_ID } from "../src/catalog.js";
 import { createPhotonAdsPlugin } from "../src/plugin.js";
-import type { AdsRuleSeverity, AdsStatus } from "../src/types.js";
+import type {
+  AdsRuleSeverity,
+  AdsStandardMetadata,
+  AdsStatus,
+  RedoclyPlugin,
+} from "../src/types.js";
 
 export interface DocsReferenceRule {
   id: string;
@@ -45,6 +50,11 @@ export interface DocsReferenceDocument {
   standards: DocsReferenceStandard[];
 }
 
+export interface BuildDocsReferenceOptions {
+  standardsCatalog?: readonly AdsStandardMetadata[];
+  plugin?: RedoclyPlugin;
+}
+
 const VALID_STATUSES = new Set<AdsStatus>(["Draft", "Reviewing", "Approved", "Deprecated"]);
 const ADS_FOLDER_RE = /^(\d{4})-([a-z0-9]+(?:-[a-z0-9]+)*)$/;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -55,11 +65,8 @@ const LEADING_H1_RE = /^\s*#\s+[^\r\n]+\r?\n?/;
 const EXTERNAL_OR_ANCHOR_HREF_RE = /^(?:https?:|mailto:|#)/i;
 const MARKDOWN_HREF_RE = /\.md(?:#.*)?$/i;
 const FENCE_OPEN_RE = /^\s{0,3}(`{3,}|~{3,})/;
+const LINT_RULES_TITLE_RE = /^(?:Deterministic\s+)?Lint\s+Rules$/i;
 const CANONICAL_REPOSITORY = "photon-hq/api-design-standards";
-const OVERVIEW_TITLE = "API Design Standards";
-const OVERVIEW_SIDEBAR_TITLE = "Overview";
-const OVERVIEW_DESCRIPTION =
-  "Public HTTP API design standards and deterministic OpenAPI lint rules for Photon APIs.";
 
 function assertCondition(condition: unknown, message: string): asserts condition {
   if (!condition) {
@@ -85,7 +92,7 @@ export function stripFrontmatterAndH1(markdown: string): {
     content = match[2] ?? "";
   }
 
-  const withoutH1 = content.replace(LEADING_H1_RE, "").trim();
+  const withoutH1 = content.replace(LEADING_H1_RE, "").replaceAll("\r\n", "\n").trim();
   return { frontmatter, body: withoutH1 };
 }
 
@@ -213,14 +220,49 @@ export function validateMintlifyMdxSafety(label: string, markdown: string): void
   }
 }
 
+export function stripLintRulesSection(markdown: string): string {
+  const normalized = markdown.replaceAll("\r\n", "\n");
+  const tokens = Lexer.lex(normalized, { gfm: true });
+  const kept: string[] = [];
+  let skipping = false;
+
+  for (const token of tokens) {
+    if (token.type === "heading") {
+      const heading = token as Tokens.Heading;
+      if (heading.depth === 2 && LINT_RULES_TITLE_RE.test(heading.text.trim())) {
+        skipping = true;
+        continue;
+      }
+      if (skipping && heading.depth <= 2) {
+        skipping = false;
+        while (kept.length > 0 && kept[kept.length - 1]?.trim() === "") {
+          kept.pop();
+        }
+        const previous = kept.pop();
+        if (previous !== undefined) {
+          kept.push(previous.replace(/\n+$/, ""), "\n\n");
+        }
+        kept.push(token.raw);
+        continue;
+      }
+    }
+
+    if (!skipping) {
+      kept.push(token.raw);
+    }
+  }
+
+  return kept.join("").trim();
+}
+
 export function rewriteOverviewLinksForDocs(markdown: string): string {
   return markdown
     .replace(
-      /\]\(\.\/ads\/(\d{4})-[a-z0-9-]+\/index\.md(#[^)]*)?\)/g,
+      /\]\(\.(?:\/ads)?\/(\d{4})-[a-z0-9-]+\/index\.md(#[^)]*)?\)/g,
       (_match, num: string, hash: string | undefined) => `](./ads-${num}${hash ?? ""})`,
     )
     .replace(
-      /\]\(\.\/LICENSE\)/g,
+      /\]\((?:\.|\.\.)\/LICENSE\)/g,
       `](https://github.com/${CANONICAL_REPOSITORY}/blob/main/LICENSE)`,
     );
 }
@@ -292,7 +334,10 @@ function parseFrontmatterString(
   return value.trim();
 }
 
-export async function buildDocsReference(rootDir: string): Promise<DocsReferenceDocument> {
+export async function buildDocsReference(
+  rootDir: string,
+  options: BuildDocsReferenceOptions = {},
+): Promise<DocsReferenceDocument> {
   const packageJsonPath = resolve(rootDir, "package.json");
   const pkg = JSON.parse(await readFile(packageJsonPath, "utf8")) as {
     name?: string;
@@ -310,12 +355,26 @@ export async function buildDocsReference(rootDir: string): Promise<DocsReference
   const version = resolveExportVersion(pkg.version, process.env.RELEASE_VERSION);
   const revision = readGitRevision(rootDir);
 
-  const readmePath = resolve(rootDir, "README.md");
-  const readmeRaw = await readFile(readmePath, "utf8");
-  const { body: rawOverviewBody } = stripFrontmatterAndH1(readmeRaw);
+  const overviewLabel = "ads/overview.md";
+  const overviewPath = resolve(rootDir, overviewLabel);
+  const overviewRaw = await readFile(overviewPath, "utf8");
+  const { frontmatter: overviewFrontmatter, body: rawOverviewBody } =
+    stripFrontmatterAndH1(overviewRaw);
+  assertCondition(overviewFrontmatter !== null, `${overviewLabel} is missing YAML frontmatter.`);
+  const overviewTitle = parseFrontmatterString(overviewFrontmatter, "title", overviewLabel);
+  const overviewSidebarTitle = parseFrontmatterString(
+    overviewFrontmatter,
+    "sidebarTitle",
+    overviewLabel,
+  );
+  const overviewDescription = parseFrontmatterString(
+    overviewFrontmatter,
+    "description",
+    overviewLabel,
+  );
   const overviewBody = rewriteOverviewLinksForDocs(rawOverviewBody);
-  assertCondition(overviewBody.length > 0, "README.md overview body must not be empty.");
-  validateMintlifyMdxSafety("README.md (overview)", overviewBody);
+  assertCondition(overviewBody.length > 0, `${overviewLabel} body must not be empty.`);
+  validateMintlifyMdxSafety(overviewLabel, overviewBody);
 
   const adsDir = resolve(rootDir, "ads");
   const entries = await readdir(adsDir, { withFileTypes: true });
@@ -326,7 +385,8 @@ export async function buildDocsReference(rootDir: string): Promise<DocsReference
 
   assertCondition(folders.length > 0, "No ADS folders found under ads/.");
 
-  const plugin = createPhotonAdsPlugin();
+  const standardsCatalog = options.standardsCatalog ?? ADS_STANDARDS;
+  const plugin = options.plugin ?? createPhotonAdsPlugin();
   const pluginRuleNames = new Set(Object.keys(plugin.rules.oas3));
   const pluginRecommendedRuleIds = new Set(Object.keys(plugin.configs?.recommended?.rules ?? {}));
   const seenRuleNames = new Set<string>();
@@ -354,7 +414,7 @@ export async function buildDocsReference(rootDir: string): Promise<DocsReference
       `ADS folder "ads/${folder}" is missing required file "rules.test.ts".`,
     );
 
-    const catalogEntry = ADS_STANDARDS.find((item) => item.folder === folder);
+    const catalogEntry = standardsCatalog.find((item) => item.folder === folder);
     assertCondition(
       catalogEntry,
       `ADS folder "ads/${folder}" is not registered in src/catalog.ts (ADS_STANDARDS).`,
@@ -436,6 +496,17 @@ export async function buildDocsReference(rootDir: string): Promise<DocsReference
       );
     }
 
+    if (status !== "Approved") {
+      continue;
+    }
+
+    const exportedBody = stripLintRulesSection(body);
+    assertCondition(
+      exportedBody.length > 0,
+      `${label}: body after removing Lint Rules section must not be empty.`,
+    );
+    validateMintlifyMdxSafety(label, exportedBody);
+
     standards.push({
       ads: adsNumber,
       slug: catalogEntry.slug,
@@ -446,11 +517,11 @@ export async function buildDocsReference(rootDir: string): Promise<DocsReference
       status,
       updated,
       rules,
-      body,
+      body: exportedBody,
     });
   }
 
-  for (const catalogEntry of ADS_STANDARDS) {
+  for (const catalogEntry of standardsCatalog) {
     assertCondition(
       folders.includes(catalogEntry.folder),
       `Catalog entry "${catalogEntry.folder}" has no matching directory under ads/.`,
@@ -464,6 +535,11 @@ export async function buildDocsReference(rootDir: string): Promise<DocsReference
     );
   }
 
+  assertCondition(
+    standards.length > 0,
+    "At least one Approved ADS standard is required to export docs-reference.json.",
+  );
+
   standards.sort((a, b) => a.ads.localeCompare(b.ads, "en"));
 
   return {
@@ -476,9 +552,9 @@ export async function buildDocsReference(rootDir: string): Promise<DocsReference
       version,
     },
     overview: {
-      title: OVERVIEW_TITLE,
-      sidebarTitle: OVERVIEW_SIDEBAR_TITLE,
-      description: OVERVIEW_DESCRIPTION,
+      title: overviewTitle,
+      sidebarTitle: overviewSidebarTitle,
+      description: overviewDescription,
       body: overviewBody,
     },
     standards,
