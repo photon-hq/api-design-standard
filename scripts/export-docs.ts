@@ -65,12 +65,7 @@ const LEADING_H1_RE = /^\s*#\s+[^\r\n]+\r?\n?/;
 const EXTERNAL_OR_ANCHOR_HREF_RE = /^(?:https?:|mailto:|#)/i;
 const MARKDOWN_HREF_RE = /\.md(?:#.*)?$/i;
 const FENCE_OPEN_RE = /^\s{0,3}(`{3,}|~{3,})/;
-const BACKTICK_FENCE_OPEN_RE = /^ {0,3}(`{3,})[^`]*$/;
-const TILDE_FENCE_OPEN_RE = /^ {0,3}(~{3,})/;
-const FENCE_CLOSE_RE = /^ {0,3}(`{3,}|~{3,})$/;
-const LINT_RULES_H2_RE =
-  /^ {0,3}##[ \t]+(?:Deterministic[ \t]+)?Lint[ \t]+Rules(?:[ \t]+#+)?[ \t]*$/i;
-const H1_OR_H2_RE = /^ {0,3}#{1,2}(?:[ \t]+|$)/;
+const LINT_RULES_TITLE_RE = /^(?:Deterministic\s+)?Lint\s+Rules$/i;
 const CANONICAL_REPOSITORY = "photon-hq/api-design-standards";
 
 function assertCondition(condition: unknown, message: string): asserts condition {
@@ -226,60 +221,38 @@ export function validateMintlifyMdxSafety(label: string, markdown: string): void
 }
 
 export function stripLintRulesSection(markdown: string): string {
-  const lines = markdown.replaceAll("\r\n", "\n").split("\n");
+  const normalized = markdown.replaceAll("\r\n", "\n");
+  const tokens = Lexer.lex(normalized, { gfm: true });
   const kept: string[] = [];
-  let fenceChar: "`" | "~" | null = null;
-  let fenceLen = 0;
   let skipping = false;
 
-  for (const line of lines) {
-    if (fenceChar !== null) {
-      const closeMatch = FENCE_CLOSE_RE.exec(line.trimEnd());
-      if (closeMatch?.[1] && closeMatch[1][0] === fenceChar && closeMatch[1].length >= fenceLen) {
-        fenceChar = null;
-        fenceLen = 0;
+  for (const token of tokens) {
+    if (token.type === "heading") {
+      const heading = token as Tokens.Heading;
+      if (heading.depth === 2 && LINT_RULES_TITLE_RE.test(heading.text.trim())) {
+        skipping = true;
+        continue;
       }
-      if (!skipping) {
-        kept.push(line);
-      }
-      continue;
-    }
-
-    const backtickOpen = BACKTICK_FENCE_OPEN_RE.exec(line);
-    const tildeOpen = backtickOpen ? null : TILDE_FENCE_OPEN_RE.exec(line);
-    const fenceToken = backtickOpen?.[1] ?? tildeOpen?.[1];
-    if (fenceToken) {
-      fenceChar = fenceToken[0] as "`" | "~";
-      fenceLen = fenceToken.length;
-      if (!skipping) {
-        kept.push(line);
-      }
-      continue;
-    }
-
-    if (LINT_RULES_H2_RE.test(line)) {
-      skipping = true;
-      continue;
-    }
-
-    if (skipping) {
-      if (H1_OR_H2_RE.test(line)) {
+      if (skipping && heading.depth <= 2) {
         skipping = false;
         while (kept.length > 0 && kept[kept.length - 1]?.trim() === "") {
           kept.pop();
         }
-        if (kept.length > 0) {
-          kept.push("");
+        const previous = kept.pop();
+        if (previous !== undefined) {
+          kept.push(previous.replace(/\n+$/, ""), "\n\n");
         }
-        kept.push(line);
+        kept.push(token.raw);
+        continue;
       }
-      continue;
     }
 
-    kept.push(line);
+    if (!skipping) {
+      kept.push(token.raw);
+    }
   }
 
-  return kept.join("\n").trim();
+  return kept.join("").trim();
 }
 
 export function rewriteOverviewLinksForDocs(markdown: string): string {

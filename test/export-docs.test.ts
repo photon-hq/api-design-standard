@@ -248,6 +248,66 @@ describe("docs-reference export", () => {
 
     const withoutLintRules = "## Normative Rules\n\nUse `id`.";
     expect(stripLintRulesSection(withoutLintRules)).toBe(withoutLintRules);
+
+    const withSetextNextSection = [
+      "## Normative Rules",
+      "",
+      "Use `id`.",
+      "",
+      "## Lint Rules",
+      "",
+      "Internal plugin details.",
+      "",
+      "```markdown",
+      "Examples",
+      "--------",
+      "```",
+      "",
+      "Examples",
+      "--------",
+      "",
+      "Keep these examples.",
+    ].join("\n");
+    expect(stripLintRulesSection(withSetextNextSection)).toBe(
+      [
+        "## Normative Rules",
+        "",
+        "Use `id`.",
+        "",
+        "Examples",
+        "--------",
+        "",
+        "Keep these examples.",
+      ].join("\n"),
+    );
+
+    const withSetextLintRules = [
+      "## Normative Rules",
+      "",
+      "Use `id`.",
+      "",
+      "Lint Rules",
+      "----------",
+      "",
+      "Removed setext lint section.",
+      "",
+      "Changelog",
+      "=========",
+      "",
+      "- **2026-11-21**: Approved.",
+    ].join("\n");
+    expect(stripLintRulesSection(withSetextLintRules)).toBe(
+      [
+        "## Normative Rules",
+        "",
+        "Use `id`.",
+        "",
+        "Changelog",
+        "=========",
+        "",
+        "- **2026-11-21**: Approved.",
+      ].join("\n"),
+    );
   });
 
   it("exports only Approved standards and excludes Draft, Reviewing, and Deprecated standards", async () => {
