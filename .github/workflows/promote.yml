@@ -1,0 +1,83 @@
+name: Promote to production
+
+on:
+  workflow_dispatch:
+    inputs:
+      staging_version:
+        type: string
+        default: ""
+        description: Staging version to promote (blank uses the staging tag)
+
+permissions:
+  contents: read
+
+jobs:
+  promote:
+    uses: photon-hq/buildspace/.github/workflows/package-promote.yml@1941484be11615e956f5cc819f391a0e58457b71
+    permissions:
+      contents: write
+      packages: write
+      actions: read
+      attestations: read
+    with:
+      package: "@photon-hq/api-design-standards"
+      staging-version: ${{ inputs.staging_version }}
+
+  attach-docs-reference:
+    name: Attach docs-reference.json to release
+    needs: promote
+    if: needs.promote.outputs.version != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Validate promoted version
+        env:
+          VERSION: ${{ needs.promote.outputs.version }}
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || {
+            echo "::error::Invalid promoted version: $VERSION" >&2
+            exit 1
+          }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/v${{ needs.promote.outputs.version }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Export and verify docs-reference.json
+        env:
+          VERSION: ${{ needs.promote.outputs.version }}
+          RELEASE_VERSION: ${{ needs.promote.outputs.version }}
+        run: |
+          set -euo pipefail
+          pnpm docs:export
+          EXPECTED_REVISION="$(git rev-parse HEAD)"
+          export EXPECTED_REVISION
+          node --input-type=module -e '
+            import assert from "node:assert/strict";
+            import { readFileSync } from "node:fs";
+            const doc = JSON.parse(readFileSync("artifacts/docs-reference.json", "utf8"));
+            assert.equal(doc.schemaVersion, 1);
+            assert.equal(doc.family, "ads");
+            assert.equal(doc.source.package, "@photon-hq/api-design-standards");
+            assert.equal(doc.source.repository, "photon-hq/api-design-standards");
+            assert.equal(doc.source.version, process.env.VERSION);
+            assert.equal(doc.source.revision, process.env.EXPECTED_REVISION);
+            console.log(`Verified docs-reference.json (${doc.source.package}@${doc.source.version} @ ${doc.source.revision})`);
+          '
+      - name: Upload docs-reference.json to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.promote.outputs.version }}
+        run: |
+          set -euo pipefail
+          gh release upload "v${VERSION}" artifacts/docs-reference.json --clobber

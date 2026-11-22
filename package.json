@@ -1,5 +1,5 @@
 {
-  "name": "@photon-ai/api-design-standards",
+  "name": "@photon-hq/api-design-standards",
   "version": "0.1.0",
   "description": "Photon API Design Standards (ADS) specifications and deterministic Redocly OpenAPI lint rules.",
   "license": "Apache-2.0",
@@ -26,7 +26,8 @@
     "lint"
   ],
   "publishConfig": {
-    "access": "public"
+    "access": "public",
+    "registry": "https://npm.pkg.github.com"
   },
   "files": [
     "dist",

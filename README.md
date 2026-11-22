@@ -17,19 +17,32 @@ Each standard in **Photon API Design Standards (ADS)** defines a service-agnosti
 - **Approved**: Binding default for new and redesigned Photon public HTTP APIs.
 - **Deprecated**: Superseded by a newer standard.
 
+## Reporting Non-Conformant Photon APIs
+
+If you find any Photon API endpoint that does not follow these standards, please open an issue in [photon-hq/api-design-standards](https://github.com/photon-hq/api-design-standards/issues/new). Include the HTTP method, path, the standard or rule that is violated, and a sanitized or synthetic example request or response payload (with any credentials, tokens, or sensitive customer data removed) when available.
+
+Pull requests are restricted to repository collaborators, while [GitHub Issues](https://github.com/photon-hq/api-design-standards/issues) are open to everyone for violation reports, questions, and standard proposals.
+
 ## Using the Redocly Plugin
 
-Install `@photon-ai/api-design-standards` alongside `@redocly/cli` (v2):
+`@photon-hq/api-design-standards` is published to GitHub Packages alongside [GitHub Releases](https://github.com/photon-hq/api-design-standards/releases). Configure your project's `.npmrc` to resolve the `@photon-hq` scope from GitHub Packages (authentication requires a GitHub token with `read:packages` scope):
+
+```ini
+@photon-hq:registry=https://npm.pkg.github.com
+//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}
+```
+
+Install `@photon-hq/api-design-standards` alongside `@redocly/cli` (v2):
 
 ```bash
-pnpm add -D @photon-ai/api-design-standards @redocly/cli
+pnpm add -D @photon-hq/api-design-standards @redocly/cli
 ```
 
 Register the `photon-ads` plugin and extend `photon-ads/recommended` in your `redocly.yaml`:
 
 ```yaml
 plugins:
-  - "@photon-ai/api-design-standards/redocly"
+  - "@photon-hq/api-design-standards/redocly"
 
 extends:
   - recommended
@@ -84,7 +97,13 @@ Individual commands:
 
 ## Proposing a New Standard
 
-1. Open an issue or pull request proposing the next sequential ADS number under `ads/<num>-<slug>/`.
+To propose a new API Design Standard or suggest a change to an existing one, [open a GitHub issue](https://github.com/photon-hq/api-design-standards/issues/new) describing the problem, proposed contract rules, and motivating examples. Pull requests are restricted to repository collaborators.
+
+### Collaborator Authoring Checklist
+
+When implementing an approved proposal:
+
+1. Create the next sequential folder under `ads/<num>-<slug>/`.
 2. Add `index.md` with YAML frontmatter (`title`, `sidebarTitle`, `description`, `ads`, `status`, `updated`), RFC 2119 normative guidance, concrete Good/Bad examples, and a Lint Rules table.
 3. Implement deterministic Redocly rules in `rules.ts`, register them in `src/catalog.ts` and `src/plugin.ts`, and cover valid, invalid, and edge cases in `rules.test.ts`.
 4. Ensure `pnpm check` passes cleanly, including `docs:export` parity checks and Mintlify MDX safety validation.

@@ -22,7 +22,6 @@ export const internalTermHashes = new Set([
   "212776f49d894288d048e4bb68f80b3524aad80487e506af7239231ef5d72efd",
   "f0fcf169a84eb47b6b94abdd6311644f4f25ddcf4d4cf220c599723c30cff551",
   "236c06d735c2d978446c40aff313c9a0530a712efd4186fee52da138c7d8095d",
-  "0e10f3b8bb2a1ef311aba90fc1dd1e92b64513ea594607a17d1cd5f79c425792",
   "addc3bcdc97955777d35537fb66ee622dd02b72d3d14390596127d254eab56b2",
   "ee4290e15e9a2f894e730a406061e2ac1bb679e167c2c1712a834b90351b8ad8",
   "469e20d57eb53c4d2de1aa350c07bb9c82dc39d1c19ef2cc3f0d22b564de0b6d",
@@ -61,7 +60,7 @@ const rules = [
   ],
   [
     "internal-package-dependency",
-    /(?:\b(?:from|import)\s*|\b(?:require(?:\.resolve)?|import)\s*\(\s*)["']@photon-hq\/[^"']+["']|["']@photon-hq\/[^"']+["']\s*:|(?:node_modules\/|registry\.npmjs\.org\/|npm\.pkg\.github\.com\/)@photon-hq\/[a-z0-9_.-]+/i,
+    /(?:\b(?:from|import)\s*|\b(?:require(?:\.resolve)?|import)\s*\(\s*)(["'])@photon-hq\/(?!api-design-standards(?:\/[^"']*)?\1)[^"']+\1|(["'])@photon-hq\/(?!api-design-standards(?:\/[^"']*)?\2)[^"']+\2\s*:|(?:node_modules\/|registry\.npmjs\.org\/|npm\.pkg\.github\.com\/)@photon-hq(?:\/|%2f)(?!api-design-standards(?![a-z0-9_.-]))[a-z0-9_.-]+/i,
   ],
 ];
 
