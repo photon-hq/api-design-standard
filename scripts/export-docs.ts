@@ -225,10 +225,7 @@ export function rewriteOverviewLinksForDocs(markdown: string): string {
     );
 }
 
-export function resolveExportVersion(
-  packageVersion: string,
-  releaseVersion: string | undefined = process.env.RELEASE_VERSION,
-): string {
+export function resolveExportVersion(packageVersion: string, releaseVersion?: string): string {
   if (releaseVersion === undefined) {
     assertCondition(
       SEMVER_RE.test(packageVersion),
@@ -245,17 +242,27 @@ export function resolveExportVersion(
 }
 
 function readGitRevision(rootDir: string): string {
+  let insideWorkTree = false;
   try {
+    insideWorkTree =
+      execFileSync("git", ["rev-parse", "--is-inside-work-tree"], {
+        cwd: rootDir,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      }).trim() === "true";
+  } catch {
+    insideWorkTree = false;
+  }
+
+  if (insideWorkTree) {
     const sha = execFileSync("git", ["rev-parse", "HEAD"], {
       cwd: rootDir,
       encoding: "utf8",
     }).trim();
-    if (/^[a-f0-9]{40}$/.test(sha)) {
-      return sha;
-    }
-  } catch {
-    // Fall back to GITHUB_SHA when running outside a git checkout.
+    assertCondition(/^[a-f0-9]{40}$/.test(sha), `Expected 40-char git revision SHA, got "${sha}".`);
+    return sha;
   }
+
   const envSha = process.env.GITHUB_SHA?.trim();
   assertCondition(
     envSha && /^[a-f0-9]{40}$/.test(envSha),
@@ -300,7 +307,7 @@ export async function buildDocsReference(rootDir: string): Promise<DocsReference
     "package.json must define version.",
   );
 
-  const version = resolveExportVersion(pkg.version);
+  const version = resolveExportVersion(pkg.version, process.env.RELEASE_VERSION);
   const revision = readGitRevision(rootDir);
 
   const readmePath = resolve(rootDir, "README.md");

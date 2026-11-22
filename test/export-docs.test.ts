@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   buildDocsReference,
   exportDocsReference,
@@ -14,6 +14,20 @@ import {
 const REPO_ROOT = resolve(fileURLToPath(new URL("..", import.meta.url)));
 
 describe("docs-reference export", () => {
+  let originalReleaseVersion: string | undefined;
+
+  beforeEach(() => {
+    originalReleaseVersion = process.env.RELEASE_VERSION;
+    delete process.env.RELEASE_VERSION;
+  });
+
+  afterEach(() => {
+    if (originalReleaseVersion === undefined) {
+      delete process.env.RELEASE_VERSION;
+    } else {
+      process.env.RELEASE_VERSION = originalReleaseVersion;
+    }
+  });
   it("builds a deterministic schemaVersion 1 ads docs reference matching the contract", async () => {
     const first = await buildDocsReference(REPO_ROOT);
     const second = await buildDocsReference(REPO_ROOT);
