@@ -1,0 +1,241 @@
+openapi: 3.1.0
+info:
+  title: Example Photon Resource API
+  version: 1.0.0
+  description: Reference OpenAPI 3.1 contract conforming to Photon API Design Standards.
+  license:
+    name: Apache-2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0
+servers:
+  - url: https://api.example.com
+paths:
+  /v1/organizations/{organizationId}/projects:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+    post:
+      operationId: createProject
+      summary: Create a project
+      description: Creates a new project inside an organization.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateProjectRequest"
+      responses:
+        "201":
+          description: Created project.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Project"
+        "400":
+          description: Invalid request.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+  /v1/projects/{projectId}:
+    parameters:
+      - $ref: "#/components/parameters/ProjectId"
+    get:
+      operationId: getProject
+      summary: Get a project
+      description: Retrieves a single project by identifier.
+      responses:
+        "200":
+          description: Project details.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Project"
+        "404":
+          description: Project not found.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+    delete:
+      operationId: deleteProject
+      summary: Delete a project
+      description: Deletes an existing project.
+      responses:
+        "204":
+          description: Project deleted.
+        "404":
+          description: Project not found.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+  /v1/projects/{projectId}/usage:
+    parameters:
+      - $ref: "#/components/parameters/ProjectId"
+    get:
+      operationId: getProjectUsage
+      summary: Get project usage
+      description: Retrieves aggregate usage totals for a project.
+      responses:
+        "200":
+          description: Usage summary.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProjectUsage"
+        "404":
+          description: Project not found.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+  /v1/projects/{projectId}/api-keys/{apiKeyId}:
+    parameters:
+      - $ref: "#/components/parameters/ProjectId"
+      - name: apiKeyId
+        in: path
+        required: true
+        description: Unique identifier of the API key.
+        schema:
+          type: string
+    get:
+      operationId: getApiKey
+      summary: Get an API key
+      description: Retrieves metadata for a single project API key.
+      responses:
+        "200":
+          description: API key details.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiKey"
+        "404":
+          description: API key not found.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+  /v1/events/{eventType}:
+    parameters:
+      - name: eventType
+        in: path
+        required: true
+        description: Event type name in lowerCamelCase.
+        schema:
+          type: string
+    get:
+      operationId: getEventTypeSchema
+      summary: Get event type metadata
+      description: Retrieves documentation metadata for an event type.
+      responses:
+        "200":
+          description: Event metadata.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - eventType
+                  - description
+                properties:
+                  eventType:
+                    type: string
+                  description:
+                    type: string
+        "404":
+          description: Event type not found.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+components:
+  parameters:
+    OrganizationId:
+      name: organizationId
+      in: path
+      required: true
+      description: Unique identifier of the organization.
+      schema:
+        type: string
+    ProjectId:
+      name: projectId
+      in: path
+      required: true
+      description: Unique identifier of the project.
+      schema:
+        type: string
+  schemas:
+    BaseResource:
+      type: object
+      required:
+        - id
+        - createdAt
+      properties:
+        id:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+    Project:
+      allOf:
+        - $ref: "#/components/schemas/BaseResource"
+        - type: object
+          required:
+            - organizationId
+            - name
+          properties:
+            organizationId:
+              type: string
+            name:
+              type: string
+    ApiKey:
+      type: object
+      required:
+        - id
+        - projectId
+        - organizationId
+        - name
+      properties:
+        id:
+          type: string
+        projectId:
+          type: string
+        organizationId:
+          type: string
+        name:
+          type: string
+    CreateProjectRequest:
+      type: object
+      required:
+        - organizationId
+        - name
+      properties:
+        organizationId:
+          type: string
+        name:
+          type: string
+    ProjectUsage:
+      type: object
+      required:
+        - projectId
+        - totalCents
+      properties:
+        projectId:
+          type: string
+        totalCents:
+          type: integer
+    ProblemDetails:
+      type: object
+      required:
+        - type
+        - title
+        - status
+      properties:
+        type:
+          type: string
+          format: uri
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string

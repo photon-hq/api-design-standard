@@ -1,0 +1,10 @@
+plugins:
+  - ./dist/src/redocly-plugin.js
+
+extends:
+  - recommended
+  - photon-ads/recommended
+
+rules:
+  security-defined: off
+  no-server-example.com: off

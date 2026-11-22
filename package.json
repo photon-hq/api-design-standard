@@ -1,0 +1,78 @@
+{
+  "name": "@photon-ai/api-design-standards",
+  "version": "0.1.0",
+  "description": "Photon API Design Standards (ADS) specifications and deterministic Redocly OpenAPI lint rules.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "packageManager": "pnpm@12.11.2",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/photon-hq/api-design-standards.git"
+  },
+  "homepage": "https://github.com/photon-hq/api-design-standards#readme",
+  "bugs": {
+    "url": "https://github.com/photon-hq/api-design-standards/issues"
+  },
+  "keywords": [
+    "photon",
+    "api-design",
+    "api-design-standards",
+    "openapi",
+    "redocly",
+    "redocly-plugin",
+    "lint"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "dist",
+    "ads/*/index.md",
+    "LICENSE",
+    "README.md"
+  ],
+  "main": "./dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "default": "./dist/src/index.js"
+    },
+    "./redocly": {
+      "types": "./dist/src/redocly-plugin.d.ts",
+      "default": "./dist/src/redocly-plugin.js"
+    }
+  },
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check .",
+    "format": "biome check --write .",
+    "test": "vitest run",
+    "redocly:check": "pnpm build && redocly lint test/fixtures/valid-openapi.yaml --config redocly.yaml",
+    "docs:export": "tsx scripts/export-docs.ts",
+    "check:public": "node tools/public-content/check.mjs",
+    "check": "pnpm typecheck && pnpm lint && pnpm build && pnpm test && redocly lint test/fixtures/valid-openapi.yaml --config redocly.yaml && pnpm docs:export && pnpm check:public"
+  },
+  "peerDependencies": {
+    "@redocly/cli": "^2.72.1"
+  },
+  "peerDependenciesMeta": {
+    "@redocly/cli": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.5",
+    "@redocly/cli": "2.72.1",
+    "@types/node": "^24.0.0",
+    "marked": "^18.2.1",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.12",
+    "yaml": "^2.8.2"
+  }
+}

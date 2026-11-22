@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  check:
+    name: Verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Typecheck
+        run: pnpm typecheck
+      - name: Lint and format check
+        run: pnpm lint
+      - name: Build Redocly plugin
+        run: pnpm build
+      - name: Run unit and end-to-end tests
+        run: pnpm test
+      - name: Self-test Redocly config
+        run: pnpm redocly:check
+      - name: Verify deterministic docs reference export
+        run: |
+          pnpm docs:export
+          cp artifacts/docs-reference.json "$RUNNER_TEMP/docs-reference-1.json"
+          pnpm docs:export
+          diff -u "$RUNNER_TEMP/docs-reference-1.json" artifacts/docs-reference.json
+      - name: Check public content
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          if [ "$EVENT_NAME" = "pull_request" ] && [ -n "$PR_BASE_SHA" ] && [ -n "$PR_HEAD_SHA" ] && git cat-file -e "${PR_BASE_SHA}^{commit}" 2>/dev/null && git cat-file -e "${PR_HEAD_SHA}^{commit}" 2>/dev/null; then
+            node tools/public-content/check.mjs --commit-range "${PR_BASE_SHA}..${PR_HEAD_SHA}"
+          elif [ "$EVENT_NAME" = "pull_request" ] && git rev-parse --verify -q HEAD^2 >/dev/null; then
+            node tools/public-content/check.mjs --commit-range HEAD^1..HEAD^2
+          elif [ "$EVENT_NAME" = "push" ] && [ -n "$PUSH_BEFORE" ] && [ "$PUSH_BEFORE" != "0000000000000000000000000000000000000000" ] && git cat-file -e "${PUSH_BEFORE}^{commit}" 2>/dev/null; then
+            node tools/public-content/check.mjs --commit-range "${PUSH_BEFORE}..${HEAD_SHA}"
+          else
+            node tools/public-content/check.mjs --commit-message
+          fi
