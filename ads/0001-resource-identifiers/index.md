@@ -149,4 +149,4 @@ The `@photon-hq/api-design-standards` Redocly plugin (`photon-ads`) enforces ADS
 
 ## Changelog
 
-- **2026-11-21**: Approved and published as `ADS-0001` with deterministic Redocly rules.
+- **2026-11-21**: Approved and published as `ADS-0001`.

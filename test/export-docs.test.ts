@@ -1,5 +1,6 @@
-import { readFile } from "node:fs/promises";
-import { resolve } from "node:path";
+import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
@@ -8,16 +9,78 @@ import {
   resolveExportVersion,
   rewriteOverviewLinksForDocs,
   stripFrontmatterAndH1,
+  stripLintRulesSection,
   validateMintlifyMdxSafety,
 } from "../scripts/export-docs.js";
+import { ADS_STANDARDS } from "../src/catalog.js";
+import { createPhotonAdsPlugin } from "../src/plugin.js";
+import type { AdsStandardMetadata, AdsStatus } from "../src/types.js";
 
 const REPO_ROOT = resolve(fileURLToPath(new URL("..", import.meta.url)));
+const FORBIDDEN_DOCS_PATTERNS = [
+  /redocly/i,
+  /photon-ads\//i,
+  /\.npmrc/i,
+  /pnpm\s+check/i,
+  /@photon-hq\//i,
+];
+
+async function createTempRepoFixture(): Promise<string> {
+  const dir = await mkdtemp(join(tmpdir(), "photon-ads-export-test-"));
+  await cp(resolve(REPO_ROOT, "package.json"), resolve(dir, "package.json"));
+  await cp(resolve(REPO_ROOT, "ads"), resolve(dir, "ads"), { recursive: true });
+  return dir;
+}
+
+async function addFixtureStandard(
+  rootDir: string,
+  folder: string,
+  ads: string,
+  status: AdsStatus,
+): Promise<AdsStandardMetadata> {
+  const dir = resolve(rootDir, "ads", folder);
+  await mkdir(dir, { recursive: true });
+  await writeFile(
+    resolve(dir, "index.md"),
+    [
+      "---",
+      `title: "ADS-${ads}: Example ${status} Standard"`,
+      `sidebarTitle: "ADS-${ads} · Example"`,
+      `description: "Example ${status.toLowerCase()} standard for export filtering tests."`,
+      `ads: "${ads}"`,
+      `status: "${status}"`,
+      'updated: "2026-11-21"',
+      "---",
+      "",
+      `# ADS-${ads}: Example ${status} Standard`,
+      "",
+      `- **Status**: ${status}`,
+      "- **Updated**: 2026-11-21",
+      "",
+      "## Normative Rules",
+      "",
+      "Resources **MUST** follow the example convention.",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+  await writeFile(resolve(dir, "rules.ts"), "export {};\n", "utf8");
+  await writeFile(resolve(dir, "rules.test.ts"), "export {};\n", "utf8");
+  return {
+    ads,
+    slug: `ads-${ads}`,
+    folder,
+    rules: [],
+  };
+}
 
 describe("docs-reference export", () => {
   let originalReleaseVersion: string | undefined;
+  let originalGithubSha: string | undefined;
 
   beforeEach(() => {
     originalReleaseVersion = process.env.RELEASE_VERSION;
+    originalGithubSha = process.env.GITHUB_SHA;
     delete process.env.RELEASE_VERSION;
   });
 
@@ -26,6 +89,11 @@ describe("docs-reference export", () => {
       delete process.env.RELEASE_VERSION;
     } else {
       process.env.RELEASE_VERSION = originalReleaseVersion;
+    }
+    if (originalGithubSha === undefined) {
+      delete process.env.GITHUB_SHA;
+    } else {
+      process.env.GITHUB_SHA = originalGithubSha;
     }
   });
   it("builds a deterministic schemaVersion 1 ads docs reference matching the contract", async () => {
@@ -43,11 +111,22 @@ describe("docs-reference export", () => {
     expect(first.overview.title).toBe("API Design Standards");
     expect(first.overview.sidebarTitle).toBe("Overview");
     expect(first.overview.description).toBe(
-      "Public HTTP API design standards and deterministic OpenAPI lint rules for Photon APIs.",
+      "Design conventions behind Photon's public HTTP APIs, why we publish them openly, and how to report inconsistencies.",
     );
     expect(first.overview.body).not.toMatch(/^#\s+/m);
     expect(first.overview.body).not.toContain("./ads/");
-    expect(first.overview.body).toContain("./ads-0001");
+    expect(first.overview.body).toContain("## Why We Publish These Standards");
+    expect(first.overview.body).toContain("## Feedback & Reporting Issues");
+    expect(first.overview.body).toContain("do not accept external pull requests");
+    expect(first.overview.body).toContain(
+      "https://github.com/photon-hq/api-design-standards/issues/new",
+    );
+    expect(first.overview.body).not.toMatch(/^#{2,3}\s+Status\s+Lifecycle\b/im);
+    expect(first.overview.body).not.toMatch(/^#{2,3}\s+Standards(?:\s+Index)?\b/im);
+    for (const pattern of FORBIDDEN_DOCS_PATTERNS) {
+      expect(first.overview.description).not.toMatch(pattern);
+      expect(first.overview.body).not.toMatch(pattern);
+    }
 
     expect(first.standards).toHaveLength(1);
     const ads0001 = first.standards[0];
@@ -84,6 +163,18 @@ describe("docs-reference export", () => {
     ]);
     expect(ads0001?.body).not.toMatch(/^---/);
     expect(ads0001?.body).not.toMatch(/^#\s+/);
+    expect(ads0001?.body).toContain("## Normative Rules");
+    expect(ads0001?.body).toContain("## Examples");
+    expect(ads0001?.body).toContain("## Changelog");
+    expect(ads0001?.body).toContain("Approved and published as `ADS-0001`.");
+    expect(ads0001?.body).not.toMatch(/^##\s+(?:Deterministic\s+)?Lint\s+Rules\b/im);
+    for (const standard of first.standards) {
+      expect(standard.status).toBe("Approved");
+      for (const pattern of FORBIDDEN_DOCS_PATTERNS) {
+        expect(standard.description).not.toMatch(pattern);
+        expect(standard.body).not.toMatch(pattern);
+      }
+    }
   });
 
   it("writes byte-identical artifacts/docs-reference.json across repeated runs", async () => {
@@ -95,6 +186,139 @@ describe("docs-reference export", () => {
     expect(out1).toBe(out2);
     expect(content1).toBe(content2);
     expect(content1.endsWith("\n")).toBe(true);
+  });
+
+  it("strips ## Lint Rules sections while preserving surrounding sections and code fences", () => {
+    const withChangelog = [
+      "## Normative Rules",
+      "",
+      "Use `id`.",
+      "",
+      "## Examples",
+      "",
+      "```markdown",
+      "## Lint Rules",
+      "Inside a fenced block, keep verbatim.",
+      "```",
+      "",
+      "## Lint Rules",
+      "",
+      "Internal plugin details.",
+      "",
+      "### Nested subsection",
+      "",
+      "```markdown",
+      "## Fake Heading Inside Fence",
+      "```",
+      "",
+      "## Changelog",
+      "",
+      "- **2026-11-21**: Approved.",
+    ].join("\n");
+
+    expect(stripLintRulesSection(withChangelog)).toBe(
+      [
+        "## Normative Rules",
+        "",
+        "Use `id`.",
+        "",
+        "## Examples",
+        "",
+        "```markdown",
+        "## Lint Rules",
+        "Inside a fenced block, keep verbatim.",
+        "```",
+        "",
+        "## Changelog",
+        "",
+        "- **2026-11-21**: Approved.",
+      ].join("\n"),
+    );
+
+    const atEnd = [
+      "## Normative Rules",
+      "",
+      "Use `id`.",
+      "",
+      "## Lint Rules",
+      "",
+      "Removed through EOF.",
+    ].join("\n");
+    expect(stripLintRulesSection(atEnd)).toBe("## Normative Rules\n\nUse `id`.");
+
+    const withoutLintRules = "## Normative Rules\n\nUse `id`.";
+    expect(stripLintRulesSection(withoutLintRules)).toBe(withoutLintRules);
+  });
+
+  it("exports only Approved standards and excludes Draft, Reviewing, and Deprecated standards", async () => {
+    const fixtureRoot = await createTempRepoFixture();
+    process.env.GITHUB_SHA = "a".repeat(40);
+    try {
+      const draftMeta = await addFixtureStandard(
+        fixtureRoot,
+        "0002-draft-example",
+        "0002",
+        "Draft",
+      );
+      const reviewingMeta = await addFixtureStandard(
+        fixtureRoot,
+        "0003-reviewing-example",
+        "0003",
+        "Reviewing",
+      );
+      const deprecatedMeta = await addFixtureStandard(
+        fixtureRoot,
+        "0004-deprecated-example",
+        "0004",
+        "Deprecated",
+      );
+
+      const exported = await buildDocsReference(fixtureRoot, {
+        standardsCatalog: [...ADS_STANDARDS, draftMeta, reviewingMeta, deprecatedMeta],
+        plugin: createPhotonAdsPlugin(),
+      });
+
+      expect(exported.standards.map((standard) => standard.slug)).toEqual(["ads-0001"]);
+      expect(exported.standards.every((standard) => standard.status === "Approved")).toBe(true);
+    } finally {
+      await rm(fixtureRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects export when no Approved standard exists", async () => {
+    const fixtureRoot = await createTempRepoFixture();
+    process.env.GITHUB_SHA = "b".repeat(40);
+    try {
+      const indexPath = resolve(fixtureRoot, "ads/0001-resource-identifiers/index.md");
+      const original = await readFile(indexPath, "utf8");
+      await writeFile(indexPath, original.replace('status: "Approved"', 'status: "Draft"'), "utf8");
+
+      await expect(buildDocsReference(fixtureRoot)).rejects.toThrow(
+        /At least one Approved ADS standard is required/,
+      );
+    } finally {
+      await rm(fixtureRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("still enforces index.md rule parity before stripping ## Lint Rules", async () => {
+    const fixtureRoot = await createTempRepoFixture();
+    process.env.GITHUB_SHA = "c".repeat(40);
+    try {
+      const indexPath = resolve(fixtureRoot, "ads/0001-resource-identifiers/index.md");
+      const original = await readFile(indexPath, "utf8");
+      await writeFile(
+        indexPath,
+        original.replaceAll("photon-ads/ads-0001-path-param-consistency", "removed-rule"),
+        "utf8",
+      );
+
+      await expect(buildDocsReference(fixtureRoot)).rejects.toThrow(
+        /Rule "photon-ads\/ads-0001-path-param-consistency" exported by ads\/0001-resource-identifiers\/rules\.ts is not documented in ads\/0001-resource-identifiers\/index\.md/,
+      );
+    } finally {
+      await rm(fixtureRoot, { recursive: true, force: true });
+    }
   });
 
   it("validates Mintlify MDX safety for braces, angle brackets, wrapped code spans, and links", () => {
@@ -182,10 +406,10 @@ describe("docs-reference export", () => {
 
     expect(
       rewriteOverviewLinksForDocs(
-        "See [ADS-0001](./ads/0001-resource-identifiers/index.md) and [LICENSE](./LICENSE).",
+        "See [ADS-0001](./ads/0001-resource-identifiers/index.md), [ADS-0001 relative](./0001-resource-identifiers/index.md#normative-rules), and [LICENSE](../LICENSE).",
       ),
     ).toBe(
-      "See [ADS-0001](./ads-0001) and [LICENSE](https://github.com/photon-hq/api-design-standards/blob/main/LICENSE).",
+      "See [ADS-0001](./ads-0001), [ADS-0001 relative](./ads-0001#normative-rules), and [LICENSE](https://github.com/photon-hq/api-design-standards/blob/main/LICENSE).",
     );
   });
 
