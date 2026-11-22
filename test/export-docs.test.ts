@@ -182,6 +182,12 @@ describe("docs-reference export", () => {
     expect(resolveExportVersion("0.1.0", "1.2.3-rc.1+build.7")).toBe("1.2.3-rc.1+build.7");
     expect(() => resolveExportVersion("0.1.0", "")).toThrow(/Invalid RELEASE_VERSION/);
     expect(() => resolveExportVersion("0.1.0", "v0.2.0")).toThrow(/Invalid RELEASE_VERSION/);
+    expect(() => resolveExportVersion("0.1.0", "01.2.3")).toThrow(/Invalid RELEASE_VERSION/);
+    expect(() => resolveExportVersion("0.1.0", "1.2.3-rc..1")).toThrow(/Invalid RELEASE_VERSION/);
+    expect(() => resolveExportVersion("0.1.0", "1.2.3-01")).toThrow(/Invalid RELEASE_VERSION/);
+    expect(() => resolveExportVersion("0.1.0", "1.2.3+build..7")).toThrow(
+      /Invalid RELEASE_VERSION/,
+    );
     expect(() => resolveExportVersion("0.1.0", "not-a-version")).toThrow(/Invalid RELEASE_VERSION/);
 
     const previous = process.env.RELEASE_VERSION;

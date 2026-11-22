@@ -48,7 +48,8 @@ export interface DocsReferenceDocument {
 const VALID_STATUSES = new Set<AdsStatus>(["Draft", "Reviewing", "Approved", "Deprecated"]);
 const ADS_FOLDER_RE = /^(\d{4})-([a-z0-9]+(?:-[a-z0-9]+)*)$/;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
-const SEMVER_RE = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
+const SEMVER_RE =
+  /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*)?(?:\+[0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*)?$/;
 const FRONTMATTER_RE = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/;
 const LEADING_H1_RE = /^\s*#\s+[^\r\n]+\r?\n?/;
 const EXTERNAL_OR_ANCHOR_HREF_RE = /^(?:https?:|mailto:|#)/i;
