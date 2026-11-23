@@ -1,9 +1,17 @@
 import { createRuleIgnoreMatcher, HTTP_METHODS } from "../../src/ignore.js";
+import {
+  isRecord,
+  locationKey,
+  type ResolverFn,
+  resolveRecordWithLocation,
+  safeResolveSchema,
+  type UnknownRecord,
+  walkSchemaLattice,
+} from "../../src/schema-utils.js";
 import type {
   AdsStandardMetadata,
   RedoclyLocation,
   RedoclyOas3Rule,
-  RedoclyResolveResult,
   RedoclyUserContext,
 } from "../../src/types.js";
 import { PLUGIN_ID } from "../0001-resource-identifiers/rules.js";
@@ -38,12 +46,10 @@ export const ADS_0002_METADATA: AdsStandardMetadata = {
 };
 
 const SUCCESS_STATUS_RE = /^2(?:\d\d|XX)$/i;
-const JSON_MEDIA_TYPE_RE = /^application\/(?!problem\+json)(?:[^;]+\+)?json\b/i;
+const JSON_MEDIA_TYPE_RE = /^application\/(?!problem\+json(?:\s*;|$))(?:[^;]+\+)?json(?:\s*;|$)/i;
 const GENERIC_ENVELOPE_KEY_RE = /^(?:data|result|payload)$/i;
 const SECRET_OR_TOKEN_PROP_RE = /^(?:secret|token|[a-z][a-zA-Z0-9]*(?:Secret|Token))$/;
 
-type UnknownRecord = Record<string, unknown>;
-type ResolverFn = RedoclyUserContext["resolve"];
 type JsonSchemaType = "object" | "array" | "string" | "number" | "integer" | "boolean" | "null";
 
 const ALL_JSON_TYPES: readonly JsonSchemaType[] = [
@@ -56,60 +62,11 @@ const ALL_JSON_TYPES: readonly JsonSchemaType[] = [
   "null",
 ];
 
-const JSON_TYPE_SET = new Set<string>(ALL_JSON_TYPES);
-
-function isRecord(value: unknown): value is UnknownRecord {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
+const ALL_JSON_TYPE_SET: ReadonlySet<JsonSchemaType> = new Set(ALL_JSON_TYPES);
+const EMPTY_TYPE_SET: ReadonlySet<JsonSchemaType> = new Set();
 
 function isJsonSchemaType(value: unknown): value is JsonSchemaType {
-  return typeof value === "string" && JSON_TYPE_SET.has(value);
-}
-
-function locationKey(location: RedoclyLocation): string {
-  return location.absolutePointer ?? `${location.source?.absoluteRef ?? ""}#${location.pointer}`;
-}
-
-function safeResolveRecord(
-  resolve: ResolverFn,
-  node: UnknownRecord,
-  from?: string,
-): RedoclyResolveResult<UnknownRecord> | null {
-  if (typeof node.$ref !== "string") {
-    return null;
-  }
-  try {
-    const resolved = resolve<UnknownRecord>({ $ref: node.$ref }, from);
-    if (!resolved || resolved.error || !isRecord(resolved.node)) {
-      return null;
-    }
-    return resolved;
-  } catch {
-    return null;
-  }
-}
-
-function safeResolveSchema(
-  resolve: ResolverFn,
-  node: UnknownRecord,
-  from?: string,
-): RedoclyResolveResult<UnknownRecord | boolean> | null {
-  if (typeof node.$ref !== "string") {
-    return null;
-  }
-  try {
-    const resolved = resolve<UnknownRecord | boolean>({ $ref: node.$ref }, from);
-    if (
-      !resolved ||
-      resolved.error ||
-      (!isRecord(resolved.node) && typeof resolved.node !== "boolean")
-    ) {
-      return null;
-    }
-    return resolved;
-  } catch {
-    return null;
-  }
+  return typeof value === "string" && ALL_JSON_TYPE_SET.has(value as JsonSchemaType);
 }
 
 function jsonTypeOfValue(value: unknown): JsonSchemaType | null {
@@ -133,297 +90,228 @@ function jsonTypeOfValue(value: unknown): JsonSchemaType | null {
   }
 }
 
-function isExplicitlyNonNullType(type: unknown): boolean {
-  if (typeof type === "string") {
-    return type !== "null";
-  }
-  if (Array.isArray(type)) {
-    return type.length > 0 && !type.includes("null");
-  }
-  return false;
+interface TypeConstraint {
+  readonly allowed: ReadonlySet<JsonSchemaType>;
+  readonly explicit: ReadonlySet<JsonSchemaType>;
+  readonly conflictNonObject: ReadonlySet<JsonSchemaType>;
 }
 
-function schemaForbidsNull(
-  schema: unknown,
-  resolve: ResolverFn,
-  from: string | undefined,
-  seen: ReadonlySet<unknown> = new Set(),
-  memo: Map<object, Map<string, { value: boolean; hitCycle: boolean }>> = new Map(),
-): boolean {
-  const visit = (
-    node: unknown,
-    currentFrom: string | undefined,
-    currentSeen: ReadonlySet<unknown>,
-  ): { value: boolean; hitCycle: boolean } => {
-    if (node === false) {
-      return { value: true, hitCycle: false };
-    }
-    if (node === true || !isRecord(node)) {
-      return { value: false, hitCycle: false };
-    }
-    if (currentSeen.has(node)) {
-      return { value: false, hitCycle: true };
-    }
+const UNCONSTRAINED_TYPE_CONSTRAINT: TypeConstraint = {
+  allowed: ALL_JSON_TYPE_SET,
+  explicit: EMPTY_TYPE_SET,
+  conflictNonObject: EMPTY_TYPE_SET,
+};
 
-    const cacheKey = currentFrom ?? "";
-    const cached = memo.get(node)?.get(cacheKey);
-    if (cached) {
-      return cached;
-    }
+const FALSE_TYPE_CONSTRAINT: TypeConstraint = {
+  allowed: EMPTY_TYPE_SET,
+  explicit: EMPTY_TYPE_SET,
+  conflictNonObject: EMPTY_TYPE_SET,
+};
 
-    if (node.nullable === true) {
-      return { value: false, hitCycle: false };
+function intersectTypeSets(
+  a: ReadonlySet<JsonSchemaType>,
+  b: ReadonlySet<JsonSchemaType>,
+): Set<JsonSchemaType> {
+  const out = new Set<JsonSchemaType>();
+  for (const t of a) {
+    if (b.has(t)) {
+      out.add(t);
+    } else if ((t === "integer" && b.has("number")) || (t === "number" && b.has("integer"))) {
+      out.add("integer");
     }
-    if (node.type === "null" || (Array.isArray(node.type) && node.type.includes("null"))) {
-      return { value: false, hitCycle: false };
-    }
-    if (isExplicitlyNonNullType(node.type)) {
-      return { value: true, hitCycle: false };
-    }
-    if (node.const !== undefined) {
-      return { value: node.const !== null, hitCycle: false };
-    }
-    if (Array.isArray(node.enum) && node.enum.length > 0) {
-      return { value: !node.enum.includes(null), hitCycle: false };
-    }
-
-    const nextSeen = new Set(currentSeen);
-    nextSeen.add(node);
-    let hitCycle = false;
-    let value = false;
-
-    if (typeof node.$ref === "string") {
-      const resolved = safeResolveSchema(resolve, node, currentFrom);
-      if (resolved) {
-        if (resolved.node !== undefined) {
-          const targetRes = visit(resolved.node, resolved.location?.source?.absoluteRef, nextSeen);
-          if (targetRes.hitCycle) {
-            hitCycle = true;
-          }
-          if (targetRes.value) {
-            value = true;
-          }
-        }
-        if (!value) {
-          for (const hop of resolved.chain ?? []) {
-            if (!isRecord(hop.node) || hop.node === node || hop.node === resolved.node) {
-              continue;
-            }
-            const hopRes = visit(
-              { ...hop.node, $ref: undefined },
-              hop.location?.source?.absoluteRef,
-              nextSeen,
-            );
-            if (hopRes.hitCycle) {
-              hitCycle = true;
-            }
-            if (hopRes.value) {
-              value = true;
-              break;
-            }
-          }
-        }
-      }
-    }
-
-    if (!value && Array.isArray(node.allOf)) {
-      for (const branch of node.allOf) {
-        const branchRes = visit(branch, currentFrom, nextSeen);
-        if (branchRes.hitCycle) {
-          hitCycle = true;
-        }
-        if (branchRes.value) {
-          value = true;
-          break;
-        }
-      }
-    }
-
-    if (!value) {
-      for (const unionKey of ["oneOf", "anyOf"] as const) {
-        const branches = node[unionKey];
-        if (!Array.isArray(branches) || branches.length === 0) {
-          continue;
-        }
-        let allForbid = true;
-        for (const branch of branches) {
-          const branchRes = visit(branch, currentFrom, nextSeen);
-          if (branchRes.hitCycle) {
-            hitCycle = true;
-          }
-          if (!branchRes.value) {
-            allForbid = false;
-          }
-        }
-        if (allForbid) {
-          value = true;
-          break;
-        }
-      }
-    }
-
-    const result = { value, hitCycle };
-    if (!hitCycle) {
-      let nodeCache = memo.get(node);
-      if (!nodeCache) {
-        nodeCache = new Map();
-        memo.set(node, nodeCache);
-      }
-      nodeCache.set(cacheKey, result);
-    }
-    return result;
-  };
-
-  return visit(schema, from, seen).value;
+  }
+  return out;
 }
 
-export function isNullableSchema(
+function combineTypeConstraintAllOf(a: TypeConstraint, b: TypeConstraint): TypeConstraint {
+  const allowed = intersectTypeSets(a.allowed, b.allowed);
+  const mergedExplicit = new Set<JsonSchemaType>(a.explicit);
+  for (const t of b.explicit) {
+    mergedExplicit.add(t);
+  }
+  const explicit = intersectTypeSets(mergedExplicit, allowed);
+  const conflictNonObject = new Set<JsonSchemaType>(a.conflictNonObject);
+  for (const t of b.conflictNonObject) {
+    conflictNonObject.add(t);
+  }
+  if (a.allowed.size > 0 && b.allowed.size > 0 && allowed.size === 0) {
+    for (const t of mergedExplicit) {
+      if (t !== "object") {
+        conflictNonObject.add(t);
+      }
+    }
+  }
+  return { allowed, explicit, conflictNonObject };
+}
+
+function combineTypeConstraintUnion(
+  values: readonly TypeConstraint[],
+  unionKey: "oneOf" | "anyOf",
+): TypeConstraint {
+  if (values.length === 0) {
+    return UNCONSTRAINED_TYPE_CONSTRAINT;
+  }
+  const allowed = new Set<JsonSchemaType>();
+  const explicit = new Set<JsonSchemaType>();
+  const conflictNonObject = new Set<JsonSchemaType>();
+  let explicitNullBranches = 0;
+
+  for (const item of values) {
+    for (const t of item.allowed) {
+      allowed.add(t);
+    }
+    for (const t of item.explicit) {
+      explicit.add(t);
+    }
+    for (const t of item.conflictNonObject) {
+      conflictNonObject.add(t);
+    }
+    if (item.explicit.has("null")) {
+      explicitNullBranches += 1;
+    }
+  }
+
+  if (unionKey === "oneOf" && explicitNullBranches >= 2) {
+    allowed.delete("null");
+    explicit.delete("null");
+  }
+
+  return { allowed, explicit, conflictNonObject };
+}
+
+function localTypeConstraint(node: UnknownRecord): TypeConstraint {
+  let result = UNCONSTRAINED_TYPE_CONSTRAINT;
+
+  if (typeof node.type === "string" && isJsonSchemaType(node.type)) {
+    const types = new Set<JsonSchemaType>([node.type]);
+    result = combineTypeConstraintAllOf(result, {
+      allowed: types,
+      explicit: types,
+      conflictNonObject: EMPTY_TYPE_SET,
+    });
+  } else if (Array.isArray(node.type)) {
+    const validTypes = node.type.filter(isJsonSchemaType);
+    if (validTypes.length > 0) {
+      const types = new Set<JsonSchemaType>(validTypes);
+      result = combineTypeConstraintAllOf(result, {
+        allowed: types,
+        explicit: types,
+        conflictNonObject: EMPTY_TYPE_SET,
+      });
+    }
+  }
+
+  if (node.const !== undefined) {
+    const constType = jsonTypeOfValue(node.const);
+    if (constType !== null) {
+      const types = new Set<JsonSchemaType>([constType]);
+      result = combineTypeConstraintAllOf(result, {
+        allowed: types,
+        explicit: types,
+        conflictNonObject: EMPTY_TYPE_SET,
+      });
+    }
+  }
+
+  if (Array.isArray(node.enum) && node.enum.length > 0) {
+    const enumTypes = new Set<JsonSchemaType>();
+    for (const item of node.enum) {
+      const itemType = jsonTypeOfValue(item);
+      if (itemType !== null) {
+        enumTypes.add(itemType);
+      }
+    }
+    if (enumTypes.size > 0) {
+      result = combineTypeConstraintAllOf(result, {
+        allowed: enumTypes,
+        explicit: enumTypes,
+        conflictNonObject: EMPTY_TYPE_SET,
+      });
+    }
+  }
+
+  if (node.items !== undefined && result.allowed.has("array") && !result.explicit.has("array")) {
+    const explicit = new Set<JsonSchemaType>(result.explicit);
+    explicit.add("array");
+    result = {
+      allowed: result.allowed,
+      explicit,
+      conflictNonObject: result.conflictNonObject,
+    };
+  }
+
+  return result;
+}
+
+function computeTypeConstraint(
   schema: unknown,
   resolve: ResolverFn,
   from?: string,
-  seen: ReadonlySet<unknown> = new Set(),
-): boolean {
-  const memo = new Map<object, Map<string, { value: boolean; hitCycle: boolean }>>();
-  const forbidsMemo = new Map<object, Map<string, { value: boolean; hitCycle: boolean }>>();
-
-  const visit = (
-    node: unknown,
-    currentFrom: string | undefined,
-    currentSeen: ReadonlySet<unknown>,
-  ): { value: boolean; hitCycle: boolean } => {
-    if (!isRecord(node)) {
-      return { value: false, hitCycle: false };
-    }
-    if (currentSeen.has(node)) {
-      return { value: false, hitCycle: true };
-    }
-
-    const cacheKey = currentFrom ?? "";
-    const cached = memo.get(node)?.get(cacheKey);
-    if (cached) {
-      return cached;
-    }
-
-    if (node.nullable === true) {
-      return { value: true, hitCycle: false };
-    }
-    if (node.type === "null") {
-      return { value: true, hitCycle: false };
-    }
-    if (Array.isArray(node.type) && node.type.includes("null")) {
-      return { value: true, hitCycle: false };
-    }
-    if (node.const === null) {
-      return { value: true, hitCycle: false };
-    }
-    if (Array.isArray(node.enum) && node.enum.includes(null)) {
-      return { value: true, hitCycle: false };
-    }
-    if (isExplicitlyNonNullType(node.type)) {
-      return { value: false, hitCycle: false };
-    }
-    if (node.const !== undefined) {
-      return { value: false, hitCycle: false };
-    }
-    if (Array.isArray(node.enum) && node.enum.length > 0) {
-      return { value: false, hitCycle: false };
-    }
-
-    const nextSeen = new Set(currentSeen);
-    nextSeen.add(node);
-    let hitCycle = false;
-    let value = false;
-
-    if (typeof node.$ref === "string") {
-      const resolved = safeResolveSchema(resolve, node, currentFrom);
-      if (resolved) {
-        if (resolved.node !== undefined) {
-          const targetRes = visit(resolved.node, resolved.location?.source?.absoluteRef, nextSeen);
-          if (targetRes.hitCycle) {
-            hitCycle = true;
-          }
-          if (targetRes.value) {
-            value = true;
-          }
-        }
-        if (!value) {
-          for (const hop of resolved.chain ?? []) {
-            if (!isRecord(hop.node) || hop.node === node || hop.node === resolved.node) {
-              continue;
-            }
-            const hopRes = visit(
-              { ...hop.node, $ref: undefined },
-              hop.location?.source?.absoluteRef,
-              nextSeen,
-            );
-            if (hopRes.hitCycle) {
-              hitCycle = true;
-            }
-            if (hopRes.value) {
-              value = true;
-              break;
-            }
-          }
-        }
+): TypeConstraint {
+  return walkSchemaLattice(schema, resolve, from, {
+    falseValue: FALSE_TYPE_CONSTRAINT,
+    unknownValue: UNCONSTRAINED_TYPE_CONSTRAINT,
+    local: localTypeConstraint,
+    combineAllOf: combineTypeConstraintAllOf,
+    combineUnion: combineTypeConstraintUnion,
+    finalize(node, value) {
+      if (node.nullable !== true) {
+        return value;
       }
-    }
+      const allowed = new Set<JsonSchemaType>(value.allowed);
+      allowed.add("null");
+      const explicit = new Set<JsonSchemaType>(value.explicit);
+      explicit.add("null");
+      return {
+        allowed,
+        explicit,
+        conflictNonObject: value.conflictNonObject,
+      };
+    },
+  });
+}
 
-    if (!value) {
-      for (const unionKey of ["oneOf", "anyOf"] as const) {
-        const branches = node[unionKey];
-        if (!Array.isArray(branches) || branches.length === 0) {
-          continue;
-        }
-        for (const branch of branches) {
-          const branchRes = visit(branch, currentFrom, nextSeen);
-          if (branchRes.hitCycle) {
-            hitCycle = true;
-          }
-          if (branchRes.value) {
-            value = true;
-            break;
-          }
-        }
-        if (value) {
-          break;
-        }
-      }
+function isNonNullableObjectConstraint(tc: TypeConstraint): boolean {
+  if (!tc.allowed.has("object") || tc.explicit.has("null")) {
+    return false;
+  }
+  for (const t of tc.explicit) {
+    if (t !== "object") {
+      return false;
     }
+  }
+  return true;
+}
 
-    if (!value && Array.isArray(node.allOf) && node.allOf.length > 0) {
-      let anyNullable = false;
-      let anyForbidsNull = false;
-      for (const branch of node.allOf) {
-        if (schemaForbidsNull(branch, resolve, currentFrom, nextSeen, forbidsMemo)) {
-          anyForbidsNull = true;
-          break;
-        }
-        const branchRes = visit(branch, currentFrom, nextSeen);
-        if (branchRes.hitCycle) {
-          hitCycle = true;
-        }
-        if (branchRes.value) {
-          anyNullable = true;
-        }
-      }
-      if (anyNullable && !anyForbidsNull) {
-        value = true;
-      }
+function isStringTypeConstraint(tc: TypeConstraint): boolean {
+  if (!tc.allowed.has("string")) {
+    return false;
+  }
+  for (const t of tc.allowed) {
+    if (t !== "string" && t !== "null") {
+      return false;
     }
+  }
+  return true;
+}
 
-    const result = { value, hitCycle };
-    if (!hitCycle) {
-      let nodeCache = memo.get(node);
-      if (!nodeCache) {
-        nodeCache = new Map();
-        memo.set(node, nodeCache);
-      }
-      nodeCache.set(cacheKey, result);
-    }
-    return result;
-  };
+export function isNullableSchema(schema: unknown, resolve: ResolverFn, from?: string): boolean {
+  return computeTypeConstraint(schema, resolve, from).explicit.has("null");
+}
 
-  return visit(schema, from, seen).value;
+export function isStringTypedSchema(schema: unknown, resolve: ResolverFn, from?: string): boolean {
+  return isStringTypeConstraint(computeTypeConstraint(schema, resolve, from));
+}
+
+export function findNonObjectTopLevelKinds(
+  schema: unknown,
+  resolve: ResolverFn,
+  from?: string,
+): readonly JsonSchemaType[] {
+  const tc = computeTypeConstraint(schema, resolve, from);
+  return ALL_JSON_TYPES.filter(
+    (t) => t !== "object" && (tc.explicit.has(t) || tc.conflictNonObject.has(t)),
+  );
 }
 
 type StructuredObjectKind = "non-object" | "unknown" | "empty-object" | "structured";
@@ -461,25 +349,25 @@ function combineStructuredUnion(kinds: readonly StructuredObjectKind[]): Structu
 }
 
 function localStructuredKind(node: UnknownRecord): StructuredObjectKind {
-  if (typeof node.type === "string") {
-    if (node.type !== "object") {
-      return "non-object";
-    }
-  } else if (Array.isArray(node.type)) {
-    const nonNullTypes = node.type.filter((item) => item !== "null");
-    if (nonNullTypes.length === 0 || nonNullTypes.some((item) => item !== "object")) {
-      return "non-object";
-    }
-  } else if (node.items !== undefined) {
+  if (typeof node.type === "string" && node.type !== "object") {
     return "non-object";
-  } else if (node.const !== undefined) {
-    return jsonTypeOfValue(node.const) === "object" ? "empty-object" : "non-object";
-  } else if (Array.isArray(node.enum) && node.enum.length > 0) {
-    return node.enum.every((value) => jsonTypeOfValue(value) === "object")
-      ? "empty-object"
-      : "non-object";
   }
-
+  if (Array.isArray(node.type) && !node.type.includes("object")) {
+    return "non-object";
+  }
+  if (node.type === undefined && node.items !== undefined) {
+    return "non-object";
+  }
+  if (node.const !== undefined && jsonTypeOfValue(node.const) !== "object") {
+    return "non-object";
+  }
+  if (
+    Array.isArray(node.enum) &&
+    node.enum.length > 0 &&
+    !node.enum.some((value) => jsonTypeOfValue(value) === "object")
+  ) {
+    return "non-object";
+  }
   if (isRecord(node.properties) && Object.keys(node.properties).length > 0) {
     return "structured";
   }
@@ -497,121 +385,16 @@ function localStructuredKind(node: UnknownRecord): StructuredObjectKind {
 function classifyStructuredObject(
   schema: unknown,
   resolve: ResolverFn,
-  from: string | undefined,
+  from?: string,
 ): StructuredObjectKind {
-  const memo = new Map<object, Map<string, { kind: StructuredObjectKind; hitCycle: boolean }>>();
-
-  const visit = (
-    node: unknown,
-    currentFrom: string | undefined,
-    seen: ReadonlySet<unknown>,
-    followRef: boolean,
-  ): { kind: StructuredObjectKind; hitCycle: boolean } => {
-    if (node === false) {
-      return { kind: "non-object", hitCycle: false };
-    }
-    if (node === true || !isRecord(node)) {
-      return { kind: "unknown", hitCycle: false };
-    }
-    if (seen.has(node)) {
-      return { kind: "unknown", hitCycle: true };
-    }
-
-    const cacheKey = `${followRef ? 1 : 0}:${currentFrom ?? ""}`;
-    const cached = memo.get(node)?.get(cacheKey);
-    if (cached) {
-      return cached;
-    }
-
-    const nextSeen = new Set(seen);
-    nextSeen.add(node);
-
-    let hitCycle = false;
-    let kind = localStructuredKind(node);
-    if (kind === "non-object") {
-      return { kind: "non-object", hitCycle: false };
-    }
-
-    if (followRef && typeof node.$ref === "string") {
-      const resolved = safeResolveSchema(resolve, node, currentFrom);
-      if (resolved) {
-        if (resolved.node !== undefined) {
-          const targetRes = visit(
-            resolved.node,
-            resolved.location?.source?.absoluteRef,
-            nextSeen,
-            true,
-          );
-          if (targetRes.hitCycle) {
-            hitCycle = true;
-          }
-          kind = combineStructuredAllOf(kind, targetRes.kind);
-        }
-        for (const hop of resolved.chain ?? []) {
-          if (
-            kind === "non-object" ||
-            !isRecord(hop.node) ||
-            hop.node === node ||
-            hop.node === resolved.node
-          ) {
-            continue;
-          }
-          const hopRes = visit(hop.node, hop.location?.source?.absoluteRef, nextSeen, false);
-          if (hopRes.hitCycle) {
-            hitCycle = true;
-          }
-          kind = combineStructuredAllOf(kind, hopRes.kind);
-        }
-      }
-    }
-
-    if (kind !== "non-object" && Array.isArray(node.allOf)) {
-      for (const branch of node.allOf) {
-        const branchRes = visit(branch, currentFrom, nextSeen, true);
-        if (branchRes.hitCycle) {
-          hitCycle = true;
-        }
-        kind = combineStructuredAllOf(kind, branchRes.kind);
-        if (kind === "non-object") {
-          break;
-        }
-      }
-    }
-
-    if (kind !== "non-object") {
-      for (const unionKey of ["oneOf", "anyOf"] as const) {
-        const branches = node[unionKey];
-        if (!Array.isArray(branches) || branches.length === 0) {
-          continue;
-        }
-        const branchKinds: StructuredObjectKind[] = [];
-        for (const branch of branches) {
-          const branchRes = visit(branch, currentFrom, nextSeen, true);
-          if (branchRes.hitCycle) {
-            hitCycle = true;
-          }
-          branchKinds.push(branchRes.kind);
-        }
-        kind = combineStructuredAllOf(kind, combineStructuredUnion(branchKinds));
-        if (kind === "non-object") {
-          break;
-        }
-      }
-    }
-
-    const result = { kind, hitCycle };
-    if (!hitCycle) {
-      let nodeCache = memo.get(node);
-      if (!nodeCache) {
-        nodeCache = new Map();
-        memo.set(node, nodeCache);
-      }
-      nodeCache.set(cacheKey, result);
-    }
-    return result;
-  };
-
-  return visit(schema, from, new Set(), true).kind;
+  return walkSchemaLattice(schema, resolve, from, {
+    falseValue: "non-object",
+    unknownValue: "unknown",
+    isAbsorbing: (value) => value === "non-object",
+    local: localStructuredKind,
+    combineAllOf: combineStructuredAllOf,
+    combineUnion: combineStructuredUnion,
+  });
 }
 
 export function isNonNullableStructuredObject(
@@ -622,429 +405,10 @@ export function isNonNullableStructuredObject(
   if (!isRecord(schema)) {
     return false;
   }
-  if (isNullableSchema(schema, resolve, from)) {
+  if (!isNonNullableObjectConstraint(computeTypeConstraint(schema, resolve, from))) {
     return false;
   }
   return classifyStructuredObject(schema, resolve, from) === "structured";
-}
-
-type StringTypeKind = "string" | "null" | "non-string" | "unknown";
-
-function combineStringAllOf(a: StringTypeKind, b: StringTypeKind): StringTypeKind {
-  if (a === "non-string" || b === "non-string") {
-    return "non-string";
-  }
-  if ((a === "string" && b === "null") || (a === "null" && b === "string")) {
-    return "non-string";
-  }
-  if (a === "string" || b === "string") {
-    return "string";
-  }
-  if (a === "null" || b === "null") {
-    return "null";
-  }
-  return "unknown";
-}
-
-function combineStringUnion(kinds: readonly StringTypeKind[]): StringTypeKind {
-  if (kinds.length === 0) {
-    return "unknown";
-  }
-  if (kinds.some((kind) => kind === "non-string" || kind === "unknown")) {
-    return "non-string";
-  }
-  if (kinds.some((kind) => kind === "string")) {
-    return "string";
-  }
-  return "null";
-}
-
-function localStringKind(node: UnknownRecord): StringTypeKind {
-  if (typeof node.type === "string") {
-    if (node.type === "string") {
-      return "string";
-    }
-    if (node.type === "null") {
-      return "null";
-    }
-    return "non-string";
-  }
-
-  if (Array.isArray(node.type)) {
-    if (node.type.length === 0) {
-      return "non-string";
-    }
-    let hasString = false;
-    for (const item of node.type) {
-      if (item === "string") {
-        hasString = true;
-      } else if (item !== "null") {
-        return "non-string";
-      }
-    }
-    return hasString ? "string" : "null";
-  }
-
-  if (
-    isRecord(node.properties) ||
-    node.items !== undefined ||
-    node.additionalProperties !== undefined
-  ) {
-    return "non-string";
-  }
-
-  if (node.const !== undefined) {
-    if (typeof node.const === "string") {
-      return "string";
-    }
-    if (node.const === null) {
-      return "null";
-    }
-    return "non-string";
-  }
-
-  if (Array.isArray(node.enum) && node.enum.length > 0) {
-    let hasString = false;
-    for (const item of node.enum) {
-      if (typeof item === "string") {
-        hasString = true;
-      } else if (item !== null) {
-        return "non-string";
-      }
-    }
-    return hasString ? "string" : "null";
-  }
-
-  return "unknown";
-}
-
-function classifyStringType(
-  schema: unknown,
-  resolve: ResolverFn,
-  from: string | undefined,
-): StringTypeKind {
-  const memo = new Map<object, Map<string, { kind: StringTypeKind; hitCycle: boolean }>>();
-
-  const visit = (
-    node: unknown,
-    currentFrom: string | undefined,
-    seen: ReadonlySet<unknown>,
-    followRef: boolean,
-  ): { kind: StringTypeKind; hitCycle: boolean } => {
-    if (node === false) {
-      return { kind: "non-string", hitCycle: false };
-    }
-    if (node === true || !isRecord(node)) {
-      return { kind: "unknown", hitCycle: false };
-    }
-    if (seen.has(node)) {
-      return { kind: "unknown", hitCycle: true };
-    }
-
-    const cacheKey = `${followRef ? 1 : 0}:${currentFrom ?? ""}`;
-    const cached = memo.get(node)?.get(cacheKey);
-    if (cached) {
-      return cached;
-    }
-
-    const nextSeen = new Set(seen);
-    nextSeen.add(node);
-
-    let hitCycle = false;
-    let kind = localStringKind(node);
-    if (kind === "non-string") {
-      return { kind: "non-string", hitCycle: false };
-    }
-
-    if (followRef && typeof node.$ref === "string") {
-      const resolved = safeResolveSchema(resolve, node, currentFrom);
-      if (resolved) {
-        if (resolved.node !== undefined) {
-          const targetRes = visit(
-            resolved.node,
-            resolved.location?.source?.absoluteRef,
-            nextSeen,
-            true,
-          );
-          if (targetRes.hitCycle) {
-            hitCycle = true;
-          }
-          kind = combineStringAllOf(kind, targetRes.kind);
-        }
-        for (const hop of resolved.chain ?? []) {
-          if (
-            kind === "non-string" ||
-            !isRecord(hop.node) ||
-            hop.node === node ||
-            hop.node === resolved.node
-          ) {
-            continue;
-          }
-          const hopRes = visit(hop.node, hop.location?.source?.absoluteRef, nextSeen, false);
-          if (hopRes.hitCycle) {
-            hitCycle = true;
-          }
-          kind = combineStringAllOf(kind, hopRes.kind);
-        }
-      }
-    }
-
-    if (kind !== "non-string" && Array.isArray(node.allOf)) {
-      for (const branch of node.allOf) {
-        const branchRes = visit(branch, currentFrom, nextSeen, true);
-        if (branchRes.hitCycle) {
-          hitCycle = true;
-        }
-        kind = combineStringAllOf(kind, branchRes.kind);
-        if (kind === "non-string") {
-          break;
-        }
-      }
-    }
-
-    if (kind !== "non-string") {
-      for (const unionKey of ["oneOf", "anyOf"] as const) {
-        const branches = node[unionKey];
-        if (!Array.isArray(branches) || branches.length === 0) {
-          continue;
-        }
-        const branchKinds: StringTypeKind[] = [];
-        for (const branch of branches) {
-          const branchRes = visit(branch, currentFrom, nextSeen, true);
-          if (branchRes.hitCycle) {
-            hitCycle = true;
-          }
-          branchKinds.push(branchRes.kind);
-        }
-        kind = combineStringAllOf(kind, combineStringUnion(branchKinds));
-        if (kind === "non-string") {
-          break;
-        }
-      }
-    }
-
-    const result = { kind, hitCycle };
-    if (!hitCycle) {
-      let nodeCache = memo.get(node);
-      if (!nodeCache) {
-        nodeCache = new Map();
-        memo.set(node, nodeCache);
-      }
-      nodeCache.set(cacheKey, result);
-    }
-    return result;
-  };
-
-  return visit(schema, from, new Set(), true).kind;
-}
-
-export function isStringTypedSchema(schema: unknown, resolve: ResolverFn, from?: string): boolean {
-  return classifyStringType(schema, resolve, from) === "string";
-}
-
-interface AllowedTypesResult {
-  readonly constrained: boolean;
-  readonly types: ReadonlySet<JsonSchemaType>;
-  readonly hitCycle: boolean;
-}
-
-function intersectTypeSets(
-  a: ReadonlySet<JsonSchemaType>,
-  b: ReadonlySet<JsonSchemaType>,
-): Set<JsonSchemaType> {
-  const out = new Set<JsonSchemaType>();
-  for (const t of a) {
-    if (b.has(t)) {
-      out.add(t);
-    } else if (t === "integer" && b.has("number")) {
-      out.add("integer");
-    } else if (t === "number" && b.has("integer")) {
-      out.add("integer");
-    }
-  }
-  return out;
-}
-
-function localAllowedTypes(node: UnknownRecord): {
-  constrained: boolean;
-  types: Set<JsonSchemaType>;
-} {
-  const types = new Set<JsonSchemaType>();
-  let constrained = false;
-
-  if (typeof node.type === "string" && isJsonSchemaType(node.type)) {
-    constrained = true;
-    types.add(node.type);
-  } else if (Array.isArray(node.type)) {
-    const validTypes = node.type.filter(isJsonSchemaType);
-    if (validTypes.length > 0) {
-      constrained = true;
-      for (const item of validTypes) {
-        types.add(item);
-      }
-    }
-  } else if (node.items !== undefined) {
-    constrained = true;
-    types.add("array");
-  } else if (isRecord(node.properties) || node.additionalProperties !== undefined) {
-    constrained = true;
-    types.add("object");
-  } else if (node.const !== undefined) {
-    const constType = jsonTypeOfValue(node.const);
-    if (constType !== null) {
-      constrained = true;
-      types.add(constType);
-    }
-  } else if (Array.isArray(node.enum) && node.enum.length > 0) {
-    for (const item of node.enum) {
-      const enumType = jsonTypeOfValue(item);
-      if (enumType !== null) {
-        constrained = true;
-        types.add(enumType);
-      }
-    }
-  }
-
-  return { constrained, types };
-}
-
-export function findNonObjectTopLevelKinds(
-  schema: unknown,
-  resolve: ResolverFn,
-  from?: string,
-): readonly JsonSchemaType[] {
-  const memo = new Map<object, Map<string, AllowedTypesResult>>();
-
-  const visit = (
-    node: unknown,
-    currentFrom: string | undefined,
-    seen: ReadonlySet<unknown>,
-    followRef: boolean,
-  ): AllowedTypesResult => {
-    if (node === true || node === false || !isRecord(node)) {
-      return { constrained: false, types: new Set(), hitCycle: false };
-    }
-    if (seen.has(node)) {
-      return { constrained: false, types: new Set(), hitCycle: true };
-    }
-
-    const cacheKey = `${followRef ? 1 : 0}:${currentFrom ?? ""}`;
-    const cached = memo.get(node)?.get(cacheKey);
-    if (cached) {
-      return cached;
-    }
-
-    const nextSeen = new Set(seen);
-    nextSeen.add(node);
-
-    let hitCycle = false;
-    const local = localAllowedTypes(node);
-    let constrained = local.constrained;
-    let allowed = local.types;
-    const extraNonObjectFromConflict = new Set<JsonSchemaType>();
-
-    const applyConstraint = (incoming: AllowedTypesResult): void => {
-      if (incoming.hitCycle) {
-        hitCycle = true;
-      }
-      if (!incoming.constrained) {
-        return;
-      }
-      if (!constrained) {
-        constrained = true;
-        allowed = new Set(incoming.types);
-        return;
-      }
-      const intersected = intersectTypeSets(allowed, incoming.types);
-      if (intersected.size === 0) {
-        for (const t of incoming.types) {
-          if (t !== "object") {
-            extraNonObjectFromConflict.add(t);
-          }
-        }
-        for (const t of allowed) {
-          if (t !== "object") {
-            extraNonObjectFromConflict.add(t);
-          }
-        }
-      }
-      allowed = intersected;
-    };
-
-    if (followRef && typeof node.$ref === "string") {
-      const resolved = safeResolveSchema(resolve, node, currentFrom);
-      if (resolved) {
-        if (resolved.node !== undefined) {
-          applyConstraint(
-            visit(resolved.node, resolved.location?.source?.absoluteRef, nextSeen, true),
-          );
-        }
-        for (const hop of resolved.chain ?? []) {
-          if (!isRecord(hop.node) || hop.node === node || hop.node === resolved.node) {
-            continue;
-          }
-          applyConstraint(visit(hop.node, hop.location?.source?.absoluteRef, nextSeen, false));
-        }
-      }
-    }
-
-    if (Array.isArray(node.allOf)) {
-      for (const branch of node.allOf) {
-        applyConstraint(visit(branch, currentFrom, nextSeen, true));
-      }
-    }
-
-    for (const unionKey of ["oneOf", "anyOf"] as const) {
-      const branches = node[unionKey];
-      if (!Array.isArray(branches) || branches.length === 0) {
-        continue;
-      }
-      const unionTypes = new Set<JsonSchemaType>();
-      let anyConstrained = false;
-      for (const branch of branches) {
-        const branchResult = visit(branch, currentFrom, nextSeen, true);
-        if (branchResult.hitCycle) {
-          hitCycle = true;
-        }
-        if (branchResult.constrained) {
-          anyConstrained = true;
-          for (const t of branchResult.types) {
-            unionTypes.add(t);
-          }
-        }
-      }
-      if (anyConstrained) {
-        applyConstraint({ constrained: true, types: unionTypes, hitCycle: false });
-      }
-    }
-
-    if (node.nullable === true) {
-      constrained = true;
-      allowed.add("null");
-    }
-
-    for (const conflictType of extraNonObjectFromConflict) {
-      constrained = true;
-      allowed.add(conflictType);
-    }
-
-    const result: AllowedTypesResult = { constrained, types: allowed, hitCycle };
-    if (!hitCycle) {
-      let nodeCache = memo.get(node);
-      if (!nodeCache) {
-        nodeCache = new Map();
-        memo.set(node, nodeCache);
-      }
-      nodeCache.set(cacheKey, result);
-    }
-    return result;
-  };
-
-  const result = visit(schema, from, new Set(), true);
-  if (!result.constrained) {
-    return [];
-  }
-  return ALL_JSON_TYPES.filter((t) => t !== "object" && result.types.has(t));
 }
 
 interface SchemaFragment {
@@ -1132,45 +496,26 @@ function mergeObjectSummaries(
   };
 }
 
-function propertyNullabilityState(
-  prop: TrackedProperty,
-  resolve: ResolverFn,
-): { nullable: boolean; forbidsNull: boolean } {
-  let anyNullable = false;
-  let anyForbidsNull = false;
+function propertyTypeConstraint(prop: TrackedProperty, resolve: ResolverFn): TypeConstraint {
+  let combined = UNCONSTRAINED_TYPE_CONSTRAINT;
   for (const frag of prop.fragments) {
-    if (schemaForbidsNull(frag.node, resolve, frag.from, new Set())) {
-      anyForbidsNull = true;
-    }
-    if (isNullableSchema(frag.node, resolve, frag.from)) {
-      anyNullable = true;
-    }
+    combined = combineTypeConstraintAllOf(
+      combined,
+      computeTypeConstraint(frag.node, resolve, frag.from),
+    );
   }
-  return {
-    nullable: anyNullable && !anyForbidsNull,
-    forbidsNull: anyForbidsNull,
-  };
+  return combined;
 }
 
 function propertyStructuredKind(prop: TrackedProperty, resolve: ResolverFn): StructuredObjectKind {
   let combined: StructuredObjectKind = "unknown";
   for (const frag of prop.fragments) {
-    const fragKind = classifyStructuredObject(frag.node, resolve, frag.from);
-    combined = combineStructuredAllOf(combined, fragKind);
+    combined = combineStructuredAllOf(
+      combined,
+      classifyStructuredObject(frag.node, resolve, frag.from),
+    );
     if (combined === "non-object") {
       return "non-object";
-    }
-  }
-  return combined;
-}
-
-function propertyStringKind(prop: TrackedProperty, resolve: ResolverFn): StringTypeKind {
-  let combined: StringTypeKind = "unknown";
-  for (const frag of prop.fragments) {
-    const fragKind = classifyStringType(frag.node, resolve, frag.from);
-    combined = combineStringAllOf(combined, fragKind);
-    if (combined === "non-string") {
-      return "non-string";
     }
   }
   return combined;
@@ -1183,12 +528,7 @@ function isPropertyNonNullableStructuredObject(
   if (prop.fragments.length === 0) {
     return false;
   }
-  if (prop.fragments.length === 1) {
-    const first = prop.fragments[0];
-    return first ? isNonNullableStructuredObject(first.node, resolve, first.from) : false;
-  }
-  const { nullable } = propertyNullabilityState(prop, resolve);
-  if (nullable) {
+  if (!isNonNullableObjectConstraint(propertyTypeConstraint(prop, resolve))) {
     return false;
   }
   return propertyStructuredKind(prop, resolve) === "structured";
@@ -1198,14 +538,15 @@ function isPropertyStringTyped(prop: TrackedProperty, resolve: ResolverFn): bool
   if (prop.fragments.length === 0) {
     return false;
   }
-  return propertyStringKind(prop, resolve) === "string";
+  return isStringTypeConstraint(propertyTypeConstraint(prop, resolve));
 }
 
 function propertySignature(prop: TrackedProperty, resolve: ResolverFn): string {
   const structKind = propertyStructuredKind(prop, resolve);
-  const strKind = propertyStringKind(prop, resolve);
-  const { nullable, forbidsNull } = propertyNullabilityState(prop, resolve);
-  return `${prop.name}:${structKind}:${strKind}:${nullable ? "1" : "0"}:${forbidsNull ? "1" : "0"}`;
+  const tc = propertyTypeConstraint(prop, resolve);
+  const allowedSig = ALL_JSON_TYPES.filter((t) => tc.allowed.has(t)).join("|");
+  const explicitSig = ALL_JSON_TYPES.filter((t) => tc.explicit.has(t)).join("|");
+  return `${prop.name}:${structKind}:${allowedSig}:${explicitSig}`;
 }
 
 function summarySignature(summary: TopLevelObjectSummary, resolve: ResolverFn): string {
@@ -1306,19 +647,22 @@ function collectTopLevelObjectSummaries(
     let hitCycle = false;
     let summaries: TopLevelObjectSummary[] = [emptySummary];
 
+    const applyConjunctiveResult = (res: CollectSummariesResult): void => {
+      if (res.hitCycle) {
+        hitCycle = true;
+      }
+      if (res.summaries.length === 0 && !res.hitCycle) {
+        summaries = [];
+      } else {
+        summaries = combineSets(summaries, res.summaries);
+      }
+    };
+
     if (followRef && typeof node.$ref === "string") {
       const resolved = safeResolveSchema(resolve, node, location?.source?.absoluteRef);
       if (resolved) {
         if (resolved.node !== undefined) {
-          const targetResult = visit(resolved.node, resolved.location, nextSeen, true);
-          if (targetResult.hitCycle) {
-            hitCycle = true;
-          }
-          if (targetResult.summaries.length === 0 && !targetResult.hitCycle) {
-            summaries = [];
-          } else {
-            summaries = combineSets(summaries, targetResult.summaries);
-          }
+          applyConjunctiveResult(visit(resolved.node, resolved.location, nextSeen, true));
         }
         for (const hop of resolved.chain ?? []) {
           if (
@@ -1329,30 +673,17 @@ function collectTopLevelObjectSummaries(
           ) {
             continue;
           }
-          const hopResult = visit(hop.node, hop.location, nextSeen, false);
-          if (hopResult.hitCycle) {
-            hitCycle = true;
-          }
-          if (hopResult.summaries.length === 0 && !hopResult.hitCycle) {
-            summaries = [];
-          } else {
-            summaries = combineSets(summaries, hopResult.summaries);
-          }
+          applyConjunctiveResult(visit(hop.node, hop.location, nextSeen, false));
         }
       }
     }
 
     if (summaries.length > 0 && Array.isArray(node.allOf)) {
       for (const [index, branch] of node.allOf.entries()) {
-        const branchResult = visit(branch, location?.child(["allOf", index]), nextSeen, true);
-        if (branchResult.hitCycle) {
-          hitCycle = true;
-        }
-        if (branchResult.summaries.length === 0 && !branchResult.hitCycle) {
-          summaries = [];
+        applyConjunctiveResult(visit(branch, location?.child(["allOf", index]), nextSeen, true));
+        if (summaries.length === 0) {
           break;
         }
-        summaries = combineSets(summaries, branchResult.summaries);
       }
     }
 
@@ -1476,26 +807,16 @@ function collectSuccessJsonResponses(
       continue;
     }
 
-    let pathItemLocation = ctx.location.child(["paths", pathTemplate]);
-    let pathItem: unknown = rawPathItem;
-    if (isRecord(rawPathItem) && typeof rawPathItem.$ref === "string") {
-      const resolved = safeResolveRecord(
-        ctx.resolve,
-        rawPathItem,
-        pathItemLocation.source?.absoluteRef,
-      );
-      if (!resolved?.node) {
-        continue;
-      }
-      pathItem = resolved.node;
-      if (resolved.location) {
-        pathItemLocation = resolved.location;
-      }
-    }
-
-    if (!isRecord(pathItem)) {
+    const resolvedPathItem = resolveRecordWithLocation(
+      ctx.resolve,
+      rawPathItem,
+      ctx.location.child(["paths", pathTemplate]),
+    );
+    if (!resolvedPathItem) {
       continue;
     }
+
+    const { node: pathItem, location: pathItemLocation } = resolvedPathItem;
 
     for (const method of HTTP_METHODS) {
       if (methodFilter && !methodFilter(method)) {
@@ -1513,35 +834,20 @@ function collectSuccessJsonResponses(
         if (statusCode === "204" || !SUCCESS_STATUS_RE.test(statusCode)) {
           continue;
         }
-        if (!isRecord(rawResponse)) {
-          continue;
-        }
-
         const operationResponseLocation = pathItemLocation.child([method, "responses", statusCode]);
-        let responseLocation = operationResponseLocation;
-        let response: UnknownRecord = rawResponse;
-        let resolvedFromRef = false;
-        if (typeof rawResponse.$ref === "string") {
-          const resolved = safeResolveRecord(
-            ctx.resolve,
-            rawResponse,
-            operationResponseLocation.source?.absoluteRef,
-          );
-          if (!resolved?.node) {
-            continue;
-          }
-          response = resolved.node;
-          resolvedFromRef = true;
-          if (resolved.location) {
-            responseLocation = resolved.location;
-          }
-        }
-
-        if (!isRecord(response.content)) {
+        const resolvedResponse = resolveRecordWithLocation(
+          ctx.resolve,
+          rawResponse,
+          operationResponseLocation,
+        );
+        if (!resolvedResponse || !isRecord(resolvedResponse.node.content)) {
           continue;
         }
 
-        for (const [mediaType, mediaObj] of Object.entries(response.content)) {
+        const { location: responseLocation, resolvedFromRef } = resolvedResponse;
+        const responseContent = resolvedResponse.node.content;
+
+        for (const [mediaType, mediaObj] of Object.entries(responseContent)) {
           if (!JSON_MEDIA_TYPE_RE.test(mediaType)) {
             continue;
           }
@@ -1619,6 +925,19 @@ export const ads0002NoSingleResourceWrapper: RedoclyOas3Rule = (options = {}) =>
             entry.schemaLocation,
           );
           const reportedProps = new Set<string>();
+          const reportWrappedProp = (prop: TrackedProperty, message: string): void => {
+            const reportLocation = selectPropertyReportLocation(
+              prop,
+              entry.schemaLocation,
+              entry.reportBaseLocation,
+            );
+            const dedupeKey = `${locationKey(reportLocation)}:${prop.name}`;
+            if (reportedProps.has(dedupeKey)) {
+              return;
+            }
+            reportedProps.add(dedupeKey);
+            ctx.report({ message, location: reportLocation });
+          };
 
           for (const summary of summaries) {
             const singleKeyProp =
@@ -1632,20 +951,10 @@ export const ads0002NoSingleResourceWrapper: RedoclyOas3Rule = (options = {}) =>
               if (!isPropertyNonNullableStructuredObject(prop, ctx.resolve)) {
                 continue;
               }
-              const reportLocation = selectPropertyReportLocation(
+              reportWrappedProp(
                 prop,
-                entry.schemaLocation,
-                entry.reportBaseLocation,
+                `${entry.method.toUpperCase()} "${entry.pathTemplate}" (${entry.statusCode} ${entry.mediaType}) wraps a structured object under generic envelope key "${propName}". Return single-resource fields directly at the top level instead of using a generic "${propName}" envelope (ADS-0002).`,
               );
-              const dedupeKey = `${locationKey(reportLocation)}:${propName}`;
-              if (reportedProps.has(dedupeKey)) {
-                continue;
-              }
-              reportedProps.add(dedupeKey);
-              ctx.report({
-                message: `${entry.method.toUpperCase()} "${entry.pathTemplate}" (${entry.statusCode} ${entry.mediaType}) wraps a structured object under generic envelope key "${propName}". Return single-resource fields directly at the top level instead of using a generic "${propName}" envelope (ADS-0002).`,
-                location: reportLocation,
-              });
             }
 
             if (
@@ -1653,20 +962,10 @@ export const ads0002NoSingleResourceWrapper: RedoclyOas3Rule = (options = {}) =>
               !GENERIC_ENVELOPE_KEY_RE.test(singleKeyProp.name) &&
               isPropertyNonNullableStructuredObject(singleKeyProp, ctx.resolve)
             ) {
-              const reportLocation = selectPropertyReportLocation(
+              reportWrappedProp(
                 singleKeyProp,
-                entry.schemaLocation,
-                entry.reportBaseLocation,
+                `${entry.method.toUpperCase()} "${entry.pathTemplate}" (${entry.statusCode} ${entry.mediaType}) wraps a single resource inside top-level key "${singleKeyProp.name}". Return resource fields directly at the top level instead of using a single-key wrapper envelope (ADS-0002).`,
               );
-              const dedupeKey = `${locationKey(reportLocation)}:${singleKeyProp.name}`;
-              if (reportedProps.has(dedupeKey)) {
-                continue;
-              }
-              reportedProps.add(dedupeKey);
-              ctx.report({
-                message: `${entry.method.toUpperCase()} "${entry.pathTemplate}" (${entry.statusCode} ${entry.mediaType}) wraps a single resource inside top-level key "${singleKeyProp.name}". Return resource fields directly at the top level instead of using a single-key wrapper envelope (ADS-0002).`,
-                location: reportLocation,
-              });
             }
           }
         }

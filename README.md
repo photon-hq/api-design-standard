@@ -80,7 +80,7 @@ rules:
 Each `ignore` entry accepts `path`, `method`, `schema`, and an optional `reason` string:
 
 - `path`: Exact OpenAPI path template (trailing slash trimmed except `/`). Omitting `method` matches all methods (and path-level parameters) on that path.
-- `method`: Case-insensitive HTTP method (`get`, `post`, `patch`, `put`, `delete`, etc.) narrowing a `path` or `schema` match.
+- `method`: Case-insensitive HTTP method (`get`, `post`, `patch`, `put`, `delete`, etc.) narrowing a `path` or `schema` match where operation context applies. Component schema diagnostics (under `components.schemas`) have no HTTP method context, so suppressing them requires a schema-only `ignore` entry.
 - `schema`: Component schema name under `components.schemas` (used by `photon-ads/ads-0001-resource-primary-id`).
 - `reason`: Optional human-readable explanation for reviewers.
 

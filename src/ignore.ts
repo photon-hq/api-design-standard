@@ -1,3 +1,4 @@
+import { isRecord } from "./schema-utils.js";
 import type { AdsRuleOptions } from "./types.js";
 
 export const HTTP_METHODS = [
@@ -40,10 +41,6 @@ export interface RuleIgnoreMatcher {
   readonly entries: readonly NormalizedIgnoreEntry[];
   isIgnored(target: IgnoreMatchTarget): boolean;
   areAllPathOperationsIgnored(path: string, pathItem: unknown): boolean;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function unescapeJsonPointerToken(token: string): string {
@@ -90,6 +87,22 @@ export function extractPointerContext(pointer?: string): PointerContext {
   return {};
 }
 
+type OptionalFieldParse = { readonly ok: true; readonly value?: string } | { readonly ok: false };
+
+function parseOptionalSelector(
+  raw: unknown,
+  normalize: (value: string) => string,
+): OptionalFieldParse {
+  if (raw === undefined) {
+    return { ok: true };
+  }
+  if (typeof raw !== "string") {
+    return { ok: false };
+  }
+  const normalized = normalize(raw);
+  return normalized.length > 0 ? { ok: true, value: normalized } : { ok: false };
+}
+
 export function parseRuleIgnoreEntries(options?: unknown): readonly NormalizedIgnoreEntry[] {
   if (!isRecord(options)) {
     return [];
@@ -107,53 +120,24 @@ export function parseRuleIgnoreEntries(options?: unknown): readonly NormalizedIg
       continue;
     }
 
-    let path: string | undefined;
-    if (rawEntry.path !== undefined) {
-      if (typeof rawEntry.path !== "string") {
-        continue;
-      }
-      const normalized = normalizeIgnorePath(rawEntry.path);
-      if (normalized.length === 0) {
-        continue;
-      }
-      path = normalized;
+    const parsedPath = parseOptionalSelector(rawEntry.path, normalizeIgnorePath);
+    const parsedMethod = parseOptionalSelector(rawEntry.method, normalizeIgnoreMethod);
+    const parsedSchema = parseOptionalSelector(rawEntry.schema, normalizeIgnoreSchema);
+    if (!parsedPath.ok || !parsedMethod.ok || !parsedSchema.ok) {
+      continue;
     }
 
-    let method: string | undefined;
-    if (rawEntry.method !== undefined) {
-      if (typeof rawEntry.method !== "string") {
-        continue;
-      }
-      const normalized = normalizeIgnoreMethod(rawEntry.method);
-      if (normalized.length === 0) {
-        continue;
-      }
-      method = normalized;
-    }
-
-    let schema: string | undefined;
-    if (rawEntry.schema !== undefined) {
-      if (typeof rawEntry.schema !== "string") {
-        continue;
-      }
-      const normalized = normalizeIgnoreSchema(rawEntry.schema);
-      if (normalized.length === 0) {
-        continue;
-      }
-      schema = normalized;
-    }
-
+    const path = parsedPath.value;
+    const method = parsedMethod.value;
+    const schema = parsedSchema.value;
     if (path === undefined && schema === undefined) {
       continue;
     }
 
-    let reason: string | undefined;
-    if (typeof rawEntry.reason === "string") {
-      const trimmedReason = rawEntry.reason.trim();
-      if (trimmedReason.length > 0) {
-        reason = trimmedReason;
-      }
-    }
+    const reason =
+      typeof rawEntry.reason === "string" && rawEntry.reason.trim().length > 0
+        ? rawEntry.reason.trim()
+        : undefined;
 
     entries.push({
       ...(path !== undefined ? { path } : {}),
@@ -166,38 +150,27 @@ export function parseRuleIgnoreEntries(options?: unknown): readonly NormalizedIg
   return entries;
 }
 
+function selectorMatches(
+  expected: string | undefined,
+  actual: string | undefined,
+  normalize: (value: string) => string,
+): boolean {
+  if (expected === undefined) {
+    return true;
+  }
+  if (actual === undefined) {
+    return false;
+  }
+  const normalized = normalize(actual);
+  return normalized.length > 0 && normalized === expected;
+}
+
 function entryMatchesTarget(entry: NormalizedIgnoreEntry, target: IgnoreMatchTarget): boolean {
-  if (entry.path !== undefined) {
-    if (target.path === undefined) {
-      return false;
-    }
-    const normalizedTargetPath = normalizeIgnorePath(target.path);
-    if (normalizedTargetPath.length === 0 || normalizedTargetPath !== entry.path) {
-      return false;
-    }
-  }
-
-  if (entry.method !== undefined) {
-    if (target.method === undefined) {
-      return false;
-    }
-    const normalizedTargetMethod = normalizeIgnoreMethod(target.method);
-    if (normalizedTargetMethod.length === 0 || normalizedTargetMethod !== entry.method) {
-      return false;
-    }
-  }
-
-  if (entry.schema !== undefined) {
-    if (target.schema === undefined) {
-      return false;
-    }
-    const normalizedTargetSchema = normalizeIgnoreSchema(target.schema);
-    if (normalizedTargetSchema.length === 0 || normalizedTargetSchema !== entry.schema) {
-      return false;
-    }
-  }
-
-  return true;
+  return (
+    selectorMatches(entry.path, target.path, normalizeIgnorePath) &&
+    selectorMatches(entry.method, target.method, normalizeIgnoreMethod) &&
+    selectorMatches(entry.schema, target.schema, normalizeIgnoreSchema)
+  );
 }
 
 export function createRuleIgnoreMatcher(options?: unknown): RuleIgnoreMatcher {

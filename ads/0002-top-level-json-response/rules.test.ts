@@ -205,6 +205,54 @@ describe("ADS-0002 unit helpers", () => {
         resolveRef,
       ),
     ).toBe(false);
+    expect(
+      isNullableSchema(
+        {
+          type: ["object", "null"],
+          allOf: [{ $ref: "#/components/schemas/Sub" }],
+        },
+        resolveRef,
+      ),
+    ).toBe(false);
+    expect(
+      isNullableSchema(
+        {
+          type: ["object", "null"],
+          allOf: [{ properties: { extra: { type: "string" } } }],
+        },
+        resolveRef,
+      ),
+    ).toBe(true);
+    expect(
+      isNullableSchema(
+        {
+          oneOf: [
+            { type: ["object", "null"], properties: { a: { type: "string" } } },
+            { type: ["object", "null"], properties: { b: { type: "string" } } },
+          ],
+        },
+        resolveRef,
+      ),
+    ).toBe(false);
+    expect(
+      isNullableSchema(
+        {
+          anyOf: [
+            { type: ["object", "null"], properties: { a: { type: "string" } } },
+            { type: ["object", "null"], properties: { b: { type: "string" } } },
+          ],
+        },
+        resolveRef,
+      ),
+    ).toBe(true);
+    expect(
+      isNullableSchema(
+        {
+          oneOf: [{ $ref: "#/components/schemas/Sub" }, { type: "null" }],
+        },
+        resolveRef,
+      ),
+    ).toBe(true);
     expect(isNullableSchema({ $ref: "#/components/schemas/CycleA" }, resolveRef)).toBe(false);
   });
 
@@ -238,6 +286,15 @@ describe("ADS-0002 unit helpers", () => {
             { type: ["object", "null"], properties: { id: { type: "string" } } },
             { type: "object" },
           ],
+        },
+        resolveRef,
+      ),
+    ).toBe(true);
+    expect(
+      isNonNullableStructuredObject(
+        {
+          type: ["object", "null"],
+          allOf: [{ $ref: "#/components/schemas/Project" }],
         },
         resolveRef,
       ),
@@ -325,6 +382,34 @@ describe("ADS-0002 unit helpers", () => {
     expect(findNonObjectTopLevelKinds({ items: { type: "string" } }, resolveRef)).toEqual([
       "array",
     ]);
+    expect(
+      findNonObjectTopLevelKinds(
+        {
+          type: ["object", "null"],
+          allOf: [{ $ref: "#/components/schemas/Project" }],
+        },
+        resolveRef,
+      ),
+    ).toEqual([]);
+    expect(
+      findNonObjectTopLevelKinds(
+        {
+          allOf: [{ type: ["object", "null"] }, { properties: { id: { type: "string" } } }],
+        },
+        resolveRef,
+      ),
+    ).toEqual(["null"]);
+    expect(
+      findNonObjectTopLevelKinds(
+        {
+          allOf: [{ type: ["object", "null"] }, { anyOf: [{ type: "object" }, {}] }],
+        },
+        resolveRef,
+      ),
+    ).toEqual(["null"]);
+    expect(
+      findNonObjectTopLevelKinds({ properties: { id: { type: "string" } } }, resolveRef),
+    ).toEqual([]);
   });
 });
 
@@ -1861,5 +1946,210 @@ describe("Declarative rule-level ignore options across ADS-0001 and ADS-0002", (
     const { exitCode, report } = await lintOpenApi(doc, configPath);
     expect(exitCode).toBe(1);
     expect(ads0002Problems(report)).toHaveLength(2);
+  });
+
+  it("enforces wrappers and flat creation secrets when same-node type array is narrowed by allOf", async () => {
+    const doc = baseOpenApi({
+      paths: {
+        "/v1/narrowed-wrapper": {
+          get: {
+            operationId: "getNarrowedWrapper",
+            summary: "Same-node nullable type array narrowed by allOf ref",
+            responses: {
+              "200": {
+                description: "Wrapped object whose nullability is narrowed out by allOf",
+                content: {
+                  "application/json": {
+                    schema: {
+                      type: "object",
+                      properties: {
+                        data: {
+                          type: ["object", "null"],
+                          allOf: [{ $ref: "#/components/schemas/Project" }],
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+        "/v1/narrowed-secret": {
+          post: {
+            operationId: "createNarrowedSecret",
+            summary: "POST with narrowed type array resource and secret",
+            responses: {
+              "201": {
+                description: "Split creation secret where resource narrows out null",
+                content: {
+                  "application/json": {
+                    schema: {
+                      type: "object",
+                      properties: {
+                        apiKey: {
+                          type: ["object", "null"],
+                          allOf: [{ $ref: "#/components/schemas/ApiKey" }],
+                        },
+                        secret: { type: "string" },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+        "/v1/json-seq": {
+          get: {
+            operationId: "getJsonSeq",
+            summary: "JSON text sequence is not application/json or +json",
+            responses: {
+              "200": {
+                description: "RFC 7464 JSON text sequence",
+                content: {
+                  "application/json-seq": {
+                    schema: { type: "string" },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+      components: {
+        schemas: {
+          Project: {
+            type: "object",
+            properties: {
+              id: { type: "string" },
+              name: { type: "string" },
+            },
+          },
+          ApiKey: {
+            type: "object",
+            properties: {
+              id: { type: "string" },
+              name: { type: "string" },
+            },
+          },
+        },
+      },
+    });
+
+    const { exitCode, report } = await lintOpenApi(doc);
+    expect(exitCode).toBe(1);
+    const problems = ads0002Problems(report);
+    expect(problems.map((p) => p.ruleId).sort()).toEqual([
+      "photon-ads/ads-0002-flat-creation-secret",
+      "photon-ads/ads-0002-no-single-resource-wrapper",
+    ]);
+  });
+
+  it("suppresses reusable component path parameters referenced exclusively by ignored paths while keeping shared ones", async () => {
+    const configPath = await writeRedoclyConfig({
+      "photon-ads/ads-0001-path-param-naming": {
+        severity: "error",
+        ignore: [
+          { path: "/v1/legacy/{id}", reason: "Legacy route using reusable component parameter" },
+          {
+            path: "/v1/legacy-shared/{id}",
+            reason: "Legacy route sharing a parameter with an active route",
+          },
+        ],
+      },
+      "photon-ads/ads-0001-path-param-consistency": "off",
+    });
+
+    const doc = baseOpenApi({
+      paths: {
+        "/v1/legacy/{id}": {
+          parameters: [{ $ref: "#/components/parameters/LegacyOnlyId" }],
+          get: {
+            operationId: "getLegacyOnly",
+            summary: "Ignored route using dedicated reusable parameter",
+            responses: {
+              "200": {
+                description: "OK",
+                content: {
+                  "application/json": {
+                    schema: { type: "object", properties: { id: { type: "string" } } },
+                  },
+                },
+              },
+            },
+          },
+        },
+        "/v1/legacy-shared/{id}": {
+          parameters: [{ $ref: "#/components/parameters/SharedBadId" }],
+          get: {
+            operationId: "getLegacyShared",
+            summary: "Ignored route sharing reusable parameter",
+            responses: {
+              "200": {
+                description: "OK",
+                content: {
+                  "application/json": {
+                    schema: { type: "object", properties: { id: { type: "string" } } },
+                  },
+                },
+              },
+            },
+          },
+        },
+        "/v1/active-shared/{id}": {
+          parameters: [{ $ref: "#/components/parameters/SharedBadId" }],
+          get: {
+            operationId: "getActiveShared",
+            summary: "Non-ignored route sharing reusable parameter",
+            responses: {
+              "200": {
+                description: "OK",
+                content: {
+                  "application/json": {
+                    schema: { type: "object", properties: { id: { type: "string" } } },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+      components: {
+        parameters: {
+          LegacyOnlyId: {
+            name: "id",
+            in: "path",
+            required: true,
+            schema: { type: "string" },
+          },
+          SharedBadId: {
+            name: "id",
+            in: "path",
+            required: true,
+            schema: { type: "string" },
+          },
+          UnusedBadId: {
+            name: "id",
+            in: "path",
+            required: true,
+            schema: { type: "string" },
+          },
+        },
+      },
+    });
+
+    const { exitCode, report } = await lintOpenApi(doc, configPath);
+    expect(exitCode).toBe(1);
+    const namingProblems = adsProblems(report).filter(
+      (p) => p.ruleId === "photon-ads/ads-0001-path-param-naming",
+    );
+    const pointers = namingProblems.flatMap((p) => (p.location ?? []).map((l) => l.pointer ?? ""));
+
+    expect(pointers.some((p) => p.includes("LegacyOnlyId"))).toBe(false);
+    expect(pointers.some((p) => p.includes("~1v1~1legacy~1{id}"))).toBe(false);
+    expect(pointers.some((p) => p.includes("SharedBadId"))).toBe(true);
+    expect(pointers.some((p) => p.includes("UnusedBadId"))).toBe(true);
+    expect(pointers.some((p) => p.includes("~1v1~1active-shared~1{id}"))).toBe(true);
   });
 });
