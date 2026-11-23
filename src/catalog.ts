@@ -1,9 +1,10 @@
 import { ADS_0001_METADATA, PLUGIN_ID } from "../ads/0001-resource-identifiers/rules.js";
+import { ADS_0002_METADATA } from "../ads/0002-top-level-json-response/rules.js";
 import type { AdsRuleMetadata, AdsRuleSeverity, AdsStandardMetadata } from "./types.js";
 
 export { PLUGIN_ID };
 
-export const ADS_STANDARDS: readonly AdsStandardMetadata[] = [ADS_0001_METADATA];
+export const ADS_STANDARDS: readonly AdsStandardMetadata[] = [ADS_0001_METADATA, ADS_0002_METADATA];
 
 export const ADS_RULES: readonly AdsRuleMetadata[] = ADS_STANDARDS.flatMap(
   (standard) => standard.rules,

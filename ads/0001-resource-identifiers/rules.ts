@@ -1,8 +1,17 @@
+import { createRuleIgnoreMatcher, extractPointerContext } from "../../src/ignore.js";
+import {
+  isRecord,
+  locationKey,
+  type ResolverFn,
+  resolveRecordWithLocation,
+  safeResolveRecord as safeResolve,
+  safeResolveSchema,
+  type UnknownRecord,
+} from "../../src/schema-utils.js";
 import type {
   AdsStandardMetadata,
   RedoclyLocation,
   RedoclyOas3Rule,
-  RedoclyResolveResult,
   RedoclyUserContext,
 } from "../../src/types.js";
 
@@ -93,16 +102,6 @@ const RESOURCE_SCHEMA_SUFFIXES = [
   "Dto",
   "DTO",
 ] as const;
-
-type UnknownRecord = Record<string, unknown>;
-
-function isRecord(value: unknown): value is UnknownRecord {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function locationKey(location: RedoclyLocation): string {
-  return location.absolutePointer ?? `${location.source?.absoluteRef ?? ""}#${location.pointer}`;
-}
 
 export function validatePathParamName(rawName: string): string | null {
   const name = rawName.trim();
@@ -289,50 +288,6 @@ interface CollectVariantsOptions {
   matchTarget: (propName: string) => boolean;
   trackWrapper: boolean;
   dedupeTargetByLocation?: boolean;
-}
-
-type ResolverFn = RedoclyUserContext["resolve"];
-
-function safeResolve(
-  resolve: ResolverFn,
-  node: UnknownRecord,
-  from?: string,
-): RedoclyResolveResult<UnknownRecord> | null {
-  if (typeof node.$ref !== "string") {
-    return null;
-  }
-  try {
-    const resolved = resolve<UnknownRecord>({ $ref: node.$ref }, from);
-    if (!resolved || resolved.error || !isRecord(resolved.node)) {
-      return null;
-    }
-    return resolved;
-  } catch {
-    return null;
-  }
-}
-
-function safeResolveSchema(
-  resolve: ResolverFn,
-  node: UnknownRecord,
-  from?: string,
-): RedoclyResolveResult<UnknownRecord | boolean> | null {
-  if (typeof node.$ref !== "string") {
-    return null;
-  }
-  try {
-    const resolved = resolve<UnknownRecord | boolean>({ $ref: node.$ref }, from);
-    if (
-      !resolved ||
-      resolved.error ||
-      (!isRecord(resolved.node) && typeof resolved.node !== "boolean")
-    ) {
-      return null;
-    }
-    return resolved;
-  } catch {
-    return null;
-  }
 }
 
 function isExplicitlyNonObjectSchema(node: unknown): boolean {
@@ -719,14 +674,70 @@ function collectObjectVariants(
   );
 }
 
-export const ads0001PathParamNaming: RedoclyOas3Rule = () => {
-  const reportedParameters = new Set<string>();
+export const ads0001PathParamNaming: RedoclyOas3Rule = (options = {}) => {
+  const ignoreMatcher = createRuleIgnoreMatcher(options);
+  const reportedInlineParameters = new Set<string>();
+  const reusableParamCandidates = new Map<string, { location: RedoclyLocation; message: string }>();
+  const reusableParamIgnored = new Set<string>();
+  const reusableParamActive = new Set<string>();
+  const pathStack: Array<{ path: string; allOpsIgnored: boolean }> = [];
+  const methodStack: string[] = [];
+
+  const recordReusableParamRefs = (
+    rawParams: unknown,
+    ctx: RedoclyUserContext,
+    isUsageIgnored: boolean,
+  ): void => {
+    if (!Array.isArray(rawParams)) {
+      return;
+    }
+    const from = ctx.location.source?.absoluteRef;
+    const inComponentPathItem = ctx.location.pointer.startsWith("#/components/pathItems/");
+    for (const [index, rawParam] of rawParams.entries()) {
+      if (!isRecord(rawParam)) {
+        continue;
+      }
+      let paramNode: UnknownRecord | undefined;
+      let paramLocation: RedoclyLocation | undefined;
+      if (typeof rawParam.$ref === "string") {
+        const resolved = safeResolve(ctx.resolve, rawParam, from);
+        paramNode = resolved?.node;
+        paramLocation = resolved?.location;
+      } else if (inComponentPathItem) {
+        paramNode = rawParam;
+        paramLocation = ctx.location.child(["parameters", index]);
+      }
+      if (
+        !paramNode ||
+        !paramLocation ||
+        paramNode.in !== "path" ||
+        typeof paramNode.name !== "string"
+      ) {
+        continue;
+      }
+      const nameLocation = paramLocation.child(["name"]);
+      const dedupeKey = `${locationKey(nameLocation)}:${paramNode.name}`;
+      if (isUsageIgnored) {
+        reusableParamIgnored.add(dedupeKey);
+      } else {
+        reusableParamActive.add(dedupeKey);
+      }
+    }
+  };
 
   return {
     Paths: {
       PathItem: {
-        enter(_pathItem, ctx) {
+        enter(pathItem, ctx) {
           const pathTemplate = String(ctx.key);
+          const allOpsIgnored = ignoreMatcher.areAllPathOperationsIgnored(pathTemplate, pathItem);
+          pathStack.push({ path: pathTemplate, allOpsIgnored });
+          if (isRecord(pathItem)) {
+            recordReusableParamRefs(pathItem.parameters, ctx, allOpsIgnored);
+          }
+          if (allOpsIgnored) {
+            return;
+          }
           for (const match of pathTemplate.matchAll(PATH_PARAM_TEMPLATE_RE)) {
             const paramName = match[1] ?? "";
             const error = validatePathParamName(paramName);
@@ -737,6 +748,23 @@ export const ads0001PathParamNaming: RedoclyOas3Rule = () => {
               });
             }
           }
+        },
+        leave() {
+          pathStack.pop();
+        },
+        Operation: {
+          enter(operation, ctx) {
+            const method = String(ctx.key).toLowerCase();
+            methodStack.push(method);
+            const currentPathItem = pathStack[pathStack.length - 1];
+            if (currentPathItem !== undefined && isRecord(operation)) {
+              const opIgnored = ignoreMatcher.isIgnored({ path: currentPathItem.path, method });
+              recordReusableParamRefs(operation.parameters, ctx, opIgnored);
+            }
+          },
+          leave() {
+            methodStack.pop();
+          },
         },
       },
     },
@@ -749,16 +777,64 @@ export const ads0001PathParamNaming: RedoclyOas3Rule = () => {
         if (!error) {
           return;
         }
+
+        const pointerCtx = extractPointerContext(ctx.location.pointer);
+        const currentPathItem = pathStack[pathStack.length - 1];
+        const currentMethod = methodStack[methodStack.length - 1];
         const nameLocation = ctx.location.child(["name"]);
         const dedupeKey = `${locationKey(nameLocation)}:${param.name}`;
-        if (reportedParameters.has(dedupeKey)) {
+
+        if (pointerCtx.path !== undefined) {
+          if (pointerCtx.method !== undefined) {
+            if (ignoreMatcher.isIgnored({ path: pointerCtx.path, method: pointerCtx.method })) {
+              return;
+            }
+          } else if (
+            ignoreMatcher.isIgnored({ path: pointerCtx.path }) ||
+            (currentPathItem !== undefined &&
+              currentPathItem.path === pointerCtx.path &&
+              currentPathItem.allOpsIgnored)
+          ) {
+            return;
+          }
+          if (reportedInlineParameters.has(dedupeKey)) {
+            return;
+          }
+          reportedInlineParameters.add(dedupeKey);
+          ctx.report({
+            message: error,
+            location: nameLocation,
+          });
           return;
         }
-        reportedParameters.add(dedupeKey);
-        ctx.report({
-          message: error,
-          location: nameLocation,
-        });
+
+        if (!reusableParamCandidates.has(dedupeKey)) {
+          reusableParamCandidates.set(dedupeKey, { location: nameLocation, message: error });
+        }
+        if (currentPathItem !== undefined) {
+          const usageIgnored =
+            currentMethod !== undefined
+              ? ignoreMatcher.isIgnored({ path: currentPathItem.path, method: currentMethod })
+              : currentPathItem.allOpsIgnored;
+          if (usageIgnored) {
+            reusableParamIgnored.add(dedupeKey);
+          } else {
+            reusableParamActive.add(dedupeKey);
+          }
+        }
+      },
+    },
+    Root: {
+      leave(_root, ctx) {
+        for (const [dedupeKey, candidate] of reusableParamCandidates.entries()) {
+          if (reusableParamIgnored.has(dedupeKey) && !reusableParamActive.has(dedupeKey)) {
+            continue;
+          }
+          ctx.report({
+            message: candidate.message,
+            location: candidate.location,
+          });
+        }
       },
     },
   };
@@ -772,7 +848,9 @@ function formatRouteSummary(routes: readonly string[]): string {
   return `${routes[0]}, ${routes[1]}, and ${remaining} more`;
 }
 
-export const ads0001PathParamConsistency: RedoclyOas3Rule = () => {
+export const ads0001PathParamConsistency: RedoclyOas3Rule = (options = {}) => {
+  const ignoreMatcher = createRuleIgnoreMatcher(options);
+
   return {
     Paths: {
       leave(paths, ctx) {
@@ -782,8 +860,22 @@ export const ads0001PathParamConsistency: RedoclyOas3Rule = () => {
 
         const slots = new Map<string, Map<string, string[]>>();
 
-        for (const pathTemplate of Object.keys(paths)) {
+        for (const [pathTemplate, rawPathItem] of Object.entries(paths)) {
           if (!pathTemplate.startsWith("/")) {
+            continue;
+          }
+          let pathItem: unknown = rawPathItem;
+          if (isRecord(rawPathItem) && typeof rawPathItem.$ref === "string") {
+            const resolved = safeResolve(
+              ctx.resolve,
+              rawPathItem,
+              ctx.location.child([pathTemplate]).source?.absoluteRef,
+            );
+            if (resolved?.node) {
+              pathItem = resolved.node;
+            }
+          }
+          if (ignoreMatcher.areAllPathOperationsIgnored(pathTemplate, pathItem)) {
             continue;
           }
           for (const { prefixKey, paramName } of extractPathParamSlots(pathTemplate)) {
@@ -843,7 +935,8 @@ export const ads0001PathParamConsistency: RedoclyOas3Rule = () => {
   };
 };
 
-export const ads0001ResourcePrimaryId: RedoclyOas3Rule = () => {
+export const ads0001ResourcePrimaryId: RedoclyOas3Rule = (options = {}) => {
+  const ignoreMatcher = createRuleIgnoreMatcher(options);
   const reportedCasing = new Set<string>();
   const reportedPrimaryIds = new Set<string>();
 
@@ -869,6 +962,21 @@ export const ads0001ResourcePrimaryId: RedoclyOas3Rule = () => {
         if (!isRecord(schema) || !isRecord(schema.properties)) {
           return;
         }
+        const pointerCtx = extractPointerContext(ctx.location.pointer);
+        if (pointerCtx.schema !== undefined) {
+          if (ignoreMatcher.isIgnored({ schema: pointerCtx.schema })) {
+            return;
+          }
+        } else if (pointerCtx.path !== undefined) {
+          if (pointerCtx.method !== undefined) {
+            if (ignoreMatcher.isIgnored({ path: pointerCtx.path, method: pointerCtx.method })) {
+              return;
+            }
+          } else if (ignoreMatcher.isIgnored({ path: pointerCtx.path })) {
+            return;
+          }
+        }
+
         for (const propName of Object.keys(schema.properties)) {
           const error = validateIdPropertyCasing(propName);
           if (!error) {
@@ -901,6 +1009,9 @@ export const ads0001ResourcePrimaryId: RedoclyOas3Rule = () => {
             if (isNonResourceSchemaName(schemaName)) {
               continue;
             }
+            if (ignoreMatcher.isIgnored({ schema: schemaName })) {
+              continue;
+            }
             const stem = deriveResourceStem(schemaName);
             if (stem.length === 0) {
               continue;
@@ -927,6 +1038,10 @@ export const ads0001ResourcePrimaryId: RedoclyOas3Rule = () => {
               const reportLocation = variant.matchedTarget.location
                 ? variant.matchedTarget.location.key()
                 : schemaLocation.key();
+              const targetSchema = extractPointerContext(reportLocation.pointer).schema;
+              if (targetSchema !== undefined && ignoreMatcher.isIgnored({ schema: targetSchema })) {
+                continue;
+              }
               reportPrimaryIdOnce(
                 ctx,
                 reportLocation,
@@ -945,6 +1060,9 @@ export const ads0001ResourcePrimaryId: RedoclyOas3Rule = () => {
           if (!pathTemplate.startsWith("/")) {
             continue;
           }
+          if (ignoreMatcher.isIgnored({ path: pathTemplate, method: "get" })) {
+            continue;
+          }
           const normalizedPath = pathTemplate.replace(/\/+$/, "");
           const leafMatch = LEAF_ID_PARAM_RE.exec(normalizedPath);
           if (!leafMatch?.[1]) {
@@ -952,28 +1070,17 @@ export const ads0001ResourcePrimaryId: RedoclyOas3Rule = () => {
           }
           const leafParam = leafMatch[1];
 
-          let pathItemLocation = ctx.location.child(["paths", pathTemplate]);
-          let pathItem: unknown = rawPathItem;
-          if (isRecord(rawPathItem) && typeof rawPathItem.$ref === "string") {
-            const resolved = safeResolve(
-              ctx.resolve,
-              rawPathItem,
-              pathItemLocation.source?.absoluteRef,
-            );
-            if (!resolved?.node) {
-              continue;
-            }
-            pathItem = resolved.node;
-            if (resolved.location) {
-              pathItemLocation = resolved.location;
-            }
-          }
-
-          if (!isRecord(pathItem) || !isRecord(pathItem.get)) {
+          const resolvedPathItem = resolveRecordWithLocation(
+            ctx.resolve,
+            rawPathItem,
+            ctx.location.child(["paths", pathTemplate]),
+          );
+          if (!resolvedPathItem || !isRecord(resolvedPathItem.node.get)) {
             continue;
           }
 
-          const getOp = pathItem.get;
+          const pathItemLocation = resolvedPathItem.location;
+          const getOp = resolvedPathItem.node.get;
           if (!isRecord(getOp.responses)) {
             continue;
           }
@@ -986,37 +1093,34 @@ export const ads0001ResourcePrimaryId: RedoclyOas3Rule = () => {
           if (!responseKey) {
             continue;
           }
-          const rawSuccessResponse = getOp.responses[responseKey];
-          if (!isRecord(rawSuccessResponse)) {
+          const resolvedResponse = resolveRecordWithLocation(
+            ctx.resolve,
+            getOp.responses[responseKey],
+            pathItemLocation.child(["get", "responses", responseKey]),
+          );
+          if (!resolvedResponse || !isRecord(resolvedResponse.node.content)) {
             continue;
           }
 
-          let responseLocation = pathItemLocation.child(["get", "responses", responseKey]);
-          let successResponse: UnknownRecord = rawSuccessResponse;
-          if (typeof rawSuccessResponse.$ref === "string") {
-            const resolved = safeResolve(
-              ctx.resolve,
-              rawSuccessResponse,
-              responseLocation.source?.absoluteRef,
-            );
-            if (!resolved?.node) {
-              continue;
-            }
-            successResponse = resolved.node;
-            if (resolved.location) {
-              responseLocation = resolved.location;
-            }
-          }
+          const responseLocation = resolvedResponse.location;
+          const successContent = resolvedResponse.node.content;
 
-          if (!isRecord(successResponse.content)) {
-            continue;
-          }
-
-          for (const [mediaType, mediaObj] of Object.entries(successResponse.content)) {
+          for (const [mediaType, mediaObj] of Object.entries(successContent)) {
             if (!JSON_MEDIA_TYPE_RE.test(mediaType)) {
               continue;
             }
             if (!isRecord(mediaObj) || !isRecord(mediaObj.schema)) {
+              continue;
+            }
+
+            const topRefSchema =
+              typeof mediaObj.schema.$ref === "string"
+                ? extractComponentSchemaNameFromRef(mediaObj.schema.$ref)
+                : null;
+            if (
+              topRefSchema !== null &&
+              ignoreMatcher.isIgnored({ path: pathTemplate, method: "get", schema: topRefSchema })
+            ) {
               continue;
             }
 
@@ -1028,6 +1132,14 @@ export const ads0001ResourcePrimaryId: RedoclyOas3Rule = () => {
               schemaLocation,
             );
 
+            const isIgnoredGetReport = (reportLocation: RedoclyLocation): boolean => {
+              const reportSchema = extractPointerContext(reportLocation.pointer).schema;
+              return (
+                reportSchema !== undefined &&
+                ignoreMatcher.isIgnored({ path: pathTemplate, method: "get", schema: reportSchema })
+              );
+            };
+
             for (const top of topVariants) {
               if (!top.isObjectLike || top.isExemptSummary || top.hasId) {
                 continue;
@@ -1037,6 +1149,9 @@ export const ads0001ResourcePrimaryId: RedoclyOas3Rule = () => {
                 const reportLocation = top.matchedTarget.location
                   ? top.matchedTarget.location.key()
                   : schemaLocation.key();
+                if (isIgnoredGetReport(reportLocation)) {
+                  continue;
+                }
                 reportPrimaryIdOnce(
                   ctx,
                   reportLocation,
@@ -1057,6 +1172,9 @@ export const ads0001ResourcePrimaryId: RedoclyOas3Rule = () => {
                     const reportLocation = inner.matchedTarget.location
                       ? inner.matchedTarget.location.key()
                       : fallbackLocation;
+                    if (isIgnoredGetReport(reportLocation)) {
+                      continue;
+                    }
                     reportPrimaryIdOnce(
                       ctx,
                       reportLocation,
