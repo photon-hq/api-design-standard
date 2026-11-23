@@ -2,6 +2,23 @@ export type AdsStatus = "Draft" | "Reviewing" | "Approved" | "Deprecated";
 
 export type AdsRuleSeverity = "error" | "warn" | "off";
 
+export interface AdsIgnoreEntry {
+  readonly path?: string;
+  readonly method?: string;
+  readonly schema?: string;
+  readonly reason?: string;
+}
+
+export interface AdsRuleOptions {
+  readonly ignore?: readonly AdsIgnoreEntry[];
+}
+
+export type AdsRuleConfig =
+  | AdsRuleSeverity
+  | ({
+      readonly severity: AdsRuleSeverity;
+    } & AdsRuleOptions);
+
 export interface AdsRuleMetadata {
   readonly name: string;
   readonly id: string;

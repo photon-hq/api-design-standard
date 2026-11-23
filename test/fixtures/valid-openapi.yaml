@@ -88,6 +88,49 @@ paths:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
+  /v1/projects/{projectId}/api-keys:
+    parameters:
+      - $ref: "#/components/parameters/ProjectId"
+    get:
+      operationId: listApiKeys
+      summary: List project API keys
+      description: Lists API keys belonging to a project.
+      responses:
+        "200":
+          description: Collection of project API keys.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiKeyListResponse"
+        "404":
+          description: Project not found.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+    post:
+      operationId: createApiKey
+      summary: Create a project API key
+      description: Creates a new API key and returns it flat with its one-time secret.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateApiKeyRequest"
+      responses:
+        "201":
+          description: Created API key with one-time secret.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreatedApiKey"
+        "400":
+          description: Invalid request.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
   /v1/projects/{projectId}/api-keys/{apiKeyId}:
     parameters:
       - $ref: "#/components/parameters/ProjectId"
@@ -201,6 +244,31 @@ components:
           type: string
         organizationId:
           type: string
+        name:
+          type: string
+    CreatedApiKey:
+      allOf:
+        - $ref: "#/components/schemas/ApiKey"
+        - type: object
+          required:
+            - secret
+          properties:
+            secret:
+              type: string
+    ApiKeyListResponse:
+      type: object
+      required:
+        - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/ApiKey"
+    CreateApiKeyRequest:
+      type: object
+      required:
+        - name
+      properties:
         name:
           type: string
     CreateProjectRequest:

@@ -269,6 +269,23 @@ describe("ADS-0001 end-to-end Redocly CLI enforcement", () => {
   });
 
   it("passes valid patterns without false positives", async () => {
+    const ads0001Config = join(tempDir, "redocly-ads-0001-only.yaml");
+    await writeFile(
+      ads0001Config,
+      stringifyYaml({
+        plugins: [PLUGIN_DIST],
+        extends: ["recommended"],
+        rules: {
+          "security-defined": "off",
+          "no-server-example.com": "off",
+          "photon-ads/ads-0001-resource-primary-id": "error",
+          "photon-ads/ads-0001-path-param-naming": "error",
+          "photon-ads/ads-0001-path-param-consistency": "error",
+        },
+      }),
+      "utf8",
+    );
+
     const { exitCode, report } = await lintOpenApi(
       baseOpenApi({
         paths: {
@@ -500,6 +517,7 @@ describe("ADS-0001 end-to-end Redocly CLI enforcement", () => {
           },
         },
       }),
+      ads0001Config,
     );
 
     expect(exitCode).toBe(0);

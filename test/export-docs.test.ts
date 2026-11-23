@@ -128,7 +128,7 @@ describe("docs-reference export", () => {
       expect(first.overview.body).not.toMatch(pattern);
     }
 
-    expect(first.standards).toHaveLength(1);
+    expect(first.standards).toHaveLength(2);
     const ads0001 = first.standards[0];
     expect(ads0001).toBeDefined();
     expect(ads0001?.ads).toBe("0001");
@@ -168,6 +168,47 @@ describe("docs-reference export", () => {
     expect(ads0001?.body).toContain("## Changelog");
     expect(ads0001?.body).toContain("Approved and published as `ADS-0001`.");
     expect(ads0001?.body).not.toMatch(/^##\s+(?:Deterministic\s+)?Lint\s+Rules\b/im);
+
+    const ads0002 = first.standards[1];
+    expect(ads0002).toBeDefined();
+    expect(ads0002?.ads).toBe("0002");
+    expect(ads0002?.slug).toBe("ads-0002");
+    expect(ads0002?.folder).toBe("0002-top-level-json-response");
+    expect(ads0002?.title).toBe("ADS-0002: Top-Level JSON Response Structure");
+    expect(ads0002?.sidebarTitle).toBe("ADS-0002 · Top-Level JSON Responses");
+    expect(ads0002?.description).toBe(
+      "Flat top-level JSON objects for Photon public HTTP API responses, prohibiting bare arrays, single-resource wrapper envelopes, and split resource-and-secret creation wrappers.",
+    );
+    expect(ads0002?.status).toBe("Approved");
+    expect(ads0002?.updated).toBe("2026-11-22");
+    expect(ads0002?.rules).toEqual([
+      {
+        id: "photon-ads/ads-0002-top-level-json-object",
+        severity: "error",
+        summary:
+          "Every 2xx JSON response must have a JSON object at the top level rather than a bare array or primitive value.",
+      },
+      {
+        id: "photon-ads/ads-0002-no-single-resource-wrapper",
+        severity: "error",
+        summary:
+          "Single-resource 2xx JSON responses must return resource fields directly at the top level rather than wrapping them in a single-key resource envelope or a generic `data`, `result`, or `payload` envelope.",
+      },
+      {
+        id: "photon-ads/ads-0002-flat-creation-secret",
+        severity: "error",
+        summary:
+          "POST creation responses that return a one-time secret or token must return the resource flat at the top level with the secret as a sibling field rather than wrapping the resource and secret in a two-key envelope.",
+      },
+    ]);
+    expect(ads0002?.body).not.toMatch(/^---/);
+    expect(ads0002?.body).not.toMatch(/^#\s+/);
+    expect(ads0002?.body).toContain("## Normative Rules");
+    expect(ads0002?.body).toContain("## Examples");
+    expect(ads0002?.body).toContain("## Changelog");
+    expect(ads0002?.body).toContain("Approved and published as `ADS-0002`.");
+    expect(ads0002?.body).not.toMatch(/^##\s+(?:Deterministic\s+)?Lint\s+Rules\b/im);
+
     for (const standard of first.standards) {
       expect(standard.status).toBe("Approved");
       for (const pattern of FORBIDDEN_DOCS_PATTERNS) {
@@ -316,20 +357,20 @@ describe("docs-reference export", () => {
     try {
       const draftMeta = await addFixtureStandard(
         fixtureRoot,
-        "0002-draft-example",
-        "0002",
+        "0097-draft-example",
+        "0097",
         "Draft",
       );
       const reviewingMeta = await addFixtureStandard(
         fixtureRoot,
-        "0003-reviewing-example",
-        "0003",
+        "0098-reviewing-example",
+        "0098",
         "Reviewing",
       );
       const deprecatedMeta = await addFixtureStandard(
         fixtureRoot,
-        "0004-deprecated-example",
-        "0004",
+        "0099-deprecated-example",
+        "0099",
         "Deprecated",
       );
 
@@ -338,7 +379,7 @@ describe("docs-reference export", () => {
         plugin: createPhotonAdsPlugin(),
       });
 
-      expect(exported.standards.map((standard) => standard.slug)).toEqual(["ads-0001"]);
+      expect(exported.standards.map((standard) => standard.slug)).toEqual(["ads-0001", "ads-0002"]);
       expect(exported.standards.every((standard) => standard.status === "Approved")).toBe(true);
     } finally {
       await rm(fixtureRoot, { recursive: true, force: true });
@@ -349,9 +390,15 @@ describe("docs-reference export", () => {
     const fixtureRoot = await createTempRepoFixture();
     process.env.GITHUB_SHA = "b".repeat(40);
     try {
-      const indexPath = resolve(fixtureRoot, "ads/0001-resource-identifiers/index.md");
-      const original = await readFile(indexPath, "utf8");
-      await writeFile(indexPath, original.replace('status: "Approved"', 'status: "Draft"'), "utf8");
+      for (const standard of ADS_STANDARDS) {
+        const indexPath = resolve(fixtureRoot, "ads", standard.folder, "index.md");
+        const original = await readFile(indexPath, "utf8");
+        await writeFile(
+          indexPath,
+          original.replace('status: "Approved"', 'status: "Draft"'),
+          "utf8",
+        );
+      }
 
       await expect(buildDocsReference(fixtureRoot)).rejects.toThrow(
         /At least one Approved ADS standard is required/,

@@ -9,6 +9,7 @@ Each standard in **Photon API Design Standards (ADS)** defines a service-agnosti
 | Standard | Title | Status | Rules |
 | --- | --- | --- | --- |
 | [ADS-0001](./ads/0001-resource-identifiers/index.md) | Resource Identifiers and Path Parameter Naming | Approved | `photon-ads/ads-0001-resource-primary-id`, `photon-ads/ads-0001-path-param-naming`, `photon-ads/ads-0001-path-param-consistency` |
+| [ADS-0002](./ads/0002-top-level-json-response/index.md) | Top-Level JSON Response Structure | Approved | `photon-ads/ads-0002-top-level-json-object`, `photon-ads/ads-0002-no-single-resource-wrapper`, `photon-ads/ads-0002-flat-creation-secret` |
 
 ### Status Lifecycle
 
@@ -52,14 +53,36 @@ extends:
   - photon-ads/recommended
 ```
 
-You can also override individual rule severities under `rules:`:
+You can also override individual rule severities or add declarative rule-level `ignore` entries under `rules:`:
 
 ```yaml
 rules:
-  photon-ads/ads-0001-resource-primary-id: error
+  photon-ads/ads-0001-resource-primary-id:
+    severity: error
+    ignore:
+      - schema: LegacyProject
+        reason: Existing v1 schema pending deprecation
+      - path: /v1/legacy/items/{itemId}
+        method: get
+        reason: Existing response shape preserved for backward compatibility
   photon-ads/ads-0001-path-param-naming: error
   photon-ads/ads-0001-path-param-consistency: error
+  photon-ads/ads-0002-top-level-json-object: error
+  photon-ads/ads-0002-no-single-resource-wrapper:
+    severity: error
+    ignore:
+      - path: /v1/legacy/items/{itemId}
+        method: get
+        reason: Legacy wrapper endpoint
+  photon-ads/ads-0002-flat-creation-secret: error
 ```
+
+Each `ignore` entry accepts `path`, `method`, `schema`, and an optional `reason` string:
+
+- `path`: Exact OpenAPI path template (trailing slash trimmed except `/`). Omitting `method` matches all methods (and path-level parameters) on that path.
+- `method`: Case-insensitive HTTP method (`get`, `post`, `patch`, `put`, `delete`, etc.) narrowing a `path` or `schema` match.
+- `schema`: Component schema name under `components.schemas` (used by `photon-ads/ads-0001-resource-primary-id`).
+- `reason`: Optional human-readable explanation for reviewers.
 
 Run Redocly against your OpenAPI 3 specification:
 
@@ -75,6 +98,10 @@ The external developer documentation overview and each standard live under `ads/
 ads/
   overview.md      # External developer documentation overview
   0001-resource-identifiers/
+    index.md       # Authoritative Markdown specification and rule table
+    rules.ts       # Deterministic Redocly OpenAPI 3 rules
+    rules.test.ts  # Unit and end-to-end Redocly CLI tests
+  0002-top-level-json-response/
     index.md       # Authoritative Markdown specification and rule table
     rules.ts       # Deterministic Redocly OpenAPI 3 rules
     rules.test.ts  # Unit and end-to-end Redocly CLI tests

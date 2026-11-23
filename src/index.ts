@@ -8,7 +8,10 @@ export {
 } from "./catalog.js";
 export { createPhotonAdsPlugin, default } from "./plugin.js";
 export type {
+  AdsIgnoreEntry,
+  AdsRuleConfig,
   AdsRuleMetadata,
+  AdsRuleOptions,
   AdsRuleSeverity,
   AdsStandardMetadata,
   AdsStatus,
