@@ -10,6 +10,7 @@ Each standard in **Photon API Design Standards (ADS)** defines a service-agnosti
 | --- | --- | --- | --- |
 | [ADS-0001](./ads/0001-resource-identifiers/index.md) | Resource Identifiers and Path Parameter Naming | Approved | `photon-ads/ads-0001-resource-primary-id`, `photon-ads/ads-0001-path-param-naming`, `photon-ads/ads-0001-path-param-consistency` |
 | [ADS-0002](./ads/0002-top-level-json-response/index.md) | Top-Level JSON Response Structure | Approved | `photon-ads/ads-0002-top-level-json-object`, `photon-ads/ads-0002-no-single-resource-wrapper`, `photon-ads/ads-0002-flat-creation-secret` |
+| [ADS-0003](./ads/0003-idempotency-key/index.md) | Idempotency-Key Usage by HTTP Method | Draft | `photon-ads/ads-0003-idempotency-key-method`, `photon-ads/ads-0003-idempotency-key-optional` |
 
 ### Status Lifecycle
 
@@ -102,6 +103,10 @@ ads/
     rules.ts       # Deterministic Redocly OpenAPI 3 rules
     rules.test.ts  # Unit and end-to-end Redocly CLI tests
   0002-top-level-json-response/
+    index.md       # Authoritative Markdown specification and rule table
+    rules.ts       # Deterministic Redocly OpenAPI 3 rules
+    rules.test.ts  # Unit and end-to-end Redocly CLI tests
+  0003-idempotency-key/
     index.md       # Authoritative Markdown specification and rule table
     rules.ts       # Deterministic Redocly OpenAPI 3 rules
     rules.test.ts  # Unit and end-to-end Redocly CLI tests
