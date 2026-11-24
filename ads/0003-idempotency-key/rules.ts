@@ -50,23 +50,32 @@ export function isIdempotencyKeyHeader(parameter: unknown): parameter is Unknown
   );
 }
 
-function findIdempotencyKey(
+interface ResolvedParameter {
+  readonly parameter: UnknownRecord;
+  readonly location: RedoclyLocation;
+}
+
+function resolveParameters(
   rawParams: unknown,
   baseLocation: RedoclyLocation,
   ctx: RedoclyUserContext,
-): { parameter: UnknownRecord; location: RedoclyLocation } | undefined {
+): ResolvedParameter[] {
   if (!Array.isArray(rawParams)) {
-    return undefined;
+    return [];
   }
+  const resolvedParams: ResolvedParameter[] = [];
   for (const [index, rawParam] of rawParams.entries()) {
     const location = baseLocation.child(["parameters", index]);
     const resolved = resolveRecordWithLocation(ctx.resolve, rawParam, location);
-    if (resolved && isIdempotencyKeyHeader(resolved.node)) {
-      return { parameter: resolved.node, location };
+    if (resolved) {
+      resolvedParams.push({ parameter: resolved.node, location });
     }
   }
-  return undefined;
+  return resolvedParams;
 }
+
+const parameterIdentity = ({ parameter }: ResolvedParameter): string =>
+  `${String(parameter.in)}:${String(parameter.name)}`;
 
 export function collectIdempotencyKeyUsages(
   paths: unknown,
@@ -85,18 +94,27 @@ export function collectIdempotencyKeyUsages(
     if (!pathItem) {
       continue;
     }
-    const pathLevel = findIdempotencyKey(pathItem.node.parameters, pathItem.location, ctx);
+    const pathLevel = resolveParameters(pathItem.node.parameters, pathItem.location, ctx);
     for (const method of HTTP_METHODS) {
       const operation = pathItem.node[method];
       if (!isRecord(operation)) {
         continue;
       }
-      // An operation-level parameter overrides a path-level one with the same name and location.
-      const usage =
-        findIdempotencyKey(operation.parameters, pathItem.location.child([method]), ctx) ??
-        pathLevel;
-      if (usage) {
-        usages.push({ pathTemplate, method, ...usage });
+      const operationLevel = resolveParameters(
+        operation.parameters,
+        pathItem.location.child([method]),
+        ctx,
+      );
+      // OpenAPI identifies a parameter by its exact name and location; an operation-level one overrides a path-level one.
+      const overridden = new Set(operationLevel.map(parameterIdentity));
+      const effective = [
+        ...operationLevel,
+        ...pathLevel.filter((param) => !overridden.has(parameterIdentity(param))),
+      ];
+      for (const param of effective) {
+        if (isIdempotencyKeyHeader(param.parameter)) {
+          usages.push({ pathTemplate, method, ...param });
+        }
       }
     }
   }

@@ -129,7 +129,7 @@ describe("ADS-0003 end-to-end Redocly CLI enforcement", () => {
         },
         "/v1/drafts": {
           parameters: [keyParam("Idempotency-Key", true)],
-          post: op("createDraft", [keyParam("idempotency-key", false)]),
+          post: op("createDraft", [keyParam("Idempotency-Key", false)]),
         },
       }),
     ).toEqual([]);
@@ -177,6 +177,10 @@ describe("ADS-0003 end-to-end Redocly CLI enforcement", () => {
       },
       {
         rule: "ads-0003-idempotency-key-method",
+        pointer: "#/paths/~1v1~1items~1{itemId}/parameters/1",
+      },
+      {
+        rule: "ads-0003-idempotency-key-method",
         pointer: "#/paths/~1v1~1items~1{itemId}/put/parameters/0",
       },
     ]);
@@ -198,13 +202,33 @@ describe("ADS-0003 end-to-end Redocly CLI enforcement", () => {
             post: op("cancelOrder", [{ $ref: "#/components/parameters/IdempotencyKey" }]),
             trace: op("traceOrder"),
           },
+          "/v1/carts": {
+            parameters: [keyParam("Idempotency-Key", true)],
+            post: op("createCart", [
+              keyParam("Idempotency-Key", false),
+              keyParam("idempotency-key", true),
+            ]),
+            patch: op("updateCarts", [keyParam("idempotency-key", false)]),
+          },
         },
         { parameters: { IdempotencyKey: keyParam("IDEMPOTENCY-KEY", true) } },
       ),
     ).toEqual([
       {
         rule: "ads-0003-idempotency-key-optional",
+        pointer: "#/paths/~1v1~1carts/parameters/0",
+      },
+      {
+        rule: "ads-0003-idempotency-key-optional",
+        pointer: "#/paths/~1v1~1carts/post/parameters/1",
+      },
+      {
+        rule: "ads-0003-idempotency-key-optional",
         pointer: "#/paths/~1v1~1orders/post/parameters/0",
+      },
+      {
+        rule: "ads-0003-idempotency-key-optional",
+        pointer: "#/paths/~1v1~1orders~1{orderId}/parameters/1",
       },
       {
         rule: "ads-0003-idempotency-key-optional",

@@ -116,7 +116,7 @@ paths:
 
 ## Lint Rules
 
-The `@photon-hq/api-design-standards` Redocly plugin (`photon-ads`) enforces ADS-0003 with the following deterministic OpenAPI 3 rules. Both rules match the header name without regard to case, check operation-level and path-level parameters (an operation-level parameter overrides a path-level one), and follow `$ref` parameters and path items. They do not accept `ignore` entries: an operation that violates this standard fails lint until it is fixed.
+The `@photon-hq/api-design-standards` Redocly plugin (`photon-ads`) enforces ADS-0003 with the following deterministic OpenAPI 3 rules. Both rules match the header name without regard to case, check every operation-level and path-level declaration (an operation-level parameter overrides a path-level one only when its name matches exactly, as OpenAPI defines), and follow `$ref` parameters and path items. They do not accept `ignore` entries: an operation that violates this standard fails lint until it is fixed.
 
 | Rule ID | Default Severity | What it enforces |
 | --- | --- | --- |
