@@ -16,7 +16,7 @@ describe("photon-ads Redocly plugin exports", () => {
   it("exports plugin metadata, catalog helpers, ignore types, and Redocly plugin factory", () => {
     expect(PLUGIN_ID).toBe("photon-ads");
     expect(ADS_STANDARDS).toHaveLength(4);
-    expect(ADS_RULES).toHaveLength(12);
+    expect(ADS_RULES).toHaveLength(17);
 
     expect(getStandardByNumber("0001")?.folder).toBe("0001-resource-identifiers");
     expect(getStandardByNumber("0002")?.folder).toBe("0002-top-level-json-response");
@@ -44,6 +44,11 @@ describe("photon-ads Redocly plugin exports", () => {
       "photon-ads/ads-0002-flat-creation-secret": "error",
       "photon-ads/ads-0003-idempotency-key-method": "error",
       "photon-ads/ads-0003-idempotency-key-optional": "error",
+      "photon-ads/ads-0003-idempotency-key-name": "error",
+      "photon-ads/ads-0003-idempotency-key-schema": "error",
+      "photon-ads/ads-0003-idempotency-no-required-problem": "error",
+      "photon-ads/ads-0003-idempotent-replayed-header": "error",
+      "photon-ads/ads-0003-idempotency-problems": "error",
       "photon-ads/ads-0004-operation-resource-shape": "error",
       "photon-ads/ads-0004-operation-status-invariants": "error",
       "photon-ads/ads-0004-accepted-operation-headers": "error",
@@ -76,7 +81,12 @@ describe("photon-ads Redocly plugin exports", () => {
       "ads-0002-no-single-resource-wrapper",
       "ads-0002-top-level-json-object",
       "ads-0003-idempotency-key-method",
+      "ads-0003-idempotency-key-name",
       "ads-0003-idempotency-key-optional",
+      "ads-0003-idempotency-key-schema",
+      "ads-0003-idempotency-no-required-problem",
+      "ads-0003-idempotency-problems",
+      "ads-0003-idempotent-replayed-header",
       "ads-0004-accepted-operation-headers",
       "ads-0004-operation-cancel-method",
       "ads-0004-operation-resource-shape",
