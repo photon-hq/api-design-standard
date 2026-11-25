@@ -98,7 +98,7 @@ paths:
             type: string
             minLength: 1
             maxLength: 255
-            pattern: "^[\x21-\x7e]{1,255}$"
+            pattern: '^[\x21-\x7e]{1,255}$'
       responses:
         "201":
           description: Message sent.
