@@ -128,7 +128,7 @@ describe("docs-reference export", () => {
       expect(first.overview.body).not.toMatch(pattern);
     }
 
-    expect(first.standards).toHaveLength(2);
+    expect(first.standards).toHaveLength(3);
     const ads0001 = first.standards[0];
     expect(ads0001).toBeDefined();
     expect(ads0001?.ads).toBe("0001");
@@ -208,6 +208,52 @@ describe("docs-reference export", () => {
     expect(ads0002?.body).toContain("## Changelog");
     expect(ads0002?.body).toContain("Approved and published as `ADS-0002`.");
     expect(ads0002?.body).not.toMatch(/^##\s+(?:Deterministic\s+)?Lint\s+Rules\b/im);
+
+    const ads0004 = first.standards[2];
+    expect(ads0004).toBeDefined();
+    expect(ads0004?.ads).toBe("0004");
+    expect(ads0004?.slug).toBe("ads-0004");
+    expect(ads0004?.folder).toBe("0004-long-running-operations");
+    expect(ads0004?.title).toBe("ADS-0004: Long-Running Operations");
+    expect(ads0004?.sidebarTitle).toBe("ADS-0004 · Long-Running Operations");
+    expect(ads0004?.description).toBe(
+      "Canonical flat Operation schema, status lifecycle invariants, structured nextAction contract, and HTTP polling and cancellation conventions for asynchronous Photon public HTTP APIs.",
+    );
+    expect(ads0004?.status).toBe("Approved");
+    expect(ads0004?.updated).toBe("2026-11-25");
+    expect(ads0004?.rules).toEqual([
+      {
+        id: "photon-ads/ads-0004-operation-resource-shape",
+        severity: "error",
+        summary:
+          "Operation responses must be flat JSON objects using the canonical ADS-0004 field names (`id`, `type`, `status`, `createdAt`, `updatedAt`, `completedAt`, `response`, `error`), canonical status values, date-time formats, and RFC 9457 error objects.",
+      },
+      {
+        id: "photon-ads/ads-0004-operation-status-invariants",
+        severity: "error",
+        summary:
+          "Operation status branches must preserve ADS-0004 nullability and nextAction invariants across non-terminal, requires_action, succeeded, failed, and cancelled states without exposing sensitive credentials.",
+      },
+      {
+        id: "photon-ads/ads-0004-accepted-operation-headers",
+        severity: "error",
+        summary:
+          "Every 202 Accepted response returning an Operation resource must declare a Location response header pointing to the poll URL.",
+      },
+      {
+        id: "photon-ads/ads-0004-operation-cancel-method",
+        severity: "error",
+        summary:
+          "Operation cancellation must use POST .../operations/{operationId}/cancel returning a 200 JSON response and must not use DELETE on operation routes.",
+      },
+    ]);
+    expect(ads0004?.body).not.toMatch(/^---/);
+    expect(ads0004?.body).not.toMatch(/^#\s+/);
+    expect(ads0004?.body).toContain("## Normative Rules");
+    expect(ads0004?.body).toContain("## Examples");
+    expect(ads0004?.body).toContain("## Changelog");
+    expect(ads0004?.body).toContain("Approved and published as `ADS-0004`.");
+    expect(ads0004?.body).not.toMatch(/^##\s+(?:Deterministic\s+)?Lint\s+Rules\b/im);
 
     for (const standard of first.standards) {
       expect(standard.status).toBe("Approved");
@@ -379,7 +425,11 @@ describe("docs-reference export", () => {
         plugin: createPhotonAdsPlugin(),
       });
 
-      expect(exported.standards.map((standard) => standard.slug)).toEqual(["ads-0001", "ads-0002"]);
+      expect(exported.standards.map((standard) => standard.slug)).toEqual([
+        "ads-0001",
+        "ads-0002",
+        "ads-0004",
+      ]);
       expect(exported.standards.every((standard) => standard.status === "Approved")).toBe(true);
     } finally {
       await rm(fixtureRoot, { recursive: true, force: true });
