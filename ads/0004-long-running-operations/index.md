@@ -3,13 +3,13 @@ title: "ADS-0004: Long-Running Operations"
 sidebarTitle: "ADS-0004 · Long-Running Operations"
 description: "Canonical flat Operation schema, status lifecycle invariants, structured nextAction contract, and HTTP polling and cancellation conventions for asynchronous Photon public HTTP APIs."
 ads: "0004"
-status: "Draft"
+status: "Approved"
 updated: "2026-11-25"
 ---
 
 # ADS-0004: Long-Running Operations
 
-- **Status**: Draft
+- **Status**: Approved
 - **Updated**: 2026-11-25
 
 Consistent asynchronous contracts let callers, generated SDKs, dashboards, CLIs, and AI agents start, poll, resume, and cancel long-running workflows with one shared state machine instead of per-endpoint conventions. This standard is part of Photon API Design Standards and uses the keywords **MUST**, **MUST NOT**, **SHOULD**, and **MAY** as described in RFC 2119.
@@ -338,4 +338,4 @@ Lifecycle-bearing resource `202` endpoints and fire-and-forget `202` endpoints t
 
 ## Changelog
 
-- **2026-11-25**: Initial draft as `ADS-0004`.
+- **2026-11-25**: Approved and published as `ADS-0004`.
