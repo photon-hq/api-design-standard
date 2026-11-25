@@ -386,6 +386,36 @@ describe("docs-reference export", () => {
     }
   });
 
+  it("omits Draft ADS-0004 from live docs export and exports it cleanly without forbidden patterns when Approved", async () => {
+    const live = await buildDocsReference(REPO_ROOT);
+    expect(live.standards.map((standard) => standard.slug)).toEqual(["ads-0001", "ads-0002"]);
+
+    const fixtureRoot = await createTempRepoFixture();
+    process.env.GITHUB_SHA = "d".repeat(40);
+    try {
+      const indexPath = resolve(fixtureRoot, "ads/0004-long-running-operations/index.md");
+      const original = await readFile(indexPath, "utf8");
+      await writeFile(indexPath, original.replace('status: "Draft"', 'status: "Approved"'), "utf8");
+
+      const exported = await buildDocsReference(fixtureRoot);
+      expect(exported.standards.map((standard) => standard.slug)).toEqual([
+        "ads-0001",
+        "ads-0002",
+        "ads-0004",
+      ]);
+      const ads0004 = exported.standards.find((standard) => standard.slug === "ads-0004");
+      expect(ads0004).toBeDefined();
+      expect(ads0004?.rules).toHaveLength(4);
+      expect(ads0004?.body).not.toMatch(/^##\s+(?:Deterministic\s+)?Lint\s+Rules\b/im);
+      for (const pattern of FORBIDDEN_DOCS_PATTERNS) {
+        expect(ads0004?.description).not.toMatch(pattern);
+        expect(ads0004?.body).not.toMatch(pattern);
+      }
+    } finally {
+      await rm(fixtureRoot, { recursive: true, force: true });
+    }
+  });
+
   it("rejects export when no Approved standard exists", async () => {
     const fixtureRoot = await createTempRepoFixture();
     process.env.GITHUB_SHA = "b".repeat(40);

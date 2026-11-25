@@ -157,6 +157,104 @@ paths:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
+  /v1/projects/{projectId}/plan-changes:
+    parameters:
+      - $ref: "#/components/parameters/ProjectId"
+    post:
+      operationId: startPlanChange
+      summary: Start a project plan change
+      description: Initiates an asynchronous plan change and returns a trackable Operation.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StartPlanChangeRequest"
+      responses:
+        "202":
+          description: Plan change accepted for asynchronous processing.
+          headers:
+            Location:
+              description: Canonical poll URL for the operation.
+              schema:
+                type: string
+                format: uri
+            Retry-After:
+              description: Advisory polling delay in seconds.
+              schema:
+                type: integer
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PlanChangeOperation"
+        "400":
+          description: Invalid request.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+  /v1/projects/{projectId}/operations:
+    parameters:
+      - $ref: "#/components/parameters/ProjectId"
+    get:
+      operationId: listProjectOperations
+      summary: List project operations
+      description: Lists asynchronous operations belonging to a project.
+      responses:
+        "200":
+          description: Collection of project operations.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OperationListResponse"
+        "404":
+          description: Project not found.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+  /v1/projects/{projectId}/operations/{operationId}:
+    parameters:
+      - $ref: "#/components/parameters/ProjectId"
+      - $ref: "#/components/parameters/OperationId"
+    get:
+      operationId: getProjectOperation
+      summary: Get a project operation
+      description: Retrieves the current status and outcome of a long-running operation.
+      responses:
+        "200":
+          description: Operation details.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PlanChangeOperation"
+        "404":
+          description: Operation not found.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+  /v1/projects/{projectId}/operations/{operationId}/cancel:
+    parameters:
+      - $ref: "#/components/parameters/ProjectId"
+      - $ref: "#/components/parameters/OperationId"
+    post:
+      operationId: cancelProjectOperation
+      summary: Cancel a project operation
+      description: Requests cancellation of an in-flight operation.
+      responses:
+        "200":
+          description: Updated operation resource.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PlanChangeOperation"
+        "409":
+          description: Operation is not cancellable.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
   /v1/events/{eventType}:
     parameters:
       - name: eventType
@@ -204,6 +302,13 @@ components:
       in: path
       required: true
       description: Unique identifier of the project.
+      schema:
+        type: string
+    OperationId:
+      name: operationId
+      in: path
+      required: true
+      description: Unique identifier of the operation.
       schema:
         type: string
   schemas:
@@ -297,6 +402,7 @@ components:
         - type
         - title
         - status
+        - code
       properties:
         type:
           type: string
@@ -305,5 +411,195 @@ components:
           type: string
         status:
           type: integer
+        code:
+          type: string
         detail:
           type: string
+    StartPlanChangeRequest:
+      type: object
+      required:
+        - plan
+      properties:
+        plan:
+          type: string
+    PlanChangeOutcome:
+      type: object
+      required:
+        - id
+        - projectId
+        - plan
+      properties:
+        id:
+          type: string
+        projectId:
+          type: string
+        plan:
+          type: string
+    RedirectNextAction:
+      type: object
+      required:
+        - type
+        - url
+      properties:
+        type:
+          type: string
+          const: redirect
+        url:
+          type: string
+          format: uri
+        expiresAt:
+          type:
+            - string
+            - "null"
+          format: date-time
+    ConfirmPaymentNextAction:
+      type: object
+      required:
+        - type
+        - invoiceId
+      properties:
+        type:
+          type: string
+          const: confirm_payment
+        invoiceId:
+          type: string
+        expiresAt:
+          type:
+            - string
+            - "null"
+          format: date-time
+    PlanChangeOperationBase:
+      type: object
+      required:
+        - id
+        - type
+        - status
+        - createdAt
+        - updatedAt
+        - completedAt
+        - response
+        - error
+        - cancellable
+      properties:
+        id:
+          type: string
+        type:
+          type: string
+          const: plan.change
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+        cancellable:
+          type: boolean
+    ActivePlanChangeOperation:
+      allOf:
+        - $ref: "#/components/schemas/PlanChangeOperationBase"
+        - type: object
+          properties:
+            status:
+              type: string
+              enum:
+                - pending
+                - running
+            completedAt:
+              type: "null"
+            response:
+              type: "null"
+            error:
+              type: "null"
+            nextAction:
+              type: "null"
+    RequiresActionPlanChangeOperation:
+      allOf:
+        - $ref: "#/components/schemas/PlanChangeOperationBase"
+        - type: object
+          required:
+            - nextAction
+          properties:
+            status:
+              type: string
+              const: requires_action
+            completedAt:
+              type: "null"
+            response:
+              type: "null"
+            error:
+              type: "null"
+            nextAction:
+              oneOf:
+                - $ref: "#/components/schemas/RedirectNextAction"
+                - $ref: "#/components/schemas/ConfirmPaymentNextAction"
+    SucceededPlanChangeOperation:
+      allOf:
+        - $ref: "#/components/schemas/PlanChangeOperationBase"
+        - type: object
+          properties:
+            status:
+              type: string
+              const: succeeded
+            completedAt:
+              type: string
+              format: date-time
+            response:
+              $ref: "#/components/schemas/PlanChangeOutcome"
+            error:
+              type: "null"
+            nextAction:
+              type: "null"
+    FailedPlanChangeOperation:
+      allOf:
+        - $ref: "#/components/schemas/PlanChangeOperationBase"
+        - type: object
+          properties:
+            status:
+              type: string
+              const: failed
+            completedAt:
+              type: string
+              format: date-time
+            response:
+              type: "null"
+            error:
+              $ref: "#/components/schemas/ProblemDetails"
+            nextAction:
+              type: "null"
+    CancelledPlanChangeOperation:
+      allOf:
+        - $ref: "#/components/schemas/PlanChangeOperationBase"
+        - type: object
+          properties:
+            status:
+              type: string
+              const: cancelled
+            completedAt:
+              type: string
+              format: date-time
+            response:
+              type: "null"
+            error:
+              type: "null"
+            nextAction:
+              type: "null"
+    PlanChangeOperation:
+      oneOf:
+        - $ref: "#/components/schemas/ActivePlanChangeOperation"
+        - $ref: "#/components/schemas/RequiresActionPlanChangeOperation"
+        - $ref: "#/components/schemas/SucceededPlanChangeOperation"
+        - $ref: "#/components/schemas/FailedPlanChangeOperation"
+        - $ref: "#/components/schemas/CancelledPlanChangeOperation"
+    OperationListResponse:
+      type: object
+      required:
+        - operations
+      properties:
+        operations:
+          type: array
+          items:
+            $ref: "#/components/schemas/PlanChangeOperation"
+        nextPageToken:
+          type:
+            - string
+            - "null"
