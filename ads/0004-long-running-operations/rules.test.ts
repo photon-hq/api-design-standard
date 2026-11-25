@@ -2606,4 +2606,316 @@ describe("ADS-0004 Redocly end-to-end rules", () => {
     const messages = ads0004Problems(report).map((p) => p.message);
     expect(messages.some((m) => m.includes("256-variant union analysis cap"))).toBe(true);
   });
+
+  it("handles OAS 3.0 allOf null narrowing, mixed-type enum intersections, disjoint numeric const oneOf branches, non-first redirect missing url, overflow 202 Operation discovery, and overflow error variants", async () => {
+    const pathParam = (name: string) => ({
+      name,
+      in: "path",
+      required: true,
+      schema: { type: "string" },
+    });
+
+    // 1. Valid cases: OAS 3.0 nullable:true narrowed by allOf:[{type:object}],
+    //    disjoint numeric const oneOf branches, and >256 non-Operation 202 branches.
+    const nonOpBranches = Array.from({ length: 260 }, (_, index) => ({
+      type: "object",
+      required: ["id", "tag"],
+      properties: {
+        id: { type: "string" },
+        tag: { type: "string", const: `item_${index}` },
+      },
+    }));
+    const validOas30AndDisjointDoc = baseOpenApi({
+      openapi: "3.0.3",
+      paths: {
+        "/v1/projects/{projectId}/oas30-narrowed/operations/{operationId}": {
+          parameters: [pathParam("projectId"), pathParam("operationId")],
+          get: {
+            operationId: "getOas30AllOfObjectOnlyOp",
+            summary: "OAS 3.0 nullable:true narrowed to object by allOf",
+            responses: {
+              "200": {
+                description: "Object-only via allOf narrowing",
+                content: {
+                  "application/json": {
+                    schema: {
+                      type: "object",
+                      nullable: true,
+                      allOf: [
+                        {
+                          type: "object",
+                          required: [
+                            "id",
+                            "type",
+                            "status",
+                            "createdAt",
+                            "updatedAt",
+                            "completedAt",
+                            "response",
+                            "error",
+                          ],
+                          properties: {
+                            id: { type: "string" },
+                            type: { type: "string", enum: ["plan.change"] },
+                            status: { type: "string", enum: ["pending"] },
+                            createdAt: { type: "string", format: "date-time" },
+                            updatedAt: { type: "string", format: "date-time" },
+                            completedAt: { type: "string", nullable: true, enum: [null] },
+                            response: { type: "object", nullable: true, enum: [null] },
+                            error: { type: "object", nullable: true, enum: [null] },
+                          },
+                        },
+                      ],
+                    },
+                  },
+                },
+              },
+              "404": { description: "Not found" },
+            },
+          },
+        },
+      },
+    });
+    const oas30Res = await lintOpenApi(validOas30AndDisjointDoc);
+    expect(ads0004Problems(oas30Res.report)).toEqual([]);
+
+    const validDisjointAndNonOpDoc = baseOpenApi({
+      paths: {
+        "/v1/projects/{projectId}/phase-ops/operations/{operationId}": {
+          parameters: [pathParam("projectId"), pathParam("operationId")],
+          get: {
+            operationId: "getDisjointPhaseOneOfOp",
+            summary: "Pending oneOf branches disjoint on integer const phase",
+            responses: {
+              "200": {
+                description: "Disjoint numeric const branches",
+                content: {
+                  "application/json": {
+                    schema: {
+                      oneOf: [
+                        canonicalOperationBranch("pending", {
+                          completedAt: { type: "null" },
+                          response: { type: "null" },
+                          error: { type: "null" },
+                          extraRequired: ["phase"],
+                          extraProperties: {
+                            phase: { type: "integer", const: 1 },
+                          },
+                        }),
+                        canonicalOperationBranch("pending", {
+                          completedAt: { type: "null" },
+                          response: { type: "null" },
+                          error: { type: "null" },
+                          extraRequired: ["phase"],
+                          extraProperties: {
+                            phase: { type: "integer", const: 2 },
+                          },
+                        }),
+                      ],
+                    },
+                  },
+                },
+              },
+              "404": { description: "Not found" },
+            },
+          },
+        },
+        "/v1/projects/{projectId}/non-op-union": {
+          parameters: [pathParam("projectId")],
+          post: {
+            operationId: "startLargeNonOpUnion",
+            summary: "Large 202 union with zero Operation fingerprints",
+            responses: {
+              "202": {
+                description: "Non-operation union ignored even past variant cap",
+                content: {
+                  "application/json": {
+                    schema: { oneOf: nonOpBranches },
+                  },
+                },
+              },
+              "400": { description: "Bad request" },
+            },
+          },
+        },
+      },
+    });
+    const validDisjointRes = await lintOpenApi(validDisjointAndNonOpDoc);
+    expect(ads0004Problems(validDisjointRes.report)).toEqual([]);
+
+    // 2. Invalid cases: mixed-type enum intersection keeping 1 on pending response,
+    //    non-first redirect variant missing url, 202 Operation past 256 non-op branches,
+    //    and >256 distinct error variants.
+    const manyErrorBranches = Array.from({ length: 260 }, (_, index) => ({
+      type: "object",
+      required: ["type", "title", "status", "code"],
+      properties: {
+        type: { type: "string", format: "uri" },
+        title: { type: "string" },
+        status: { type: "integer", const: 400 + (index % 100) },
+        code: { type: "string", const: `err_${index}` },
+      },
+    }));
+    const badEdgeDoc = baseOpenApi({
+      paths: {
+        "/v1/projects/{projectId}/mixed-enum/operations/{operationId}": {
+          parameters: [pathParam("projectId"), pathParam("operationId")],
+          get: {
+            operationId: "getMixedEnumPendingOp",
+            responses: {
+              "200": {
+                description: "Pending response whose allOf enums share integer 1",
+                content: {
+                  "application/json": {
+                    schema: {
+                      allOf: [
+                        canonicalOperationBranch("pending", {
+                          completedAt: { type: "null" },
+                          response: { enum: ["a", 1] },
+                          error: { type: "null" },
+                        }),
+                        {
+                          type: "object",
+                          properties: {
+                            response: { enum: ["b", 1] },
+                          },
+                        },
+                      ],
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+        "/v1/projects/{projectId}/non-first-redirect/operations/{operationId}": {
+          parameters: [pathParam("projectId"), pathParam("operationId")],
+          get: {
+            operationId: "getNonFirstMissingUrlRedirectOp",
+            responses: {
+              "200": {
+                description: "Non-first redirect nextAction variant missing url",
+                content: {
+                  "application/json": {
+                    schema: canonicalOperationBranch("requires_action", {
+                      completedAt: { type: "null" },
+                      response: { type: "null" },
+                      error: { type: "null" },
+                      extraRequired: ["nextAction"],
+                      nextAction: {
+                        oneOf: [
+                          {
+                            type: "object",
+                            required: ["type", "details"],
+                            properties: {
+                              type: { type: "string", const: "verify_dns" },
+                              details: {
+                                type: "object",
+                                required: ["record"],
+                                properties: { record: { type: "string" } },
+                              },
+                            },
+                          },
+                          {
+                            type: "object",
+                            required: ["type", "details"],
+                            properties: {
+                              type: { type: "string", const: "redirect" },
+                              details: {
+                                type: "object",
+                                required: ["target"],
+                                properties: { target: { type: "string" } },
+                              },
+                            },
+                          },
+                        ],
+                      },
+                    }),
+                  },
+                },
+              },
+            },
+          },
+        },
+        "/v1/projects/{projectId}/late-op-202": {
+          parameters: [pathParam("projectId")],
+          post: {
+            operationId: "startLateOverflowOperation",
+            responses: {
+              "202": {
+                description: "256 non-op branches followed by Operation branch without Location",
+                content: {
+                  "application/json": {
+                    schema: {
+                      oneOf: [
+                        ...nonOpBranches.slice(0, 256),
+                        canonicalOperationBranch("pending", {
+                          completedAt: { type: "null" },
+                          response: { type: "null" },
+                          error: { type: "null" },
+                        }),
+                      ],
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+        "/v1/projects/{projectId}/huge-errors/operations/{operationId}": {
+          parameters: [pathParam("projectId"), pathParam("operationId")],
+          get: {
+            operationId: "getHugeErrorUnionOp",
+            responses: {
+              "200": {
+                description: "Failed operation with >256 distinct error variants",
+                content: {
+                  "application/json": {
+                    schema: canonicalOperationBranch("failed", {
+                      completedAt: { type: "string", format: "date-time" },
+                      response: { type: "null" },
+                      error: { oneOf: manyErrorBranches },
+                    }),
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    });
+
+    const badRes = await lintOpenApi(badEdgeDoc);
+    const badProblems = ads0004Problems(badRes.report);
+    const msgsByRule = (ruleId: string) =>
+      badProblems.filter((p) => p.ruleId === ruleId).map((p) => p.message);
+
+    expect(
+      msgsByRule("photon-ads/ads-0004-operation-status-invariants").some(
+        (m) => m.includes("mixed-enum") && m.includes('must constrain "response" to null'),
+      ),
+    ).toBe(true);
+    expect(
+      msgsByRule("photon-ads/ads-0004-operation-status-invariants").some(
+        (m) =>
+          m.includes("non-first-redirect") &&
+          m.includes('must declare required "url" string with "format: uri"'),
+      ),
+    ).toBe(true);
+    expect(
+      msgsByRule("photon-ads/ads-0004-accepted-operation-headers").some(
+        (m) => m.includes("late-op-202") && m.includes('declare a "Location" header'),
+      ),
+    ).toBe(true);
+    expect(
+      msgsByRule("photon-ads/ads-0004-operation-resource-shape").some(
+        (m) => m.includes("late-op-202") && m.includes("256-variant union analysis cap"),
+      ),
+    ).toBe(true);
+    expect(
+      msgsByRule("photon-ads/ads-0004-operation-resource-shape").some(
+        (m) => m.includes("huge-errors") && m.includes('Operation "error" schema exceeds'),
+      ),
+    ).toBe(true);
+  });
 });

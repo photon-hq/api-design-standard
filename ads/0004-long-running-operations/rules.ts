@@ -307,6 +307,9 @@ function finalizeTypeConstraint(node: UnknownRecord, value: TypeConstraint): Typ
   if (node.nullable !== true) {
     return value;
   }
+  if (node.type !== undefined) {
+    return value;
+  }
   if (node.const !== undefined && node.const !== null) {
     return value;
   }
@@ -499,6 +502,192 @@ function extractSchemaStringLiterals(
   });
 }
 
+type ExactLiteralLattice =
+  | { readonly kind: "unconstrained" }
+  | { readonly kind: "values"; readonly values: ReadonlySet<string> };
+
+const UNCONSTRAINED_EXACT_LITERALS: ExactLiteralLattice = { kind: "unconstrained" };
+const EMPTY_EXACT_LITERALS: ExactLiteralLattice = { kind: "values", values: new Set() };
+
+function canonicalPrimitiveKey(value: unknown): string | null {
+  if (value === null) {
+    return "null";
+  }
+  switch (typeof value) {
+    case "string":
+      return `s:${value}`;
+    case "boolean":
+      return value ? "b:true" : "b:false";
+    case "number":
+      return Number.isFinite(value) ? `n:${Object.is(value, -0) ? 0 : value}` : null;
+    default:
+      return null;
+  }
+}
+
+function jsonTypeOfCanonicalPrimitiveKey(key: string): JsonSchemaType {
+  if (key === "null") {
+    return "null";
+  }
+  if (key.startsWith("s:")) {
+    return "string";
+  }
+  if (key.startsWith("b:")) {
+    return "boolean";
+  }
+  const num = Number(key.slice(2));
+  return Number.isInteger(num) ? "integer" : "number";
+}
+
+function canonicalKeyMatchesAllowedTypes(
+  key: string,
+  allowed: ReadonlySet<JsonSchemaType>,
+): boolean {
+  const keyType = jsonTypeOfCanonicalPrimitiveKey(key);
+  if (allowed.has(keyType)) {
+    return true;
+  }
+  return keyType === "integer" && allowed.has("number");
+}
+
+function combineExactLiteralsAllOf(
+  a: ExactLiteralLattice,
+  b: ExactLiteralLattice,
+): ExactLiteralLattice {
+  if (a.kind === "unconstrained") {
+    return b;
+  }
+  if (b.kind === "unconstrained") {
+    return a;
+  }
+  const intersection = new Set<string>();
+  for (const val of a.values) {
+    if (b.values.has(val)) {
+      intersection.add(val);
+    }
+  }
+  return { kind: "values", values: intersection };
+}
+
+function combineExactLiteralsUnion(values: readonly ExactLiteralLattice[]): ExactLiteralLattice {
+  if (values.length === 0) {
+    return UNCONSTRAINED_EXACT_LITERALS;
+  }
+  const union = new Set<string>();
+  for (const item of values) {
+    if (item.kind === "unconstrained") {
+      return UNCONSTRAINED_EXACT_LITERALS;
+    }
+    for (const val of item.values) {
+      union.add(val);
+    }
+  }
+  return { kind: "values", values: union };
+}
+
+function localExactLiterals(node: UnknownRecord): ExactLiteralLattice {
+  let result: ExactLiteralLattice = UNCONSTRAINED_EXACT_LITERALS;
+  if (node.const !== undefined) {
+    const key = canonicalPrimitiveKey(node.const);
+    if (key !== null) {
+      result = combineExactLiteralsAllOf(result, { kind: "values", values: new Set([key]) });
+    }
+  }
+  if (Array.isArray(node.enum) && node.enum.length > 0) {
+    const keys = new Set<string>();
+    let allPrimitive = true;
+    for (const item of node.enum) {
+      const key = canonicalPrimitiveKey(item);
+      if (key === null) {
+        allPrimitive = false;
+        break;
+      }
+      keys.add(key);
+    }
+    if (allPrimitive) {
+      result = combineExactLiteralsAllOf(result, { kind: "values", values: keys });
+    }
+  }
+  return result;
+}
+
+function extractSchemaExactLiterals(
+  schema: unknown,
+  resolve: ResolverFn,
+  from?: string,
+): ExactLiteralLattice {
+  return walkSchemaLattice<ExactLiteralLattice>(schema, resolve, from, {
+    falseValue: EMPTY_EXACT_LITERALS,
+    unknownValue: UNCONSTRAINED_EXACT_LITERALS,
+    local: localExactLiterals,
+    combineAllOf: combineExactLiteralsAllOf,
+    combineUnion: (values) => combineExactLiteralsUnion(values),
+  });
+}
+
+const EXTRA_CONSTRAINT_KEYWORDS = [
+  "minimum",
+  "exclusiveMinimum",
+  "maximum",
+  "exclusiveMaximum",
+  "multipleOf",
+  "minLength",
+  "maxLength",
+  "pattern",
+  "minItems",
+  "maxItems",
+  "uniqueItems",
+  "not",
+  "if",
+  "then",
+  "else",
+  "dependentRequired",
+  "dependentSchemas",
+] as const;
+
+function schemaHasExtraConstraints(
+  schema: unknown,
+  resolve: ResolverFn,
+  from: string | undefined,
+  seen: Set<unknown> = new Set(),
+): boolean {
+  if (!isRecord(schema) || seen.has(schema)) {
+    return false;
+  }
+  seen.add(schema);
+  for (const kw of EXTRA_CONSTRAINT_KEYWORDS) {
+    if (schema[kw] !== undefined) {
+      return true;
+    }
+  }
+  if (typeof schema.$ref === "string") {
+    const resolved = safeResolveSchema(resolve, schema, from);
+    if (
+      resolved &&
+      schemaHasExtraConstraints(
+        resolved.node,
+        resolve,
+        resolved.location?.source?.absoluteRef,
+        seen,
+      )
+    ) {
+      return true;
+    }
+  }
+  for (const combiner of ["allOf", "oneOf", "anyOf"] as const) {
+    const branches = schema[combiner];
+    if (!Array.isArray(branches)) {
+      continue;
+    }
+    for (const branch of branches) {
+      if (schemaHasExtraConstraints(branch, resolve, from, seen)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 type FormatLattice = "yes" | "no" | "null-only" | "unknown";
 
 function checkSchemaStringFormat(
@@ -580,11 +769,13 @@ interface CollectVariantsResult {
   readonly variants: readonly FlattenedObjectVariant[];
   readonly hitCycle: boolean;
   readonly truncated: boolean;
+  readonly sawOperationFingerprint: boolean;
 }
 
 interface DedupeVariantsResult {
   readonly variants: FlattenedObjectVariant[];
   readonly truncated: boolean;
+  readonly sawOperationFingerprint: boolean;
 }
 
 function mergeOneOfBranchMaps(
@@ -655,19 +846,26 @@ function mergeVariants(
     }
     const baseTc = propertyTypeConstraint(baseProp, resolve);
     const addTc = propertyTypeConstraint(addProp, resolve);
-    if (baseTc.allowed.size > 0 && addTc.allowed.size > 0) {
-      const mergedTc = propertyTypeConstraint(mergedProp, resolve);
-      if (mergedTc.allowed.size === 0) {
-        return null;
-      }
+    const mergedTc = propertyTypeConstraint(mergedProp, resolve);
+    if (baseTc.allowed.size > 0 && addTc.allowed.size > 0 && mergedTc.allowed.size === 0) {
+      return null;
     }
-    const baseLit = propertyStringLiterals(baseProp, resolve);
-    const addLit = propertyStringLiterals(addProp, resolve);
-    const baseLitSatisfiable = baseLit.kind !== "values" || baseLit.values.size > 0;
-    const addLitSatisfiable = addLit.kind !== "values" || addLit.values.size > 0;
-    if (baseLitSatisfiable && addLitSatisfiable) {
-      const mergedLit = propertyStringLiterals(mergedProp, resolve);
-      if (mergedLit.kind === "values" && mergedLit.values.size === 0) {
+    const baseExact = propertyExactLiterals(baseProp, resolve);
+    const addExact = propertyExactLiterals(addProp, resolve);
+    const baseSatisfiable =
+      baseExact.kind !== "values" ||
+      [...baseExact.values].some((key) => canonicalKeyMatchesAllowedTypes(key, baseTc.allowed));
+    const addSatisfiable =
+      addExact.kind !== "values" ||
+      [...addExact.values].some((key) => canonicalKeyMatchesAllowedTypes(key, addTc.allowed));
+    if (baseSatisfiable && addSatisfiable) {
+      const mergedExact = propertyExactLiterals(mergedProp, resolve);
+      if (
+        mergedExact.kind === "values" &&
+        ![...mergedExact.values].some((key) =>
+          canonicalKeyMatchesAllowedTypes(key, mergedTc.allowed),
+        )
+      ) {
         return null;
       }
     }
@@ -712,6 +910,26 @@ function propertyStringLiterals(prop: TrackedProperty, resolve: ResolverFn): Lit
   return combined;
 }
 
+function propertyExactLiterals(prop: TrackedProperty, resolve: ResolverFn): ExactLiteralLattice {
+  let combined: ExactLiteralLattice = UNCONSTRAINED_EXACT_LITERALS;
+  for (const frag of prop.fragments) {
+    combined = combineExactLiteralsAllOf(
+      combined,
+      extractSchemaExactLiterals(frag.node, resolve, frag.from),
+    );
+  }
+  return combined;
+}
+
+function propertyHasExtraConstraints(prop: TrackedProperty, resolve: ResolverFn): boolean {
+  for (const frag of prop.fragments) {
+    if (schemaHasExtraConstraints(frag.node, resolve, frag.from)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function propertyStringFormat(
   prop: TrackedProperty,
   expectedFormat: string,
@@ -743,10 +961,16 @@ function variantSignature(variant: FlattenedObjectVariant, resolve: ResolverFn):
     }
     const tc = propertyTypeConstraint(prop, resolve);
     const tcSig = ALL_JSON_TYPES.filter((t) => tc.allowed.has(t)).join("|");
+    const exact = propertyExactLiterals(prop, resolve);
+    const exactSig = exact.kind === "values" ? `[${[...exact.values].sort().join("|")}]` : "";
+    const parts = [key, tcSig];
+    if (exactSig.length > 0) {
+      parts.push(exactSig);
+    }
     if (key === "status" || key === "type" || key === "state" || key === "kind") {
       const lit = propertyStringLiterals(prop, resolve);
       const litSig = lit.kind === "values" ? [...lit.values].sort().join("|") : "*";
-      return `${key}:${tcSig}:${litSig}`;
+      parts.push(`str:${litSig}`);
     }
     if (
       key === "createdAt" ||
@@ -755,53 +979,24 @@ function variantSignature(variant: FlattenedObjectVariant, resolve: ResolverFn):
       key === "startedAt" ||
       key === "expiresAt"
     ) {
-      const fmt = propertyStringFormat(prop, "date-time", resolve);
-      return `${key}:${tcSig}:${fmt}`;
+      parts.push(`fmt:${propertyStringFormat(prop, "date-time", resolve)}`);
+    } else if (key === "url") {
+      parts.push(`fmt:${propertyStringFormat(prop, "uri", resolve)}`);
     }
-    if (key === "url") {
-      const fmt = propertyStringFormat(prop, "uri", resolve);
-      return `${key}:${tcSig}:${fmt}`;
-    }
-    if (tc.allowed.has("object") || tc.allowed.has("array")) {
+    if (
+      tc.allowed.has("object") ||
+      tc.allowed.has("array") ||
+      propertyHasExtraConstraints(prop, resolve)
+    ) {
       const fragSig = prop.fragments
         .map((frag) => (frag.location ? locationKey(frag.location) : typeof frag.node))
         .sort()
         .join("&");
-      return `${key}:${tcSig}:${fragSig}`;
+      parts.push(`f:${fragSig}`);
     }
-    return `${key}:${tcSig}`;
+    return parts.join(":");
   });
   return `${variant.isObjectLike ? "1" : "0"}:${typesSig}:s[${schemaNamesSig}]:r[${reqSig}]:p[${propSigs.join(";")}]`;
-}
-
-function dedupeVariants(
-  variants: readonly FlattenedObjectVariant[],
-  resolve: ResolverFn,
-): DedupeVariantsResult {
-  const indexBySig = new Map<string, number>();
-  const out: FlattenedObjectVariant[] = [];
-  let truncated = false;
-  for (const variant of variants) {
-    const sig = variantSignature(variant, resolve);
-    const existingIndex = indexBySig.get(sig);
-    if (existingIndex !== undefined) {
-      const existing = out[existingIndex];
-      if (existing && variant.oneOfBranches.size > 0) {
-        out[existingIndex] = {
-          ...existing,
-          oneOfBranches: mergeOneOfBranchMaps(existing.oneOfBranches, variant.oneOfBranches),
-        };
-      }
-      continue;
-    }
-    if (out.length >= MAX_OBJECT_VARIANTS) {
-      truncated = true;
-      continue;
-    }
-    indexBySig.set(sig, out.length);
-    out.push(variant);
-  }
-  return { variants: out, truncated };
 }
 
 function combineVariantSets(
@@ -810,11 +1005,12 @@ function combineVariantSets(
   resolve: ResolverFn,
 ): DedupeVariantsResult {
   if (left.length === 0 || right.length === 0) {
-    return { variants: [], truncated: false };
+    return { variants: [], truncated: false, sawOperationFingerprint: false };
   }
   const indexBySig = new Map<string, number>();
   const out: FlattenedObjectVariant[] = [];
   let truncated = false;
+  let sawOperationFingerprint = false;
   for (const a of left) {
     for (const b of right) {
       const merged = mergeVariants(a, b, resolve);
@@ -835,13 +1031,16 @@ function combineVariantSets(
       }
       if (out.length >= MAX_OBJECT_VARIANTS) {
         truncated = true;
+        if (!sawOperationFingerprint && hasOperationStructuralFingerprint([merged], resolve)) {
+          sawOperationFingerprint = true;
+        }
         continue;
       }
       indexBySig.set(sig, out.length);
       out.push(merged);
     }
   }
-  return { variants: out, truncated };
+  return { variants: out, truncated, sawOperationFingerprint };
 }
 
 const EMPTY_SEED_VARIANT: FlattenedObjectVariant = {
@@ -866,7 +1065,11 @@ function collectFlattenedObjectVariants(
   schema: unknown,
   resolve: ResolverFn,
   baseLocation?: RedoclyLocation,
-): { readonly variants: readonly FlattenedObjectVariant[]; readonly truncated: boolean } {
+): {
+  readonly variants: readonly FlattenedObjectVariant[];
+  readonly truncated: boolean;
+  readonly sawOperationFingerprint: boolean;
+} {
   const memo = new Map<object, Map<string, CollectVariantsResult>>();
   let anonymousOneOfCounter = 0;
 
@@ -877,13 +1080,23 @@ function collectFlattenedObjectVariants(
     followRef: boolean,
   ): CollectVariantsResult => {
     if (node === false) {
-      return { variants: [], hitCycle: false, truncated: false };
+      return { variants: [], hitCycle: false, truncated: false, sawOperationFingerprint: false };
     }
     if (node === true || !isRecord(node)) {
-      return { variants: [EMPTY_SEED_VARIANT], hitCycle: false, truncated: false };
+      return {
+        variants: [EMPTY_SEED_VARIANT],
+        hitCycle: false,
+        truncated: false,
+        sawOperationFingerprint: false,
+      };
     }
     if (seen.has(node)) {
-      return { variants: [EMPTY_SEED_VARIANT], hitCycle: true, truncated: false };
+      return {
+        variants: [EMPTY_SEED_VARIANT],
+        hitCycle: true,
+        truncated: false,
+        sawOperationFingerprint: false,
+      };
     }
 
     const cacheKey = `${followRef ? "1" : "0"}:${location ? locationKey(location) : ""}`;
@@ -897,6 +1110,7 @@ function collectFlattenedObjectVariants(
 
     let hitCycle = false;
     let truncated = false;
+    let sawOperationFingerprint = false;
     let variants: FlattenedObjectVariant[] = [EMPTY_SEED_VARIANT];
 
     const localSchemaNames = new Set<string>();
@@ -919,10 +1133,16 @@ function collectFlattenedObjectVariants(
         if (targetResult.truncated) {
           truncated = true;
         }
+        if (targetResult.sawOperationFingerprint) {
+          sawOperationFingerprint = true;
+        }
         const mergedTarget = combineVariantSets(variants, targetResult.variants, resolve);
         variants = mergedTarget.variants;
         if (mergedTarget.truncated) {
           truncated = true;
+        }
+        if (mergedTarget.sawOperationFingerprint) {
+          sawOperationFingerprint = true;
         }
 
         const chain = resolved.chain ?? [];
@@ -942,10 +1162,16 @@ function collectFlattenedObjectVariants(
           if (hopResult.truncated) {
             truncated = true;
           }
+          if (hopResult.sawOperationFingerprint) {
+            sawOperationFingerprint = true;
+          }
           const mergedHop = combineVariantSets(variants, hopResult.variants, resolve);
           variants = mergedHop.variants;
           if (mergedHop.truncated) {
             truncated = true;
+          }
+          if (mergedHop.sawOperationFingerprint) {
+            sawOperationFingerprint = true;
           }
         }
       }
@@ -960,10 +1186,16 @@ function collectFlattenedObjectVariants(
         if (branchResult.truncated) {
           truncated = true;
         }
+        if (branchResult.sawOperationFingerprint) {
+          sawOperationFingerprint = true;
+        }
         const mergedBranch = combineVariantSets(variants, branchResult.variants, resolve);
         variants = mergedBranch.variants;
         if (mergedBranch.truncated) {
           truncated = true;
+        }
+        if (mergedBranch.sawOperationFingerprint) {
+          sawOperationFingerprint = true;
         }
         if (variants.length === 0) {
           break;
@@ -1027,6 +1259,9 @@ function collectFlattenedObjectVariants(
       if (mergedLocal.truncated) {
         truncated = true;
       }
+      if (mergedLocal.sawOperationFingerprint) {
+        sawOperationFingerprint = true;
+      }
     }
 
     if (variants.length > 0) {
@@ -1050,6 +1285,9 @@ function collectFlattenedObjectVariants(
           if (branchResult.truncated) {
             truncated = true;
           }
+          if (branchResult.sawOperationFingerprint) {
+            sawOperationFingerprint = true;
+          }
           if (oneOfId !== undefined) {
             const branchTag = new Map<string, ReadonlySet<number>>([[oneOfId, new Set([index])]]);
             for (const branchVariant of branchResult.variants) {
@@ -1062,14 +1300,13 @@ function collectFlattenedObjectVariants(
             unionVariants.push(...branchResult.variants);
           }
         }
-        const dedupedUnion = dedupeVariants(unionVariants, resolve);
-        if (dedupedUnion.truncated) {
-          truncated = true;
-        }
-        const mergedUnion = combineVariantSets(variants, dedupedUnion.variants, resolve);
+        const mergedUnion = combineVariantSets(variants, unionVariants, resolve);
         variants = mergedUnion.variants;
         if (mergedUnion.truncated) {
           truncated = true;
+        }
+        if (mergedUnion.sawOperationFingerprint) {
+          sawOperationFingerprint = true;
         }
       }
     }
@@ -1081,7 +1318,12 @@ function collectFlattenedObjectVariants(
       }));
     }
 
-    const result: CollectVariantsResult = { variants, hitCycle, truncated };
+    const result: CollectVariantsResult = {
+      variants,
+      hitCycle,
+      truncated,
+      sawOperationFingerprint,
+    };
     if (!hitCycle) {
       let nodeCache = memo.get(node);
       if (!nodeCache) {
@@ -1094,7 +1336,11 @@ function collectFlattenedObjectVariants(
   };
 
   const finalResult = visit(schema, baseLocation, new Set(), true);
-  return { variants: finalResult.variants, truncated: finalResult.truncated };
+  return {
+    variants: finalResult.variants,
+    truncated: finalResult.truncated,
+    sawOperationFingerprint: finalResult.sawOperationFingerprint,
+  };
 }
 
 function collectPropertyObjectVariants(
@@ -1514,6 +1760,7 @@ function collectOperationResponses(
                 knownOperationNodes,
               ) ||
               schemaHasOperationComponentName(schema, ctx.resolve, from) ||
+              collected.sawOperationFingerprint ||
               hasOperationStructuralFingerprint(collected.variants, ctx.resolve);
             if (!matches) {
               continue;
@@ -1880,7 +2127,17 @@ function validateErrorProblemDetails(
     return;
   }
 
-  const errorVariants = collectPropertyObjectVariants(errorProp, ctx.resolve).variants.filter(
+  const errorCollected = collectPropertyObjectVariants(errorProp, ctx.resolve);
+  if (errorCollected.truncated) {
+    reportOnce(
+      ctx,
+      reported,
+      "error-variant-cap-exceeded",
+      errorLoc,
+      `${entryPrefix(entry)}: Operation "error" schema exceeds the ${MAX_OBJECT_VARIANTS}-variant union analysis cap and could not be fully verified (ADS-0004).`,
+    );
+  }
+  const errorVariants = errorCollected.variants.filter(
     (v) => !isStrictlyNullConstraint(v.typeConstraint),
   );
   if (errorVariants.length === 0) {
@@ -2621,14 +2878,14 @@ function areVariantsDisjointOnOtherFields(
     ) {
       return true;
     }
-    const aLit = propertyStringLiterals(aProp, resolve);
-    const bLit = propertyStringLiterals(bProp, resolve);
+    const aExact = propertyExactLiterals(aProp, resolve);
+    const bExact = propertyExactLiterals(bProp, resolve);
     if (
-      aLit.kind === "values" &&
-      bLit.kind === "values" &&
-      aLit.values.size > 0 &&
-      bLit.values.size > 0 &&
-      !setsIntersect(aLit.values, bLit.values)
+      aExact.kind === "values" &&
+      bExact.kind === "values" &&
+      aExact.values.size > 0 &&
+      bExact.values.size > 0 &&
+      !setsIntersect(aExact.values, bExact.values)
     ) {
       return true;
     }
