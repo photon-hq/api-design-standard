@@ -18,7 +18,7 @@ Consistent asynchronous contracts let callers, generated SDKs, dashboards, CLIs,
 
 Not every `202 Accepted` endpoint requires a separate `Operation` resource. Photon public HTTP APIs distinguish three asynchronous patterns:
 
-1. **Long-Running Operations**: Multi-step provisioning, billing mutations, external provider handshakes, or batch workflows whose asynchronous execution is tracked independently of a single domain entity. These endpoints **MUST** return `202 Accepted` with a `Location` header pointing to `GET <scope>/operations/{operationId}`, an advisory `Retry-After` header, and a canonical flat `Operation` JSON body.
+1. **Long-Running Operations**: Multi-step provisioning, billing mutations, external provider handshakes, or batch workflows whose asynchronous execution is tracked independently of a single domain entity. These endpoints **MUST** return `202 Accepted` with a `Location` header pointing to `GET <scope>/operations/{operationId}`, an advisory `Retry-After` header when non-terminal, and a canonical flat `Operation` JSON body.
 2. **Lifecycle-Bearing Resources**: Domain resources whose own canonical representation carries a durable lifecycle state (for example a resource awaiting provisioning, verification, or review). Creating or mutating such a resource **MAY** return `202 Accepted` with a `Location` header pointing to the resource itself rather than introducing a separate `Operation` resource.
 3. **Fire-and-Forget Requests**: Ephemeral or queued signals that have no pollable status resource (for example typing indicators or best-effort queued notifications). These endpoints **MAY** return `202 Accepted` without a `Location` header.
 
@@ -114,7 +114,7 @@ Every `nextAction` object follows a layered contract:
 
 #### Polling endpoint (`GET <scope>/operations/{operationId}`)
 
-- The polling endpoint **MUST** always return HTTP `200 OK` with the flat `Operation` body, including when `status` is `failed` or `cancelled`.
+- The polling endpoint **MUST** return HTTP `200 OK` with the flat `Operation` body (including when `status` is `failed` or `cancelled`), unless a supported conditional request returns `304 Not Modified`.
 - HTTP `4xx` and `5xx` statuses on the polling endpoint are reserved for failures of the poll request itself (such as `404 Not Found` for an unknown operation or `403 Forbidden`), never for execution failure of the underlying operation.
 - Polling responses **SHOULD** include `Retry-After` while non-terminal and **MAY** support conditional requests via `ETag` and `304 Not Modified`.
 
@@ -328,6 +328,8 @@ The `@photon-hq/api-design-standards` Redocly plugin (`photon-ads`) enforces ADS
 4. The schema carries an Operation structural fingerprint: `operationId` without `id`, or a `status`/`state` discriminator paired with operation lifecycle markers (`completedAt`, `resolvedAt`, `endedAt`, `submittedAt`, `nextAction`, `cancellable`, `response`/`result` alongside `error`/`failure`, or `error`/`failure` alongside `type`/`kind` and a timestamp).
 
 Lifecycle-bearing resource `202` endpoints and fire-and-forget `202` endpoints that do not match these signals are ignored.
+
+**Union analysis bound**: Composed `allOf`/`oneOf`/`anyOf` Operation schemas are flattened up to 256 distinct object variants; schemas exceeding that bound fail with an incomplete-analysis error rather than silently skipping unanalyzed branches.
 
 | Rule ID | Default Severity | What it enforces |
 | --- | --- | --- |

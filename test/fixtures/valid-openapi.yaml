@@ -175,6 +175,7 @@ paths:
           description: Plan change accepted for asynchronous processing.
           headers:
             Location:
+              required: true
               description: Canonical poll URL for the operation.
               schema:
                 type: string
@@ -437,6 +438,7 @@ components:
           type: string
     RedirectNextAction:
       type: object
+      additionalProperties: false
       required:
         - type
         - url
@@ -454,6 +456,7 @@ components:
           format: date-time
     ConfirmPaymentNextAction:
       type: object
+      additionalProperties: false
       required:
         - type
         - invoiceId
@@ -480,6 +483,7 @@ components:
         - response
         - error
         - cancellable
+        - nextAction
       properties:
         id:
           type: string

@@ -86,7 +86,7 @@ const OPERATION_DELETE_PATH_RE = /(?:^|\/)operations\/\{[^}]+\}(?:\/cancel)?\/?$
 const JSON_MEDIA_TYPE_RE = /^application\/(?!problem\+json(?:\s*;|$))(?:[^;]+\+)?json(?:\s*;|$)/i;
 const COMPONENT_SCHEMA_REF_RE = /#\/components\/schemas\/([^/]+)$/;
 const OPERATION_SCHEMA_NAME_RE =
-  /^(?:[A-Z][a-zA-Z0-9]*Operation|Operation|[a-z][a-zA-Z0-9]*Operation)(?:Response|Status|Resource)?$|^(?:[a-z0-9_]+_)?operation(?:_response|_status|_resource)?$/;
+  /^(?:[A-Za-z0-9._-]*Operation)(?:Response|Status|Resource)?$|^(?:[a-z0-9._-]*[_.-])?operation(?:[_.-](?:response|status|resource))?$/;
 const SNAKE_CASE_RE = /^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$/;
 const NON_CREDENTIAL_TOKEN_KEY_RE =
   /^(?:next|prev|previous|page|continuation|sync|cursor)(?:_?page)?_?token$/i;
@@ -97,7 +97,47 @@ const SENSITIVE_CREDENTIAL_CAMEL_SUFFIX_RE =
 const SENSITIVE_CREDENTIAL_SNAKE_SUFFIX_RE =
   /_(?:secret|password|passphrase|api_key|private_key|token)$/i;
 
-const MAX_OBJECT_VARIANTS = 64;
+const PROHIBITED_CREDENTIAL_PROBES = [
+  "secret",
+  "password",
+  "passphrase",
+  "token",
+  "apiKey",
+  "api_key",
+  "privateKey",
+  "private_key",
+  "clientSecret",
+  "client_secret",
+  "accessToken",
+  "access_token",
+  "refreshToken",
+  "refresh_token",
+  "idToken",
+  "id_token",
+  "sessionToken",
+  "session_token",
+  "authToken",
+  "auth_token",
+  "bearerToken",
+  "bearer_token",
+  "signingSecret",
+  "signing_secret",
+] as const;
+
+const BENIGN_KEY_PROBES = [
+  "id",
+  "name",
+  "value",
+  "record",
+  "status",
+  "type",
+  "hostname",
+  "foo",
+  "exampleKey",
+  "example_key",
+] as const;
+
+const MAX_OBJECT_VARIANTS = 256;
 
 type JsonSchemaType = "object" | "array" | "string" | "number" | "integer" | "boolean" | "null";
 
@@ -260,28 +300,6 @@ function localTypeConstraint(node: UnknownRecord): TypeConstraint {
     }
   }
 
-  if (
-    node.type === undefined &&
-    (isRecord(node.properties) ||
-      node.additionalProperties !== undefined ||
-      Array.isArray(node.required) ||
-      isRecord(node.patternProperties))
-  ) {
-    const types = new Set<JsonSchemaType>(["object"]);
-    if (node.nullable === true) {
-      types.add("null");
-    }
-    result = combineTypeConstraintAllOf(result, { allowed: types });
-  }
-
-  if (node.type === undefined && (node.items !== undefined || Array.isArray(node.prefixItems))) {
-    const types = new Set<JsonSchemaType>(["array"]);
-    if (node.nullable === true) {
-      types.add("null");
-    }
-    result = combineTypeConstraintAllOf(result, { allowed: types });
-  }
-
   return result;
 }
 
@@ -292,11 +310,7 @@ function finalizeTypeConstraint(node: UnknownRecord, value: TypeConstraint): Typ
   if (node.const !== undefined && node.const !== null) {
     return value;
   }
-  if (
-    Array.isArray(node.enum) &&
-    node.enum.length > 0 &&
-    node.enum.every((item) => item === null)
-  ) {
+  if (Array.isArray(node.enum) && node.enum.length > 0 && !node.enum.includes(null)) {
     return value;
   }
   const allowed = new Set<JsonSchemaType>(value.allowed);
@@ -344,16 +358,8 @@ function isNonNullBooleanConstraint(tc: TypeConstraint): boolean {
   return tc.allowed.size === 1 && tc.allowed.has("boolean");
 }
 
-function isNonNullNumberConstraint(tc: TypeConstraint): boolean {
-  if (tc.allowed.size === 0) {
-    return false;
-  }
-  for (const t of tc.allowed) {
-    if (t !== "integer" && t !== "number") {
-      return false;
-    }
-  }
-  return true;
+function isNonNullIntegerConstraint(tc: TypeConstraint): boolean {
+  return tc.allowed.size === 1 && tc.allowed.has("integer");
 }
 
 function allowsOnlyNullOrString(tc: TypeConstraint): boolean {
@@ -567,11 +573,39 @@ interface FlattenedObjectVariant {
   readonly properties: ReadonlyMap<string, TrackedProperty>;
   readonly required: ReadonlySet<string>;
   readonly schemaNames: ReadonlySet<string>;
+  readonly oneOfBranches: ReadonlyMap<string, ReadonlySet<number>>;
 }
 
 interface CollectVariantsResult {
   readonly variants: readonly FlattenedObjectVariant[];
   readonly hitCycle: boolean;
+  readonly truncated: boolean;
+}
+
+interface DedupeVariantsResult {
+  readonly variants: FlattenedObjectVariant[];
+  readonly truncated: boolean;
+}
+
+function mergeOneOfBranchMaps(
+  left: ReadonlyMap<string, ReadonlySet<number>>,
+  right: ReadonlyMap<string, ReadonlySet<number>>,
+): Map<string, Set<number>> {
+  const merged = new Map<string, Set<number>>();
+  for (const [id, branches] of left.entries()) {
+    merged.set(id, new Set(branches));
+  }
+  for (const [id, branches] of right.entries()) {
+    const existing = merged.get(id);
+    if (existing) {
+      for (const index of branches) {
+        existing.add(index);
+      }
+    } else {
+      merged.set(id, new Set(branches));
+    }
+  }
+  return merged;
 }
 
 function mergeTrackedProperty(
@@ -598,6 +632,7 @@ function mergeTrackedProperty(
 function mergeVariants(
   base: FlattenedObjectVariant,
   addition: FlattenedObjectVariant,
+  resolve: ResolverFn,
 ): FlattenedObjectVariant | null {
   const typeConstraint = combineTypeConstraintAllOf(base.typeConstraint, addition.typeConstraint);
   if (typeConstraint.allowed.size === 0) {
@@ -610,6 +645,32 @@ function mergeVariants(
   const required = new Set<string>(base.required);
   for (const name of addition.required) {
     required.add(name);
+  }
+  for (const name of required) {
+    const baseProp = base.properties.get(name);
+    const addProp = addition.properties.get(name);
+    const mergedProp = properties.get(name);
+    if (!baseProp || !addProp || !mergedProp) {
+      continue;
+    }
+    const baseTc = propertyTypeConstraint(baseProp, resolve);
+    const addTc = propertyTypeConstraint(addProp, resolve);
+    if (baseTc.allowed.size > 0 && addTc.allowed.size > 0) {
+      const mergedTc = propertyTypeConstraint(mergedProp, resolve);
+      if (mergedTc.allowed.size === 0) {
+        return null;
+      }
+    }
+    const baseLit = propertyStringLiterals(baseProp, resolve);
+    const addLit = propertyStringLiterals(addProp, resolve);
+    const baseLitSatisfiable = baseLit.kind !== "values" || baseLit.values.size > 0;
+    const addLitSatisfiable = addLit.kind !== "values" || addLit.values.size > 0;
+    if (baseLitSatisfiable && addLitSatisfiable) {
+      const mergedLit = propertyStringLiterals(mergedProp, resolve);
+      if (mergedLit.kind === "values" && mergedLit.values.size === 0) {
+        return null;
+      }
+    }
   }
   const schemaNames = new Set<string>(base.schemaNames);
   for (const name of addition.schemaNames) {
@@ -625,6 +686,7 @@ function mergeVariants(
     properties,
     required,
     schemaNames,
+    oneOfBranches: mergeOneOfBranchMaps(base.oneOfBranches, addition.oneOfBranches),
   };
 }
 
@@ -700,9 +762,10 @@ function variantSignature(variant: FlattenedObjectVariant, resolve: ResolverFn):
       const fmt = propertyStringFormat(prop, "uri", resolve);
       return `${key}:${tcSig}:${fmt}`;
     }
-    if (key === "nextAction" || key === "error") {
+    if (tc.allowed.has("object") || tc.allowed.has("array")) {
       const fragSig = prop.fragments
         .map((frag) => (frag.location ? locationKey(frag.location) : typeof frag.node))
+        .sort()
         .join("&");
       return `${key}:${tcSig}:${fragSig}`;
     }
@@ -714,47 +777,71 @@ function variantSignature(variant: FlattenedObjectVariant, resolve: ResolverFn):
 function dedupeVariants(
   variants: readonly FlattenedObjectVariant[],
   resolve: ResolverFn,
-): FlattenedObjectVariant[] {
-  const seen = new Set<string>();
+): DedupeVariantsResult {
+  const indexBySig = new Map<string, number>();
   const out: FlattenedObjectVariant[] = [];
+  let truncated = false;
   for (const variant of variants) {
     const sig = variantSignature(variant, resolve);
-    if (seen.has(sig)) {
+    const existingIndex = indexBySig.get(sig);
+    if (existingIndex !== undefined) {
+      const existing = out[existingIndex];
+      if (existing && variant.oneOfBranches.size > 0) {
+        out[existingIndex] = {
+          ...existing,
+          oneOfBranches: mergeOneOfBranchMaps(existing.oneOfBranches, variant.oneOfBranches),
+        };
+      }
       continue;
     }
-    seen.add(sig);
-    out.push(variant);
     if (out.length >= MAX_OBJECT_VARIANTS) {
-      break;
+      truncated = true;
+      continue;
     }
+    indexBySig.set(sig, out.length);
+    out.push(variant);
   }
-  return out;
+  return { variants: out, truncated };
 }
 
 function combineVariantSets(
   left: readonly FlattenedObjectVariant[],
   right: readonly FlattenedObjectVariant[],
   resolve: ResolverFn,
-): FlattenedObjectVariant[] {
+): DedupeVariantsResult {
   if (left.length === 0 || right.length === 0) {
-    return [];
+    return { variants: [], truncated: false };
   }
-  const combined: FlattenedObjectVariant[] = [];
+  const indexBySig = new Map<string, number>();
+  const out: FlattenedObjectVariant[] = [];
+  let truncated = false;
   for (const a of left) {
     for (const b of right) {
-      const merged = mergeVariants(a, b);
-      if (merged) {
-        combined.push(merged);
+      const merged = mergeVariants(a, b, resolve);
+      if (!merged) {
+        continue;
       }
-      if (combined.length >= MAX_OBJECT_VARIANTS * 2) {
-        break;
+      const sig = variantSignature(merged, resolve);
+      const existingIndex = indexBySig.get(sig);
+      if (existingIndex !== undefined) {
+        const existing = out[existingIndex];
+        if (existing && merged.oneOfBranches.size > 0) {
+          out[existingIndex] = {
+            ...existing,
+            oneOfBranches: mergeOneOfBranchMaps(existing.oneOfBranches, merged.oneOfBranches),
+          };
+        }
+        continue;
       }
-    }
-    if (combined.length >= MAX_OBJECT_VARIANTS * 2) {
-      break;
+      if (out.length >= MAX_OBJECT_VARIANTS) {
+        truncated = true;
+        continue;
+      }
+      indexBySig.set(sig, out.length);
+      out.push(merged);
     }
   }
-  return dedupeVariants(combined, resolve);
+  return { variants: out, truncated };
 }
 
 const EMPTY_SEED_VARIANT: FlattenedObjectVariant = {
@@ -764,6 +851,7 @@ const EMPTY_SEED_VARIANT: FlattenedObjectVariant = {
   properties: new Map(),
   required: new Set(),
   schemaNames: new Set(),
+  oneOfBranches: new Map(),
 };
 
 function extractComponentSchemaName(refOrPointer: string | undefined): string | undefined {
@@ -778,8 +866,9 @@ function collectFlattenedObjectVariants(
   schema: unknown,
   resolve: ResolverFn,
   baseLocation?: RedoclyLocation,
-): readonly FlattenedObjectVariant[] {
+): { readonly variants: readonly FlattenedObjectVariant[]; readonly truncated: boolean } {
   const memo = new Map<object, Map<string, CollectVariantsResult>>();
+  let anonymousOneOfCounter = 0;
 
   const visit = (
     node: unknown,
@@ -788,13 +877,13 @@ function collectFlattenedObjectVariants(
     followRef: boolean,
   ): CollectVariantsResult => {
     if (node === false) {
-      return { variants: [], hitCycle: false };
+      return { variants: [], hitCycle: false, truncated: false };
     }
     if (node === true || !isRecord(node)) {
-      return { variants: [EMPTY_SEED_VARIANT], hitCycle: false };
+      return { variants: [EMPTY_SEED_VARIANT], hitCycle: false, truncated: false };
     }
     if (seen.has(node)) {
-      return { variants: [EMPTY_SEED_VARIANT], hitCycle: true };
+      return { variants: [EMPTY_SEED_VARIANT], hitCycle: true, truncated: false };
     }
 
     const cacheKey = `${followRef ? "1" : "0"}:${location ? locationKey(location) : ""}`;
@@ -807,6 +896,7 @@ function collectFlattenedObjectVariants(
     nextSeen.add(node);
 
     let hitCycle = false;
+    let truncated = false;
     let variants: FlattenedObjectVariant[] = [EMPTY_SEED_VARIANT];
 
     const localSchemaNames = new Set<string>();
@@ -826,7 +916,14 @@ function collectFlattenedObjectVariants(
         if (targetResult.hitCycle) {
           hitCycle = true;
         }
-        variants = combineVariantSets(variants, targetResult.variants, resolve);
+        if (targetResult.truncated) {
+          truncated = true;
+        }
+        const mergedTarget = combineVariantSets(variants, targetResult.variants, resolve);
+        variants = mergedTarget.variants;
+        if (mergedTarget.truncated) {
+          truncated = true;
+        }
 
         const chain = resolved.chain ?? [];
         for (let index = chain.length - 1; index >= 0; index -= 1) {
@@ -842,7 +939,14 @@ function collectFlattenedObjectVariants(
           if (hopResult.hitCycle) {
             hitCycle = true;
           }
-          variants = combineVariantSets(variants, hopResult.variants, resolve);
+          if (hopResult.truncated) {
+            truncated = true;
+          }
+          const mergedHop = combineVariantSets(variants, hopResult.variants, resolve);
+          variants = mergedHop.variants;
+          if (mergedHop.truncated) {
+            truncated = true;
+          }
         }
       }
     }
@@ -853,7 +957,14 @@ function collectFlattenedObjectVariants(
         if (branchResult.hitCycle) {
           hitCycle = true;
         }
-        variants = combineVariantSets(variants, branchResult.variants, resolve);
+        if (branchResult.truncated) {
+          truncated = true;
+        }
+        const mergedBranch = combineVariantSets(variants, branchResult.variants, resolve);
+        variants = mergedBranch.variants;
+        if (mergedBranch.truncated) {
+          truncated = true;
+        }
         if (variants.length === 0) {
           break;
         }
@@ -909,8 +1020,13 @@ function collectFlattenedObjectVariants(
         properties: localProps,
         required: localRequired,
         schemaNames: localSchemaNames,
+        oneOfBranches: new Map(),
       };
-      variants = combineVariantSets(variants, [localVariant], resolve);
+      const mergedLocal = combineVariantSets(variants, [localVariant], resolve);
+      variants = mergedLocal.variants;
+      if (mergedLocal.truncated) {
+        truncated = true;
+      }
     }
 
     if (variants.length > 0) {
@@ -919,15 +1035,42 @@ function collectFlattenedObjectVariants(
         if (!Array.isArray(branches) || branches.length === 0) {
           continue;
         }
+        const oneOfId =
+          unionKey === "oneOf"
+            ? location
+              ? locationKey(location.child(["oneOf"]))
+              : `oneOf#${++anonymousOneOfCounter}`
+            : undefined;
         const unionVariants: FlattenedObjectVariant[] = [];
         for (const [index, branch] of branches.entries()) {
           const branchResult = visit(branch, location?.child([unionKey, index]), nextSeen, true);
           if (branchResult.hitCycle) {
             hitCycle = true;
           }
-          unionVariants.push(...branchResult.variants);
+          if (branchResult.truncated) {
+            truncated = true;
+          }
+          if (oneOfId !== undefined) {
+            const branchTag = new Map<string, ReadonlySet<number>>([[oneOfId, new Set([index])]]);
+            for (const branchVariant of branchResult.variants) {
+              unionVariants.push({
+                ...branchVariant,
+                oneOfBranches: mergeOneOfBranchMaps(branchVariant.oneOfBranches, branchTag),
+              });
+            }
+          } else {
+            unionVariants.push(...branchResult.variants);
+          }
         }
-        variants = combineVariantSets(variants, dedupeVariants(unionVariants, resolve), resolve);
+        const dedupedUnion = dedupeVariants(unionVariants, resolve);
+        if (dedupedUnion.truncated) {
+          truncated = true;
+        }
+        const mergedUnion = combineVariantSets(variants, dedupedUnion.variants, resolve);
+        variants = mergedUnion.variants;
+        if (mergedUnion.truncated) {
+          truncated = true;
+        }
       }
     }
 
@@ -938,7 +1081,7 @@ function collectFlattenedObjectVariants(
       }));
     }
 
-    const result: CollectVariantsResult = { variants, hitCycle };
+    const result: CollectVariantsResult = { variants, hitCycle, truncated };
     if (!hitCycle) {
       let nodeCache = memo.get(node);
       if (!nodeCache) {
@@ -950,22 +1093,31 @@ function collectFlattenedObjectVariants(
     return result;
   };
 
-  return visit(schema, baseLocation, new Set(), true).variants;
+  const finalResult = visit(schema, baseLocation, new Set(), true);
+  return { variants: finalResult.variants, truncated: finalResult.truncated };
 }
 
 function collectPropertyObjectVariants(
   prop: TrackedProperty,
   resolve: ResolverFn,
-): FlattenedObjectVariant[] {
+): { readonly variants: FlattenedObjectVariant[]; readonly truncated: boolean } {
   let variants: FlattenedObjectVariant[] = [EMPTY_SEED_VARIANT];
+  let truncated = false;
   for (const frag of prop.fragments) {
-    const fragVariants = collectFlattenedObjectVariants(frag.node, resolve, frag.location);
-    variants = combineVariantSets(variants, fragVariants, resolve);
+    const fragResult = collectFlattenedObjectVariants(frag.node, resolve, frag.location);
+    if (fragResult.truncated) {
+      truncated = true;
+    }
+    const merged = combineVariantSets(variants, fragResult.variants, resolve);
+    variants = merged.variants;
+    if (merged.truncated) {
+      truncated = true;
+    }
     if (variants.length === 0) {
       break;
     }
   }
-  return variants;
+  return { variants, truncated };
 }
 
 function collectRootAndDirectBranchSchemaKeys(
@@ -1117,10 +1269,10 @@ function isSingleKeyOperationWrapper(
     return null;
   }
   const tc = propertyTypeConstraint(opProp, resolve);
-  if (!isNonNullObjectConstraint(tc)) {
+  if (!tc.allowed.has("object")) {
     return null;
   }
-  const nestedVariants = collectPropertyObjectVariants(opProp, resolve);
+  const nestedVariants = collectPropertyObjectVariants(opProp, resolve).variants;
   const hasStructuredNested = nestedVariants.some(
     (nested) => nested.isObjectLike && (nested.properties.size > 0 || nested.required.size > 0),
   );
@@ -1132,7 +1284,7 @@ function hasOperationStructuralFingerprint(
   resolve: ResolverFn,
 ): boolean {
   for (const variant of variants) {
-    if (!variant.isObjectLike) {
+    if (!variant.isObjectLike && variant.properties.size === 0) {
       continue;
     }
     if (isSingleKeyOperationWrapper(variant, resolve) !== null) {
@@ -1185,6 +1337,7 @@ interface OperationResponseEntry {
   readonly reportBaseLocation: RedoclyLocation;
   readonly rootSchemaName?: string;
   readonly variants: readonly FlattenedObjectVariant[];
+  readonly truncated: boolean;
 }
 
 /**
@@ -1349,7 +1502,7 @@ function collectOperationResponses(
             continue;
           }
 
-          const variants = collectFlattenedObjectVariants(schema, ctx.resolve, schemaLocation);
+          const collected = collectFlattenedObjectVariants(schema, ctx.resolve, schemaLocation);
           if (requireHeuristic) {
             const from = schemaLocation.source?.absoluteRef;
             const matches =
@@ -1361,7 +1514,7 @@ function collectOperationResponses(
                 knownOperationNodes,
               ) ||
               schemaHasOperationComponentName(schema, ctx.resolve, from) ||
-              hasOperationStructuralFingerprint(variants, ctx.resolve);
+              hasOperationStructuralFingerprint(collected.variants, ctx.resolve);
             if (!matches) {
               continue;
             }
@@ -1380,21 +1533,28 @@ function collectOperationResponses(
             schemaLocation,
             reportBaseLocation,
             ...(rootSchemaName !== undefined ? { rootSchemaName } : {}),
-            variants,
+            variants: collected.variants,
+            truncated: collected.truncated,
           });
         }
         return matchedAny;
       };
 
       if (isPollPath && method === "get") {
-        inspectStatusResponse("200", "poll", false);
-        inspectStatusResponse("2XX", "poll", false);
+        if (isRecord(operationResponses["200"])) {
+          inspectStatusResponse("200", "poll", false);
+        } else {
+          inspectStatusResponse("2XX", "poll", false);
+        }
         continue;
       }
 
       if (isCancelPath && method === "post") {
-        inspectStatusResponse("200", "cancel", false);
-        inspectStatusResponse("2XX", "cancel", false);
+        if (isRecord(operationResponses["200"])) {
+          inspectStatusResponse("200", "cancel", false);
+        } else {
+          inspectStatusResponse("2XX", "cancel", false);
+        }
         continue;
       }
 
@@ -1467,91 +1627,202 @@ interface SensitiveKeyFinding {
   readonly location?: RedoclyLocation;
 }
 
+function findProhibitedCredentialMatchForPattern(pattern: string): string | null {
+  if (pattern.length === 0 || pattern.length > 256) {
+    return null;
+  }
+  let regex: RegExp;
+  try {
+    regex = new RegExp(pattern);
+  } catch {
+    return null;
+  }
+  for (const benign of BENIGN_KEY_PROBES) {
+    if (regex.test(benign)) {
+      return null;
+    }
+  }
+  for (const probe of PROHIBITED_CREDENTIAL_PROBES) {
+    if (regex.test(probe)) {
+      return probe;
+    }
+  }
+  return null;
+}
+
+function scanSchemaForSensitiveCredentialKeys(
+  node: unknown,
+  location: RedoclyLocation | undefined,
+  from: string | undefined,
+  pathPrefix: string,
+  resolve: ResolverFn,
+  seenKeys: Set<string>,
+  findings: SensitiveKeyFinding[],
+  seen: ReadonlySet<unknown> = new Set(),
+): void {
+  if (!isRecord(node) || seen.has(node)) {
+    return;
+  }
+  const nextSeen = new Set(seen);
+  nextSeen.add(node);
+
+  if (typeof node.$ref === "string") {
+    const resolved = safeResolveSchema(resolve, node, from);
+    if (resolved && isRecord(resolved.node)) {
+      scanSchemaForSensitiveCredentialKeys(
+        resolved.node,
+        resolved.location,
+        resolved.location?.source?.absoluteRef,
+        pathPrefix,
+        resolve,
+        seenKeys,
+        findings,
+        nextSeen,
+      );
+    }
+  }
+
+  if (isRecord(node.properties)) {
+    for (const [propName, propSchema] of Object.entries(node.properties)) {
+      const propLocation = location?.child(["properties", propName]);
+      const fullPath = pathPrefix ? `${pathPrefix}.${propName}` : propName;
+      if (isSensitiveCredentialKey(propName) && !seenKeys.has(fullPath)) {
+        seenKeys.add(fullPath);
+        findings.push({
+          keyName: propName,
+          pathLabel: fullPath,
+          ...(propLocation ? { location: propLocation } : {}),
+        });
+      }
+      scanSchemaForSensitiveCredentialKeys(
+        propSchema,
+        propLocation,
+        from,
+        fullPath,
+        resolve,
+        seenKeys,
+        findings,
+        nextSeen,
+      );
+    }
+  }
+
+  if (isRecord(node.patternProperties)) {
+    for (const [pattern, patternSchema] of Object.entries(node.patternProperties)) {
+      const patternLocation = location?.child(["patternProperties", pattern]);
+      const matchedProbe = findProhibitedCredentialMatchForPattern(pattern);
+      const patternPath = pathPrefix ? `${pathPrefix}[/${pattern}/]` : `[/${pattern}/]`;
+      if (matchedProbe !== null) {
+        const dedupeKey = pathPrefix ? `${pathPrefix}.${matchedProbe}` : matchedProbe;
+        if (!seenKeys.has(dedupeKey)) {
+          seenKeys.add(dedupeKey);
+          findings.push({
+            keyName: matchedProbe,
+            pathLabel: patternPath,
+            ...(patternLocation ? { location: patternLocation } : {}),
+          });
+        }
+      }
+      scanSchemaForSensitiveCredentialKeys(
+        patternSchema,
+        patternLocation,
+        from,
+        patternPath,
+        resolve,
+        seenKeys,
+        findings,
+        nextSeen,
+      );
+    }
+  }
+
+  if (isRecord(node.items)) {
+    scanSchemaForSensitiveCredentialKeys(
+      node.items,
+      location?.child(["items"]),
+      from,
+      `${pathPrefix}[]`,
+      resolve,
+      seenKeys,
+      findings,
+      nextSeen,
+    );
+  }
+
+  if (Array.isArray(node.prefixItems)) {
+    for (const [index, item] of node.prefixItems.entries()) {
+      scanSchemaForSensitiveCredentialKeys(
+        item,
+        location?.child(["prefixItems", index]),
+        from,
+        `${pathPrefix}[${index}]`,
+        resolve,
+        seenKeys,
+        findings,
+        nextSeen,
+      );
+    }
+  }
+
+  if (isRecord(node.additionalProperties)) {
+    scanSchemaForSensitiveCredentialKeys(
+      node.additionalProperties,
+      location?.child(["additionalProperties"]),
+      from,
+      `${pathPrefix}.*`,
+      resolve,
+      seenKeys,
+      findings,
+      nextSeen,
+    );
+  }
+
+  for (const combiner of ["allOf", "oneOf", "anyOf"] as const) {
+    const branches = node[combiner];
+    if (!Array.isArray(branches)) {
+      continue;
+    }
+    for (const [index, branch] of branches.entries()) {
+      scanSchemaForSensitiveCredentialKeys(
+        branch,
+        location?.child([combiner, index]),
+        from,
+        pathPrefix,
+        resolve,
+        seenKeys,
+        findings,
+        nextSeen,
+      );
+    }
+  }
+}
+
+function findSensitiveCredentialKeysInFragments(
+  fragments: readonly SchemaFragment[],
+  resolve: ResolverFn,
+): SensitiveKeyFinding[] {
+  const findings: SensitiveKeyFinding[] = [];
+  const seenKeys = new Set<string>();
+  for (const frag of fragments) {
+    scanSchemaForSensitiveCredentialKeys(
+      frag.node,
+      frag.location,
+      frag.from,
+      "nextAction",
+      resolve,
+      seenKeys,
+      findings,
+    );
+  }
+  return findings;
+}
+
 function findSensitiveCredentialKeysInVariant(
   variant: FlattenedObjectVariant,
   resolve: ResolverFn,
 ): SensitiveKeyFinding[] {
   const findings: SensitiveKeyFinding[] = [];
   const seenKeys = new Set<string>();
-
-  const visit = (
-    node: unknown,
-    location: RedoclyLocation | undefined,
-    from: string | undefined,
-    pathPrefix: string,
-    seen: ReadonlySet<unknown>,
-  ): void => {
-    if (!isRecord(node) || seen.has(node)) {
-      return;
-    }
-    const nextSeen = new Set(seen);
-    nextSeen.add(node);
-
-    if (typeof node.$ref === "string") {
-      const resolved = safeResolveSchema(resolve, node, from);
-      if (resolved && isRecord(resolved.node)) {
-        visit(
-          resolved.node,
-          resolved.location,
-          resolved.location?.source?.absoluteRef,
-          pathPrefix,
-          nextSeen,
-        );
-      }
-    }
-
-    if (isRecord(node.properties)) {
-      for (const [propName, propSchema] of Object.entries(node.properties)) {
-        const propLocation = location?.child(["properties", propName]);
-        const fullPath = pathPrefix ? `${pathPrefix}.${propName}` : propName;
-        if (isSensitiveCredentialKey(propName) && !seenKeys.has(fullPath)) {
-          seenKeys.add(fullPath);
-          findings.push({
-            keyName: propName,
-            pathLabel: fullPath,
-            ...(propLocation ? { location: propLocation } : {}),
-          });
-        }
-        visit(propSchema, propLocation, from, fullPath, nextSeen);
-      }
-    }
-
-    if (isRecord(node.items)) {
-      visit(node.items, location?.child(["items"]), from, `${pathPrefix}[]`, nextSeen);
-    }
-
-    if (Array.isArray(node.prefixItems)) {
-      for (const [index, item] of node.prefixItems.entries()) {
-        visit(
-          item,
-          location?.child(["prefixItems", index]),
-          from,
-          `${pathPrefix}[${index}]`,
-          nextSeen,
-        );
-      }
-    }
-
-    if (isRecord(node.additionalProperties)) {
-      visit(
-        node.additionalProperties,
-        location?.child(["additionalProperties"]),
-        from,
-        `${pathPrefix}.*`,
-        nextSeen,
-      );
-    }
-
-    for (const combiner of ["allOf", "oneOf", "anyOf"] as const) {
-      const branches = node[combiner];
-      if (!Array.isArray(branches)) {
-        continue;
-      }
-      for (const [index, branch] of branches.entries()) {
-        visit(branch, location?.child([combiner, index]), from, pathPrefix, nextSeen);
-      }
-    }
-  };
 
   for (const [propName, prop] of variant.properties.entries()) {
     const fullPath = `nextAction.${propName}`;
@@ -1564,7 +1835,15 @@ function findSensitiveCredentialKeysInVariant(
       });
     }
     for (const frag of prop.fragments) {
-      visit(frag.node, frag.location, frag.from, fullPath, new Set());
+      scanSchemaForSensitiveCredentialKeys(
+        frag.node,
+        frag.location,
+        frag.from,
+        fullPath,
+        resolve,
+        seenKeys,
+        findings,
+      );
     }
   }
 
@@ -1601,7 +1880,7 @@ function validateErrorProblemDetails(
     return;
   }
 
-  const errorVariants = collectPropertyObjectVariants(errorProp, ctx.resolve).filter(
+  const errorVariants = collectPropertyObjectVariants(errorProp, ctx.resolve).variants.filter(
     (v) => !isStrictlyNullConstraint(v.typeConstraint),
   );
   if (errorVariants.length === 0) {
@@ -1609,7 +1888,10 @@ function validateErrorProblemDetails(
   }
 
   for (const errVariant of errorVariants) {
-    if (!errVariant.isObjectLike) {
+    if (
+      !errVariant.typeConstraint.allowed.has("object") ||
+      !allowsOnlyNullOrObject(errVariant.typeConstraint)
+    ) {
       reportOnce(
         ctx,
         reported,
@@ -1633,7 +1915,7 @@ function validateErrorProblemDetails(
       }
       const fieldTc = propertyTypeConstraint(prop, ctx.resolve);
       if (field === "status") {
-        if (!isNonNullNumberConstraint(fieldTc)) {
+        if (!isNonNullIntegerConstraint(fieldTc)) {
           reportOnce(
             ctx,
             reported,
@@ -1721,17 +2003,26 @@ export const ads0004OperationResourceShape: RedoclyOas3Rule = (options = {}) => 
 
         const entries = collectOperationResponses(root, ctx, options);
         for (const entry of entries) {
+          if (entry.truncated) {
+            reportOnce(
+              ctx,
+              reported,
+              "variant-cap-exceeded",
+              entry.reportBaseLocation,
+              `${entryPrefix(entry)}: Operation schema exceeds the ${MAX_OBJECT_VARIANTS}-variant union analysis cap and could not be fully verified (ADS-0004).`,
+            );
+          }
           for (const variant of entry.variants) {
             if (isVariantIgnored(variant, entry, ignoreMatcher)) {
               continue;
             }
-            if (!variant.isObjectLike) {
+            if (!isNonNullObjectConstraint(variant.typeConstraint)) {
               reportOnce(
                 ctx,
                 reported,
                 "non-object",
                 entry.reportBaseLocation,
-                `${entryPrefix(entry)}: Operation response must be a flat top-level JSON object (ADS-0004).`,
+                `${entryPrefix(entry)}: Operation response must be a non-null flat top-level JSON object (ADS-0004).`,
               );
               continue;
             }
@@ -2055,21 +2346,8 @@ function validateRequiresActionNextAction(
     return;
   }
 
-  const actionVariants = collectPropertyObjectVariants(nextActionProp, ctx.resolve);
-  for (const actionVariant of actionVariants) {
-    if (!actionVariant.isObjectLike || allowsNullConstraint(actionVariant.typeConstraint)) {
-      reportOnce(
-        ctx,
-        reported,
-        "next-action-non-object-branch",
-        nextActionLoc,
-        `${entryPrefix(entry)}: Every "nextAction" variant on "requires_action" must be a non-null structured object (ADS-0004).`,
-      );
-      continue;
-    }
-
-    const sensitiveFindings = findSensitiveCredentialKeysInVariant(actionVariant, ctx.resolve);
-    for (const finding of sensitiveFindings) {
+  const reportSensitiveFindings = (findings: readonly SensitiveKeyFinding[]): void => {
+    for (const finding of findings) {
       const loc =
         finding.location &&
         finding.location.source?.absoluteRef === entry.reportBaseLocation.source?.absoluteRef &&
@@ -2084,6 +2362,35 @@ function validateRequiresActionNextAction(
         `${entryPrefix(entry)}: Operation "nextAction" exposes sensitive credential key "${finding.keyName}" (${finding.pathLabel}). Pollable GET operation responses must not include high-sensitivity credentials (ADS-0004).`,
       );
     }
+  };
+
+  reportSensitiveFindings(
+    findSensitiveCredentialKeysInFragments(nextActionProp.fragments, ctx.resolve),
+  );
+
+  const actionCollected = collectPropertyObjectVariants(nextActionProp, ctx.resolve);
+  if (actionCollected.truncated) {
+    reportOnce(
+      ctx,
+      reported,
+      "next-action-variant-cap-exceeded",
+      nextActionLoc,
+      `${entryPrefix(entry)}: Operation "nextAction" schema exceeds the ${MAX_OBJECT_VARIANTS}-variant union analysis cap and could not be fully verified (ADS-0004).`,
+    );
+  }
+  for (const actionVariant of actionCollected.variants) {
+    if (!isNonNullObjectConstraint(actionVariant.typeConstraint)) {
+      reportOnce(
+        ctx,
+        reported,
+        "next-action-non-object-branch",
+        nextActionLoc,
+        `${entryPrefix(entry)}: Every "nextAction" variant on "requires_action" must be a non-null structured object (ADS-0004).`,
+      );
+      continue;
+    }
+
+    reportSensitiveFindings(findSensitiveCredentialKeysInVariant(actionVariant, ctx.resolve));
 
     const actionProps = actionVariant.properties;
     let hasTypeSynonym = false;
@@ -2237,6 +2544,122 @@ function validateRequiresActionNextAction(
   }
 }
 
+function extractActionTypeLiterals(
+  variant: FlattenedObjectVariant,
+  resolve: ResolverFn,
+): ReadonlySet<string> | null {
+  const nextActionProp = variant.properties.get("nextAction");
+  if (!nextActionProp) {
+    return null;
+  }
+  const actionCollected = collectPropertyObjectVariants(nextActionProp, resolve);
+  if (actionCollected.variants.length === 0) {
+    return null;
+  }
+  const types = new Set<string>();
+  for (const actionVariant of actionCollected.variants) {
+    const typeProp = actionVariant.properties.get("type");
+    if (!typeProp) {
+      return null;
+    }
+    const lit = propertyStringLiterals(typeProp, resolve);
+    if (lit.kind !== "values" || lit.values.size === 0) {
+      return null;
+    }
+    for (const value of lit.values) {
+      types.add(value);
+    }
+  }
+  return types.size > 0 ? types : null;
+}
+
+function setsIntersect(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
+  for (const item of a) {
+    if (b.has(item)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function areVariantsDisjointOnOtherFields(
+  a: FlattenedObjectVariant,
+  b: FlattenedObjectVariant,
+  resolve: ResolverFn,
+): boolean {
+  const aTypeProp = a.properties.get("type");
+  const bTypeProp = b.properties.get("type");
+  if (aTypeProp && bTypeProp) {
+    const aTypeLit = propertyStringLiterals(aTypeProp, resolve);
+    const bTypeLit = propertyStringLiterals(bTypeProp, resolve);
+    if (
+      aTypeLit.kind === "values" &&
+      bTypeLit.kind === "values" &&
+      aTypeLit.values.size > 0 &&
+      bTypeLit.values.size > 0 &&
+      !setsIntersect(aTypeLit.values, bTypeLit.values)
+    ) {
+      return true;
+    }
+  }
+
+  for (const key of a.required) {
+    if (key === "status" || !b.required.has(key)) {
+      continue;
+    }
+    const aProp = a.properties.get(key);
+    const bProp = b.properties.get(key);
+    if (!aProp || !bProp) {
+      continue;
+    }
+    const aTc = propertyTypeConstraint(aProp, resolve);
+    const bTc = propertyTypeConstraint(bProp, resolve);
+    if (
+      aTc.allowed.size > 0 &&
+      bTc.allowed.size > 0 &&
+      combineTypeConstraintAllOf(aTc, bTc).allowed.size === 0
+    ) {
+      return true;
+    }
+    const aLit = propertyStringLiterals(aProp, resolve);
+    const bLit = propertyStringLiterals(bProp, resolve);
+    if (
+      aLit.kind === "values" &&
+      bLit.kind === "values" &&
+      aLit.values.size > 0 &&
+      bLit.values.size > 0 &&
+      !setsIntersect(aLit.values, bLit.values)
+    ) {
+      return true;
+    }
+  }
+
+  const aActionTypes = extractActionTypeLiterals(a, resolve);
+  const bActionTypes = extractActionTypeLiterals(b, resolve);
+  if (aActionTypes && bActionTypes && !setsIntersect(aActionTypes, bActionTypes)) {
+    return true;
+  }
+
+  return false;
+}
+
+function shareDifferentOneOfBranch(a: FlattenedObjectVariant, b: FlattenedObjectVariant): boolean {
+  for (const [oneOfId, aBranches] of a.oneOfBranches.entries()) {
+    const bBranches = b.oneOfBranches.get(oneOfId);
+    if (!bBranches) {
+      continue;
+    }
+    for (const aIdx of aBranches) {
+      for (const bIdx of bBranches) {
+        if (aIdx !== bIdx) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
 export const ads0004OperationStatusInvariants: RedoclyOas3Rule = (options = {}) => {
   const ignoreMatcher = createRuleIgnoreMatcher(options);
 
@@ -2247,11 +2670,29 @@ export const ads0004OperationStatusInvariants: RedoclyOas3Rule = (options = {}) 
         const reported = new Set<string>();
 
         for (const entry of entries) {
+          if (entry.truncated) {
+            reportOnce(
+              ctx,
+              reported,
+              "variant-cap-exceeded",
+              entry.reportBaseLocation,
+              `${entryPrefix(entry)}: Operation schema exceeds the ${MAX_OBJECT_VARIANTS}-variant union analysis cap and could not be fully verified (ADS-0004).`,
+            );
+          }
+
+          const checkedVariants: {
+            readonly variant: FlattenedObjectVariant;
+            readonly statuses: readonly CanonicalOperationStatus[];
+          }[] = [];
+
           for (const variant of entry.variants) {
             if (isVariantIgnored(variant, entry, ignoreMatcher)) {
               continue;
             }
-            if (!variant.isObjectLike || isSingleKeyOperationWrapper(variant, ctx.resolve)) {
+            if (
+              !isNonNullObjectConstraint(variant.typeConstraint) ||
+              isSingleKeyOperationWrapper(variant, ctx.resolve)
+            ) {
               continue;
             }
 
@@ -2268,6 +2709,22 @@ export const ads0004OperationStatusInvariants: RedoclyOas3Rule = (options = {}) 
               .sort();
             if (statuses.length === 0) {
               continue;
+            }
+
+            checkedVariants.push({ variant, statuses });
+
+            for (const branchSet of variant.oneOfBranches.values()) {
+              if (branchSet.size >= 2) {
+                for (const overlapStatus of statuses) {
+                  reportOnce(
+                    ctx,
+                    reported,
+                    `oneof-status-overlap:${overlapStatus}`,
+                    entry.reportBaseLocation,
+                    `${entryPrefix(entry)}: Operation "oneOf" union matches status "${overlapStatus}" in multiple branches. Each status value in a discriminated "oneOf" union must match at most one branch (ADS-0004).`,
+                  );
+                }
+              }
             }
 
             const hasRequiresAction = statuses.includes("requires_action");
@@ -2480,6 +2937,37 @@ export const ads0004OperationStatusInvariants: RedoclyOas3Rule = (options = {}) 
               }
             }
           }
+
+          for (let i = 0; i < checkedVariants.length; i += 1) {
+            const left = checkedVariants[i];
+            if (!left) {
+              continue;
+            }
+            for (let j = i + 1; j < checkedVariants.length; j += 1) {
+              const right = checkedVariants[j];
+              if (!right || !shareDifferentOneOfBranch(left.variant, right.variant)) {
+                continue;
+              }
+              const overlappingStatuses = left.statuses.filter((status) =>
+                right.statuses.includes(status),
+              );
+              if (overlappingStatuses.length === 0) {
+                continue;
+              }
+              if (areVariantsDisjointOnOtherFields(left.variant, right.variant, ctx.resolve)) {
+                continue;
+              }
+              for (const overlapStatus of overlappingStatuses) {
+                reportOnce(
+                  ctx,
+                  reported,
+                  `oneof-status-overlap:${overlapStatus}`,
+                  entry.reportBaseLocation,
+                  `${entryPrefix(entry)}: Operation "oneOf" union matches status "${overlapStatus}" in multiple branches. Each status value in a discriminated "oneOf" union must match at most one branch (ADS-0004).`,
+                );
+              }
+            }
+          }
         }
       },
     },
@@ -2596,7 +3084,10 @@ export const ads0004OperationCancelMethod: RedoclyOas3Rule = (options = {}) => {
             let has200Json = false;
 
             if (responses) {
-              for (const statusCode of ["200", "2XX"] as const) {
+              const statusCodesToCheck = isRecord(responses["200"])
+                ? (["200"] as const)
+                : (["2XX"] as const);
+              for (const statusCode of statusCodesToCheck) {
                 const rawResponse = responses[statusCode];
                 if (!isRecord(rawResponse)) {
                   continue;

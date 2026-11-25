@@ -426,9 +426,13 @@ describe("ADS-0004 unit helpers", () => {
     expect(isOperationSchemaName("PlanChangeOperation")).toBe(true);
     expect(isOperationSchemaName("OperationResponse")).toBe(true);
     expect(isOperationSchemaName("OperationStatus")).toBe(true);
+    expect(isOperationSchemaName("Legacy-Operation")).toBe(true);
+    expect(isOperationSchemaName("v1.PlanChangeOperation")).toBe(true);
     expect(isOperationSchemaName("plan_change_operation")).toBe(true);
+    expect(isOperationSchemaName("plan-change-operation")).toBe(true);
     expect(isOperationSchemaName("OperationListResponse")).toBe(false);
     expect(isOperationSchemaName("Cooperation")).toBe(false);
+    expect(isOperationSchemaName("cooperation")).toBe(false);
     expect(isOperationSchemaName("Project")).toBe(false);
   });
 });
@@ -1915,5 +1919,691 @@ describe("ADS-0004 Redocly end-to-end rules", () => {
     const { exitCode, report } = await lintOpenApi(doc);
     expect(ads0004Problems(report)).toEqual([]);
     expect(exitCode).toBe(0);
+  });
+
+  it("prunes unsatisfiable branches when allOf narrows an existing Operation union on status", async () => {
+    const pathParam = (name: string) => ({
+      name,
+      in: "path",
+      required: true,
+      schema: { type: "string" },
+    });
+    const doc = baseOpenApi({
+      paths: {
+        "/v1/projects/{projectId}/plan-changes": {
+          parameters: [pathParam("projectId")],
+          post: {
+            operationId: "startPlanChange",
+            summary: "Start plan change",
+            responses: {
+              "202": {
+                description: "Accepted with pending-only narrowed union",
+                headers: {
+                  Location: {
+                    required: true,
+                    schema: { type: "string", format: "uri" },
+                  },
+                },
+                content: {
+                  "application/json": {
+                    schema: {
+                      allOf: [
+                        { $ref: "#/components/schemas/PlanChangeOperation" },
+                        {
+                          type: "object",
+                          properties: {
+                            status: { type: "string", const: "pending" },
+                          },
+                        },
+                      ],
+                    },
+                  },
+                },
+              },
+              "400": { description: "Bad request" },
+            },
+          },
+        },
+        "/v1/projects/{projectId}/operations/{operationId}": {
+          parameters: [pathParam("projectId"), pathParam("operationId")],
+          get: {
+            operationId: "getProjectOperation",
+            summary: "Get project operation",
+            responses: {
+              "200": {
+                description: "Operation status",
+                content: {
+                  "application/json": {
+                    schema: { $ref: "#/components/schemas/PlanChangeOperation" },
+                  },
+                },
+              },
+              "404": { description: "Not found" },
+            },
+          },
+        },
+      },
+      components: {
+        schemas: canonicalValidOperationComponents(),
+      },
+    });
+
+    const { exitCode, report } = await lintOpenApi(doc);
+    expect(ads0004Problems(report)).toEqual([]);
+    expect(exitCode).toBe(0);
+  });
+
+  it("preserves nested nextAction variants during deduplication and inspects patternProperties for credentials", async () => {
+    const pathParam = (name: string) => ({
+      name,
+      in: "path",
+      required: true,
+      schema: { type: "string" },
+    });
+    const doc = baseOpenApi({
+      paths: {
+        "/v1/projects/{projectId}/operations/{operationId}": {
+          parameters: [pathParam("projectId"), pathParam("operationId")],
+          get: {
+            operationId: "getDuplicateShapeActionOp",
+            responses: {
+              "200": {
+                description: "Two inline verify_dns variants sharing details:object shape",
+                content: {
+                  "application/json": {
+                    schema: canonicalOperationBranch("requires_action", {
+                      completedAt: { type: "null" },
+                      response: { type: "null" },
+                      error: { type: "null" },
+                      extraRequired: ["nextAction"],
+                      nextAction: {
+                        oneOf: [
+                          {
+                            type: "object",
+                            required: ["type", "details"],
+                            properties: {
+                              type: { type: "string", const: "verify_dns" },
+                              details: {
+                                type: "object",
+                                required: ["record"],
+                                properties: {
+                                  record: { type: "string" },
+                                },
+                              },
+                            },
+                          },
+                          {
+                            type: "object",
+                            required: ["type", "details"],
+                            properties: {
+                              type: { type: "string", const: "verify_dns" },
+                              details: {
+                                type: "object",
+                                required: ["clientSecret"],
+                                properties: {
+                                  clientSecret: { type: "string" },
+                                },
+                              },
+                            },
+                          },
+                        ],
+                      },
+                    }),
+                  },
+                },
+              },
+            },
+          },
+        },
+        "/v1/projects/{projectId}/pattern-ops/operations/{operationId}": {
+          parameters: [pathParam("projectId"), pathParam("operationId")],
+          get: {
+            operationId: "getPatternPropertiesActionOp",
+            responses: {
+              "200": {
+                description:
+                  "Credential exposed via patternProperties and safe generic map pattern",
+                content: {
+                  "application/json": {
+                    schema: canonicalOperationBranch("requires_action", {
+                      completedAt: { type: "null" },
+                      response: { type: "null" },
+                      error: { type: "null" },
+                      extraRequired: ["nextAction"],
+                      nextAction: {
+                        type: "object",
+                        required: ["type"],
+                        properties: {
+                          type: { type: "string", const: "verify_records" },
+                          items: {
+                            type: "array",
+                            items: {
+                              type: "object",
+                              patternProperties: {
+                                "^clientSecret$": { type: "string" },
+                                "^[a-zA-Z0-9_]+$": { type: "string" },
+                              },
+                            },
+                          },
+                          nestedEntries: {
+                            type: "object",
+                            patternProperties: {
+                              "^entry_": {
+                                type: "object",
+                                properties: {
+                                  apiKey: { type: "string" },
+                                },
+                              },
+                            },
+                          },
+                        },
+                      },
+                    }),
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    });
+
+    const { report } = await lintOpenApi(doc);
+    const invErrors = ads0004Problems(report).filter(
+      (problem) => problem.ruleId === "photon-ads/ads-0004-operation-status-invariants",
+    );
+    const messages = invErrors.map((e) => e.message);
+
+    expect(
+      messages.some((m) => m.includes('key "clientSecret"') && m.includes("details.clientSecret")),
+    ).toBe(true);
+    expect(
+      messages.some((m) => m.includes('key "clientSecret"') && m.includes("[/^clientSecret$/]")),
+    ).toBe(true);
+    expect(
+      messages.some(
+        (m) => m.includes('key "apiKey"') && m.includes("nestedEntries[/^entry_/].apiKey"),
+      ),
+    ).toBe(true);
+    expect(messages.some((m) => m.includes("^[a-zA-Z0-9_]+$"))).toBe(false);
+  });
+
+  it("handles OAS 3.0 nullable:true with non-null enum, enforces object-only responses, integer error.status, hyphenated *Operation names, and explicit 200 cancel precedence", async () => {
+    const pathParam = (name: string) => ({
+      name,
+      in: "path",
+      required: true,
+      schema: { type: "string" },
+    });
+    const oas30Doc = baseOpenApi({
+      openapi: "3.0.3",
+      paths: {
+        "/v1/projects/{projectId}/operations/{operationId}": {
+          parameters: [pathParam("projectId"), pathParam("operationId")],
+          get: {
+            operationId: "getOas30NullableNonNullEnumOp",
+            responses: {
+              "200": {
+                description: "Valid OAS 3.0 nullable:true with non-null enum",
+                content: {
+                  "application/json": {
+                    schema: {
+                      type: "object",
+                      required: [
+                        "id",
+                        "type",
+                        "status",
+                        "createdAt",
+                        "updatedAt",
+                        "completedAt",
+                        "response",
+                        "error",
+                      ],
+                      properties: {
+                        id: { type: "string" },
+                        type: { type: "string", enum: ["plan.change"] },
+                        status: { type: "string", nullable: true, enum: ["pending"] },
+                        createdAt: { type: "string", format: "date-time" },
+                        updatedAt: { type: "string", format: "date-time" },
+                        completedAt: { type: "string", nullable: true, enum: [null] },
+                        response: { type: "object", nullable: true, enum: [null] },
+                        error: { type: "object", nullable: true, enum: [null] },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    });
+    const oas30Result = await lintOpenApi(oas30Doc);
+    expect(ads0004Problems(oas30Result.report)).toEqual([]);
+
+    const badDoc = baseOpenApi({
+      paths: {
+        "/v1/projects/{projectId}/nullable-ops/operations/{operationId}": {
+          parameters: [pathParam("projectId"), pathParam("operationId")],
+          get: {
+            operationId: "getNullableOperation",
+            responses: {
+              "200": {
+                description: "Operation response allowing null",
+                content: {
+                  "application/json": {
+                    schema: {
+                      ...canonicalOperationBranch("pending", {
+                        completedAt: { type: "null" },
+                        response: { type: "null" },
+                        error: { type: "null" },
+                      }),
+                      type: ["object", "null"],
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+        "/v1/projects/{projectId}/untyped-ops/operations/{operationId}": {
+          parameters: [pathParam("projectId"), pathParam("operationId")],
+          get: {
+            operationId: "getUntypedOperation",
+            responses: {
+              "200": {
+                description: "Operation response omitting type: object",
+                content: {
+                  "application/json": {
+                    schema: {
+                      required: [
+                        "id",
+                        "type",
+                        "status",
+                        "createdAt",
+                        "updatedAt",
+                        "completedAt",
+                        "response",
+                        "error",
+                      ],
+                      properties: {
+                        id: { type: "string" },
+                        type: { type: "string", const: "plan.change" },
+                        status: { type: "string", const: "pending" },
+                        createdAt: { type: "string", format: "date-time" },
+                        updatedAt: { type: "string", format: "date-time" },
+                        completedAt: { type: "null" },
+                        response: { type: "null" },
+                        error: { type: "null" },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+        "/v1/projects/{projectId}/float-error-ops/operations/{operationId}": {
+          parameters: [pathParam("projectId"), pathParam("operationId")],
+          get: {
+            operationId: "getFloatErrorStatusOp",
+            responses: {
+              "200": {
+                description: "Failed op with non-integer error.status",
+                content: {
+                  "application/json": {
+                    schema: canonicalOperationBranch("failed", {
+                      completedAt: { type: "string", format: "date-time" },
+                      response: { type: "null" },
+                      error: {
+                        type: "object",
+                        required: ["type", "title", "status", "code"],
+                        properties: {
+                          type: { type: "string", format: "uri" },
+                          title: { type: "string" },
+                          status: { type: "number" },
+                          code: { type: "string" },
+                        },
+                      },
+                    }),
+                  },
+                },
+              },
+            },
+          },
+        },
+        "/v1/projects/{projectId}/legacy-trigger": {
+          parameters: [pathParam("projectId")],
+          post: {
+            operationId: "triggerLegacyHyphenOp",
+            responses: {
+              "202": {
+                description: "Missing Location header with hyphenated *Operation component name",
+                content: {
+                  "application/json": {
+                    schema: { $ref: "#/components/schemas/Legacy-Operation" },
+                  },
+                },
+              },
+            },
+          },
+        },
+        "/v1/projects/{projectId}/operations/{operationId}/cancel": {
+          parameters: [pathParam("projectId"), pathParam("operationId")],
+          post: {
+            operationId: "cancelWithBodyless200AndJson2XX",
+            responses: {
+              "200": {
+                description: "Bodyless 200 takes precedence over 2XX",
+              },
+              "2XX": {
+                description: "Wildcard 2XX with JSON body must not mask bodyless 200",
+                content: {
+                  "application/json": {
+                    schema: canonicalOperationBranch("cancelled", {
+                      completedAt: { type: "string", format: "date-time" },
+                      response: { type: "null" },
+                      error: { type: "null" },
+                    }),
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+      components: {
+        schemas: {
+          "Legacy-Operation": {
+            type: "object",
+            required: ["id", "status"],
+            properties: {
+              id: { type: "string" },
+              status: { type: "string", const: "pending" },
+            },
+          },
+        },
+      },
+    });
+
+    const badResult = await lintOpenApi(badDoc);
+    const problems = ads0004Problems(badResult.report);
+    const byRule = (ruleId: string) =>
+      problems.filter((p) => p.ruleId === ruleId).map((p) => p.message);
+
+    expect(
+      byRule("photon-ads/ads-0004-operation-resource-shape").some(
+        (m) => m.includes("nullable-ops") && m.includes("non-null flat top-level JSON object"),
+      ),
+    ).toBe(true);
+    expect(
+      byRule("photon-ads/ads-0004-operation-resource-shape").some(
+        (m) => m.includes("untyped-ops") && m.includes("non-null flat top-level JSON object"),
+      ),
+    ).toBe(true);
+    expect(
+      byRule("photon-ads/ads-0004-operation-resource-shape").some(
+        (m) => m.includes("float-error-ops") && m.includes('Operation "error.status"'),
+      ),
+    ).toBe(true);
+    expect(
+      byRule("photon-ads/ads-0004-accepted-operation-headers").some(
+        (m) => m.includes("legacy-trigger") && m.includes('declare a "Location" header'),
+      ),
+    ).toBe(true);
+    expect(
+      byRule("photon-ads/ads-0004-operation-cancel-method").some((m) =>
+        m.includes("must declare a 200 JSON response"),
+      ),
+    ).toBe(true);
+  });
+
+  it("reports overlapping status branches in oneOf unions while allowing anyOf and disjoint multi-type or multi-action oneOf unions", async () => {
+    const pathParam = (name: string) => ({
+      name,
+      in: "path",
+      required: true,
+      schema: { type: "string" },
+    });
+    const validMultiDoc = baseOpenApi({
+      paths: {
+        "/v1/projects/{projectId}/multi-type/operations/{operationId}": {
+          parameters: [pathParam("projectId"), pathParam("operationId")],
+          get: {
+            operationId: "getMultiTypeOperation",
+            responses: {
+              "200": {
+                description: "Disjoint operation types sharing status values in oneOf",
+                content: {
+                  "application/json": {
+                    schema: {
+                      oneOf: [
+                        canonicalOperationBranch("pending", {
+                          completedAt: { type: "null" },
+                          response: { type: "null" },
+                          error: { type: "null" },
+                          extraProperties: {
+                            type: { type: "string", const: "plan.change" },
+                          },
+                        }),
+                        canonicalOperationBranch("pending", {
+                          completedAt: { type: "null" },
+                          response: { type: "null" },
+                          error: { type: "null" },
+                          extraProperties: {
+                            type: { type: "string", const: "domain.verify" },
+                          },
+                        }),
+                      ],
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+        "/v1/projects/{projectId}/anyof-overlap/operations/{operationId}": {
+          parameters: [pathParam("projectId"), pathParam("operationId")],
+          get: {
+            operationId: "getAnyOfOverlapOperation",
+            responses: {
+              "200": {
+                description: "anyOf permits overlapping branches",
+                content: {
+                  "application/json": {
+                    schema: {
+                      anyOf: [
+                        canonicalOperationBranch("pending", {
+                          completedAt: { type: "null" },
+                          response: { type: "null" },
+                          error: { type: "null" },
+                        }),
+                        canonicalOperationBranch(["pending", "running"], {
+                          completedAt: { type: "null" },
+                          response: { type: "null" },
+                          error: { type: "null" },
+                        }),
+                      ],
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+        "/v1/projects/{projectId}/multi-action/operations/{operationId}": {
+          parameters: [pathParam("projectId"), pathParam("operationId")],
+          get: {
+            operationId: "getMultiActionOneOfOperation",
+            responses: {
+              "200": {
+                description: "Disjoint nextAction.type variants under requires_action",
+                content: {
+                  "application/json": {
+                    schema: {
+                      oneOf: [
+                        canonicalOperationBranch("requires_action", {
+                          completedAt: { type: "null" },
+                          response: { type: "null" },
+                          error: { type: "null" },
+                          extraRequired: ["nextAction"],
+                          nextAction: {
+                            type: "object",
+                            required: ["type", "url"],
+                            properties: {
+                              type: { type: "string", const: "redirect" },
+                              url: { type: "string", format: "uri" },
+                            },
+                          },
+                        }),
+                        canonicalOperationBranch("requires_action", {
+                          completedAt: { type: "null" },
+                          response: { type: "null" },
+                          error: { type: "null" },
+                          extraRequired: ["nextAction"],
+                          nextAction: {
+                            type: "object",
+                            required: ["type", "invoiceId"],
+                            properties: {
+                              type: { type: "string", const: "confirm_payment" },
+                              invoiceId: { type: "string" },
+                            },
+                          },
+                        }),
+                      ],
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    });
+    const validRes = await lintOpenApi(validMultiDoc);
+    expect(ads0004Problems(validRes.report)).toEqual([]);
+
+    const overlapDoc = baseOpenApi({
+      paths: {
+        "/v1/projects/{projectId}/overlap/operations/{operationId}": {
+          parameters: [pathParam("projectId"), pathParam("operationId")],
+          get: {
+            operationId: "getOverlappingOneOfOperation",
+            responses: {
+              "200": {
+                description: "oneOf branches overlapping on status pending",
+                content: {
+                  "application/json": {
+                    schema: {
+                      oneOf: [
+                        canonicalOperationBranch("pending", {
+                          completedAt: { type: "null" },
+                          response: { type: "null" },
+                          error: { type: "null" },
+                        }),
+                        canonicalOperationBranch(["pending", "running"], {
+                          completedAt: { type: "null" },
+                          response: { type: "null" },
+                          error: { type: "null" },
+                        }),
+                      ],
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+        "/v1/projects/{projectId}/duplicate-branch/operations/{operationId}": {
+          parameters: [pathParam("projectId"), pathParam("operationId")],
+          get: {
+            operationId: "getDuplicateOneOfOperation",
+            responses: {
+              "200": {
+                description: "Identical oneOf branches overlapping on status running",
+                content: {
+                  "application/json": {
+                    schema: {
+                      oneOf: [
+                        canonicalOperationBranch("running", {
+                          completedAt: { type: "null" },
+                          response: { type: "null" },
+                          error: { type: "null" },
+                        }),
+                        canonicalOperationBranch("running", {
+                          completedAt: { type: "null" },
+                          response: { type: "null" },
+                          error: { type: "null" },
+                        }),
+                      ],
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    });
+    const overlapRes = await lintOpenApi(overlapDoc);
+    const invMessages = ads0004Problems(overlapRes.report)
+      .filter((p) => p.ruleId === "photon-ads/ads-0004-operation-status-invariants")
+      .map((p) => p.message);
+
+    expect(
+      invMessages.some(
+        (m) => m.includes("overlap") && m.includes('matches status "pending" in multiple branches'),
+      ),
+    ).toBe(true);
+    expect(
+      invMessages.some(
+        (m) =>
+          m.includes("duplicate-branch") &&
+          m.includes('matches status "running" in multiple branches'),
+      ),
+    ).toBe(true);
+  });
+
+  it("reports incomplete analysis instead of silently truncating when an Operation union exceeds the variant cap", async () => {
+    const pathParam = (name: string) => ({
+      name,
+      in: "path",
+      required: true,
+      schema: { type: "string" },
+    });
+    const manyBranches = Array.from({ length: 260 }, (_, index) =>
+      canonicalOperationBranch("pending", {
+        completedAt: { type: "null" },
+        response: { type: "null" },
+        error: { type: "null" },
+        extraProperties: {
+          type: { type: "string", const: `resource_${index}.action` },
+        },
+      }),
+    );
+    const doc = baseOpenApi({
+      paths: {
+        "/v1/projects/{projectId}/huge/operations/{operationId}": {
+          parameters: [pathParam("projectId"), pathParam("operationId")],
+          get: {
+            operationId: "getHugeUnionOperation",
+            responses: {
+              "200": {
+                description: "Union exceeding 256-variant cap",
+                content: {
+                  "application/json": {
+                    schema: { oneOf: manyBranches },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    });
+
+    const { report } = await lintOpenApi(doc);
+    const messages = ads0004Problems(report).map((p) => p.message);
+    expect(messages.some((m) => m.includes("256-variant union analysis cap"))).toBe(true);
   });
 });
