@@ -4,7 +4,6 @@ import {
   hasHeaderCaseInsensitive,
   inspectResponseContent,
   resolveOperationParameters,
-  resolveParameterObject,
   resolvePathItemWithLocation,
 } from "./openapi-utils.js";
 import {
@@ -374,20 +373,30 @@ describe("shared schema and OpenAPI utilities", () => {
     expect(resolved.operationLocation("patch").source?.absoluteRef).toBe("a.yaml");
   });
 
-  it("merges path-level and operation-level parameters with $ref resolution and case-insensitive header overrides", () => {
+  it("merges path-level and operation-level parameters with $ref resolution, ignoring unsupported Reference Object siblings", () => {
     const idempotencyTarget = {
       name: "Idempotency-Key",
       in: "header",
       schema: { type: "string" },
     };
+    const deprecatedTarget = {
+      name: "Idempotency-Key",
+      in: "header",
+      deprecated: true,
+      schema: { type: "string" },
+    };
     const chainedAlias = {
       $ref: "#/components/parameters/IdempotencyKey",
-      description: "Chained alias",
+      deprecated: true,
     };
     const resolve = makeResolver({
       "#/components/parameters/IdempotencyKey": {
         node: idempotencyTarget,
         pointer: "#/components/parameters/IdempotencyKey",
+      },
+      "#/components/parameters/DeprecatedIdempotencyKey": {
+        node: deprecatedTarget,
+        pointer: "#/components/parameters/DeprecatedIdempotencyKey",
       },
       "#/components/parameters/IdempotencyAlias": {
         node: idempotencyTarget,
@@ -399,19 +408,9 @@ describe("shared schema and OpenAPI utilities", () => {
       },
     });
 
-    // OAS 3.1 sibling override on $ref Parameter
-    const deprecatedSibling = resolveParameterObject(
-      resolve,
-      { $ref: "#/components/parameters/IdempotencyAlias", deprecated: true },
-      makeLocation("#/paths/~1v1~1items/get/parameters/0"),
-    );
-    expect(deprecatedSibling?.resolvedFromRef).toBe(true);
-    expect(deprecatedSibling?.node.name).toBe("Idempotency-Key");
-    expect(deprecatedSibling?.node.deprecated).toBe(true);
-    expect(deprecatedSibling?.node.description).toBe("Chained alias");
-
-    // Path-level Idempotency-Key overridden case-insensitively on GET, inherited on HEAD,
-    // while case-sensitive query parameters with different casing stay distinct.
+    // Path-level Idempotency-Key overridden by a full operation-level Parameter Object on GET
+    // (case-insensitive header match), inherited on HEAD, while Reference Object siblings like
+    // deprecated: true/false on $ref or intermediate hops are ignored per OpenAPI 3.1.
     const rawPathItem = {
       parameters: [
         { $ref: "#/components/parameters/IdempotencyKey" },
@@ -426,6 +425,16 @@ describe("shared schema and OpenAPI utilities", () => {
       },
       head: {
         operationId: "headItems",
+      },
+      post: {
+        operationId: "postWithUnsupportedRefSibling",
+        parameters: [{ $ref: "#/components/parameters/IdempotencyAlias", deprecated: true }],
+      },
+      put: {
+        operationId: "putWithUnsupportedFalseSibling",
+        parameters: [
+          { $ref: "#/components/parameters/DeprecatedIdempotencyKey", deprecated: false },
+        ],
       },
     };
     const pathEntry = resolvePathItemWithLocation(
@@ -455,5 +464,19 @@ describe("shared schema and OpenAPI utilities", () => {
     expect(headHeader?.source).toBe("path");
     expect(headHeader?.resolvedFromRef).toBe(true);
     expect(headHeader?.reportLocation.pointer).toBe("#/paths/~1v1~1items/head");
+
+    const postHeader = resolveOperationParameters(pathEntry, "post", resolve).find(
+      (p) => p.in === "header",
+    );
+    expect(postHeader?.name).toBe("Idempotency-Key");
+    expect(postHeader?.deprecated).toBe(false);
+    expect(postHeader?.resolvedFromRef).toBe(true);
+
+    const putHeader = resolveOperationParameters(pathEntry, "put", resolve).find(
+      (p) => p.in === "header",
+    );
+    expect(putHeader?.name).toBe("Idempotency-Key");
+    expect(putHeader?.deprecated).toBe(true);
+    expect(putHeader?.resolvedFromRef).toBe(true);
   });
 });

@@ -8,12 +8,7 @@ import {
   safeResolveRecord,
   type UnknownRecord,
 } from "./schema-utils.js";
-import type {
-  RedoclyLocation,
-  RedoclyOas3Rule,
-  RedoclyResolveResult,
-  RedoclyUserContext,
-} from "./types.js";
+import type { RedoclyLocation, RedoclyOas3Rule, RedoclyUserContext } from "./types.js";
 
 export const JSON_MEDIA_TYPE_RE =
   /^application\/(?!problem\+json(?:\s*;|$))(?:[^;]+\+)?json(?:\s*;|$)/i;
@@ -84,52 +79,6 @@ export interface ResolvedPathItem {
   operationReportLocation(method: string): RedoclyLocation;
 }
 
-function mergeResolvedRefRecord(
-  rawNode: UnknownRecord,
-  resolvedNode: UnknownRecord,
-  resolved: RedoclyResolveResult<UnknownRecord>,
-  usageLocation: RedoclyLocation,
-): {
-  readonly node: UnknownRecord;
-  readonly targetLocation: RedoclyLocation;
-  readonly localKeys: ReadonlySet<string>;
-  readonly fieldLocations: ReadonlyMap<string, RedoclyLocation>;
-} {
-  const targetLocation = resolved.location ?? usageLocation;
-  const intermediateHops = getRefIntermediateHops(rawNode, resolved, { reverse: true });
-  const localEntries = Object.entries(rawNode).filter(([key]) => key !== "$ref");
-
-  if (intermediateHops.length === 0 && localEntries.length === 0) {
-    return {
-      node: resolvedNode,
-      targetLocation,
-      localKeys: EMPTY_STRING_SET,
-      fieldLocations: EMPTY_LOCATION_MAP,
-    };
-  }
-
-  const merged: UnknownRecord = { ...resolvedNode };
-  const fieldLocations = new Map<string, RedoclyLocation>();
-  for (const hop of intermediateHops) {
-    const hopLocation = hop.location ?? targetLocation;
-    for (const [key, value] of Object.entries(hop.node)) {
-      if (key === "$ref") {
-        continue;
-      }
-      merged[key] = value;
-      fieldLocations.set(key, hopLocation);
-    }
-  }
-
-  const localKeys = new Set<string>();
-  for (const [key, value] of localEntries) {
-    merged[key] = value;
-    localKeys.add(key);
-    fieldLocations.set(key, usageLocation);
-  }
-  return { node: merged, targetLocation, localKeys, fieldLocations };
-}
-
 export function resolvePathItemWithLocation(
   resolve: ResolverFn,
   pathTemplate: string,
@@ -190,41 +139,33 @@ export function resolvePathItemWithLocation(
     return buildEntry(localOnly, pathUsageLocation, false, localKeys, fieldLocations);
   }
 
-  const merged = mergeResolvedRefRecord(rawPathItem, resolved.node, resolved, pathUsageLocation);
-  return buildEntry(
-    merged.node,
-    merged.targetLocation,
-    true,
-    merged.localKeys,
-    merged.fieldLocations,
-  );
-}
+  const targetLocation = resolved.location ?? pathUsageLocation;
+  const intermediateHops = getRefIntermediateHops(rawPathItem, resolved, { reverse: true });
 
-export function resolveParameterObject(
-  resolve: ResolverFn,
-  rawParam: unknown,
-  usageLocation: RedoclyLocation,
-): {
-  readonly node: UnknownRecord;
-  readonly location: RedoclyLocation;
-  readonly resolvedFromRef: boolean;
-} | null {
-  if (!isRecord(rawParam)) {
-    return null;
+  if (intermediateHops.length === 0 && localEntries.length === 0) {
+    return buildEntry(resolved.node, targetLocation, true, EMPTY_STRING_SET, EMPTY_LOCATION_MAP);
   }
-  if (typeof rawParam.$ref !== "string") {
-    return { node: rawParam, location: usageLocation, resolvedFromRef: false };
+
+  const merged: UnknownRecord = { ...resolved.node };
+  const fieldLocations = new Map<string, RedoclyLocation>();
+  for (const hop of intermediateHops) {
+    const hopLocation = hop.location ?? targetLocation;
+    for (const [key, value] of Object.entries(hop.node)) {
+      if (key === "$ref") {
+        continue;
+      }
+      merged[key] = value;
+      fieldLocations.set(key, hopLocation);
+    }
   }
-  const resolved = safeResolveRecord(resolve, rawParam, usageLocation.source?.absoluteRef);
-  if (!resolved?.node) {
-    return null;
+
+  const localKeys = new Set<string>();
+  for (const [key, value] of localEntries) {
+    merged[key] = value;
+    localKeys.add(key);
+    fieldLocations.set(key, pathUsageLocation);
   }
-  const merged = mergeResolvedRefRecord(rawParam, resolved.node, resolved, usageLocation);
-  return {
-    node: merged.node,
-    location: merged.targetLocation,
-    resolvedFromRef: true,
-  };
+  return buildEntry(merged, targetLocation, true, localKeys, fieldLocations);
 }
 
 export interface ResolvedOperationParameter {
@@ -266,7 +207,7 @@ export function resolveOperationParameters(
     }
     for (const [index, rawParam] of rawParams.entries()) {
       const usageLocation = listLocation.child([index]);
-      const resolved = resolveParameterObject(resolve, rawParam, usageLocation);
+      const resolved = resolveRecordWithLocation(resolve, rawParam, usageLocation);
       if (
         !resolved ||
         typeof resolved.node.name !== "string" ||

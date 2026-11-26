@@ -2941,17 +2941,23 @@ describe("ADS-0005 Redocly CLI end-to-end linting", () => {
             responses: ok200,
           },
         },
+        // Allowed: $ref to deprecated component Parameter Object (even with unsupported
+        // deprecated: false sibling on Reference Object).
+        // Disallowed: $ref to active component Parameter Object with unsupported deprecated: true
+        // sibling on Reference Object must still be reported per OpenAPI 3.1.
         "/v1/projects/{projectId}/ref-deprecated-idempotency": {
           parameters: [pathParam("projectId")],
           get: {
             operationId: "getRefDeprecatedIdempotency",
             summary: "GET with deprecated component parameter",
-            parameters: [{ $ref: "#/components/parameters/DeprecatedIdempotencyKey" }],
+            parameters: [
+              { $ref: "#/components/parameters/DeprecatedIdempotencyKey", deprecated: false },
+            ],
             responses: ok200,
           },
           head: {
-            operationId: "headSiblingDeprecatedIdempotency",
-            summary: "HEAD with OAS 3.1 sibling deprecated override on $ref",
+            operationId: "headUnsupportedRefSiblingDeprecated",
+            summary: "HEAD with unsupported deprecated: true sibling on active $ref",
             parameters: [
               { $ref: "#/components/parameters/SharedIdempotencyKey", deprecated: true },
             ],
@@ -2985,7 +2991,7 @@ describe("ADS-0005 Redocly CLI end-to-end linting", () => {
     const errors = ads0005ProblemsFor(report, "ads-0005-standard-http-methods");
     const messages = errors.map((e) => e.message);
 
-    expect(errors).toHaveLength(8);
+    expect(errors).toHaveLength(9);
     expect(
       messages.some(
         (m) =>
@@ -3031,9 +3037,16 @@ describe("ADS-0005 Redocly CLI end-to-end linting", () => {
     expect(messages.some((m) => m.includes('GET "/v1/projects/{projectId}/override-active"'))).toBe(
       true,
     );
+    expect(
+      messages.some((m) =>
+        m.includes('HEAD "/v1/projects/{projectId}/ref-deprecated-idempotency"'),
+      ),
+    ).toBe(true);
+    expect(
+      messages.some((m) => m.includes('GET "/v1/projects/{projectId}/ref-deprecated-idempotency"')),
+    ).toBe(false);
     expect(messages.some((m) => m.startsWith("POST "))).toBe(false);
     expect(messages.some((m) => m.includes("safe-headers"))).toBe(false);
-    expect(messages.some((m) => m.includes("ref-deprecated-idempotency"))).toBe(false);
   });
 
   it("rejects state-mutating terminal action verbs on GET and HEAD while allowing POST, safe read paths, and ignore rules", async () => {
