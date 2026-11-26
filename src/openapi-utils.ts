@@ -8,7 +8,12 @@ import {
   safeResolveRecord,
   type UnknownRecord,
 } from "./schema-utils.js";
-import type { RedoclyLocation, RedoclyOas3Rule, RedoclyUserContext } from "./types.js";
+import type {
+  RedoclyLocation,
+  RedoclyOas3Rule,
+  RedoclyResolveResult,
+  RedoclyUserContext,
+} from "./types.js";
 
 export const JSON_MEDIA_TYPE_RE =
   /^application\/(?!problem\+json(?:\s*;|$))(?:[^;]+\+)?json(?:\s*;|$)/i;
@@ -73,9 +78,56 @@ export interface ResolvedPathItem {
   readonly pathItemLocation: RedoclyLocation;
   readonly pathFromRef: boolean;
   readonly localKeys: ReadonlySet<string>;
+  fieldLocation(field: string): RedoclyLocation;
   operationLocation(method: string): RedoclyLocation;
   isOperationFromRef(method: string): boolean;
   operationReportLocation(method: string): RedoclyLocation;
+}
+
+function mergeResolvedRefRecord(
+  rawNode: UnknownRecord,
+  resolvedNode: UnknownRecord,
+  resolved: RedoclyResolveResult<UnknownRecord>,
+  usageLocation: RedoclyLocation,
+): {
+  readonly node: UnknownRecord;
+  readonly targetLocation: RedoclyLocation;
+  readonly localKeys: ReadonlySet<string>;
+  readonly fieldLocations: ReadonlyMap<string, RedoclyLocation>;
+} {
+  const targetLocation = resolved.location ?? usageLocation;
+  const intermediateHops = getRefIntermediateHops(rawNode, resolved, { reverse: true });
+  const localEntries = Object.entries(rawNode).filter(([key]) => key !== "$ref");
+
+  if (intermediateHops.length === 0 && localEntries.length === 0) {
+    return {
+      node: resolvedNode,
+      targetLocation,
+      localKeys: EMPTY_STRING_SET,
+      fieldLocations: EMPTY_LOCATION_MAP,
+    };
+  }
+
+  const merged: UnknownRecord = { ...resolvedNode };
+  const fieldLocations = new Map<string, RedoclyLocation>();
+  for (const hop of intermediateHops) {
+    const hopLocation = hop.location ?? targetLocation;
+    for (const [key, value] of Object.entries(hop.node)) {
+      if (key === "$ref") {
+        continue;
+      }
+      merged[key] = value;
+      fieldLocations.set(key, hopLocation);
+    }
+  }
+
+  const localKeys = new Set<string>();
+  for (const [key, value] of localEntries) {
+    merged[key] = value;
+    localKeys.add(key);
+    fieldLocations.set(key, usageLocation);
+  }
+  return { node: merged, targetLocation, localKeys, fieldLocations };
 }
 
 export function resolvePathItemWithLocation(
@@ -89,11 +141,12 @@ export function resolvePathItemWithLocation(
     pathItemLocation: RedoclyLocation,
     pathFromRef: boolean,
     localKeys: ReadonlySet<string>,
-    operationLocations: ReadonlyMap<string, RedoclyLocation>,
+    fieldLocations: ReadonlyMap<string, RedoclyLocation>,
   ): ResolvedPathItem => {
     const isOperationFromRef = (method: string): boolean => pathFromRef && !localKeys.has(method);
-    const operationLocation = (method: string): RedoclyLocation =>
-      (operationLocations.get(method) ?? pathItemLocation).child([method]);
+    const fieldLocation = (field: string): RedoclyLocation =>
+      (fieldLocations.get(field) ?? pathItemLocation).child([field]);
+    const operationLocation = (method: string): RedoclyLocation => fieldLocation(method);
     const operationReportLocation = (method: string): RedoclyLocation =>
       isOperationFromRef(method) ? pathUsageLocation.key() : operationLocation(method).key();
 
@@ -104,6 +157,7 @@ export function resolvePathItemWithLocation(
       pathItemLocation,
       pathFromRef,
       localKeys,
+      fieldLocation,
       operationLocation,
       isOperationFromRef,
       operationReportLocation,
@@ -127,42 +181,126 @@ export function resolvePathItemWithLocation(
     }
     const localOnly: UnknownRecord = {};
     const localKeys = new Set<string>();
-    const operationLocations = new Map<string, RedoclyLocation>();
+    const fieldLocations = new Map<string, RedoclyLocation>();
     for (const [key, value] of localEntries) {
       localOnly[key] = value;
       localKeys.add(key);
-      operationLocations.set(key, pathUsageLocation);
+      fieldLocations.set(key, pathUsageLocation);
     }
-    return buildEntry(localOnly, pathUsageLocation, false, localKeys, operationLocations);
+    return buildEntry(localOnly, pathUsageLocation, false, localKeys, fieldLocations);
   }
 
-  const targetLocation = resolved.location ?? pathUsageLocation;
-  const intermediateHops = getRefIntermediateHops(rawPathItem, resolved, { reverse: true });
+  const merged = mergeResolvedRefRecord(rawPathItem, resolved.node, resolved, pathUsageLocation);
+  return buildEntry(
+    merged.node,
+    merged.targetLocation,
+    true,
+    merged.localKeys,
+    merged.fieldLocations,
+  );
+}
 
-  if (intermediateHops.length === 0 && localEntries.length === 0) {
-    return buildEntry(resolved.node, targetLocation, true, EMPTY_STRING_SET, EMPTY_LOCATION_MAP);
+export function resolveParameterObject(
+  resolve: ResolverFn,
+  rawParam: unknown,
+  usageLocation: RedoclyLocation,
+): {
+  readonly node: UnknownRecord;
+  readonly location: RedoclyLocation;
+  readonly resolvedFromRef: boolean;
+} | null {
+  if (!isRecord(rawParam)) {
+    return null;
+  }
+  if (typeof rawParam.$ref !== "string") {
+    return { node: rawParam, location: usageLocation, resolvedFromRef: false };
+  }
+  const resolved = safeResolveRecord(resolve, rawParam, usageLocation.source?.absoluteRef);
+  if (!resolved?.node) {
+    return null;
+  }
+  const merged = mergeResolvedRefRecord(rawParam, resolved.node, resolved, usageLocation);
+  return {
+    node: merged.node,
+    location: merged.targetLocation,
+    resolvedFromRef: true,
+  };
+}
+
+export interface ResolvedOperationParameter {
+  readonly name: string;
+  readonly in: string;
+  readonly deprecated: boolean;
+  readonly node: UnknownRecord;
+  readonly source: "path" | "operation";
+  readonly usageLocation: RedoclyLocation;
+  readonly resolvedLocation: RedoclyLocation;
+  readonly resolvedFromRef: boolean;
+  readonly reportLocation: RedoclyLocation;
+}
+
+function parameterDedupeKey(paramIn: string, name: string): string {
+  return paramIn === "header" ? `${paramIn}:${name.toLowerCase()}` : `${paramIn}:${name}`;
+}
+
+export function resolveOperationParameters(
+  pathEntry: ResolvedPathItem,
+  method: string,
+  resolve: ResolverFn,
+): ResolvedOperationParameter[] {
+  const pathItem = pathEntry.pathItem;
+  const op = pathItem?.[method];
+  if (!isRecord(pathItem) || !isRecord(op)) {
+    return [];
   }
 
-  const merged: UnknownRecord = { ...resolved.node };
-  const operationLocations = new Map<string, RedoclyLocation>();
-  for (const hop of intermediateHops) {
-    const hopLocation = hop.location ?? targetLocation;
-    for (const [key, value] of Object.entries(hop.node)) {
-      if (key === "$ref") {
+  const effectiveByKey = new Map<string, ResolvedOperationParameter>();
+  const collectFrom = (
+    rawParams: unknown,
+    listLocation: RedoclyLocation,
+    source: "path" | "operation",
+    makeReportLocation: (usageLocation: RedoclyLocation) => RedoclyLocation,
+  ): void => {
+    if (!Array.isArray(rawParams)) {
+      return;
+    }
+    for (const [index, rawParam] of rawParams.entries()) {
+      const usageLocation = listLocation.child([index]);
+      const resolved = resolveParameterObject(resolve, rawParam, usageLocation);
+      if (
+        !resolved ||
+        typeof resolved.node.name !== "string" ||
+        typeof resolved.node.in !== "string"
+      ) {
         continue;
       }
-      merged[key] = value;
-      operationLocations.set(key, hopLocation);
+      const key = parameterDedupeKey(resolved.node.in, resolved.node.name);
+      effectiveByKey.set(key, {
+        name: resolved.node.name,
+        in: resolved.node.in,
+        deprecated: resolved.node.deprecated === true,
+        node: resolved.node,
+        source,
+        usageLocation,
+        resolvedLocation: resolved.location,
+        resolvedFromRef: resolved.resolvedFromRef,
+        reportLocation: makeReportLocation(usageLocation),
+      });
     }
-  }
+  };
 
-  const localKeys = new Set<string>();
-  for (const [key, value] of localEntries) {
-    merged[key] = value;
-    localKeys.add(key);
-    operationLocations.set(key, pathUsageLocation);
-  }
-  return buildEntry(merged, targetLocation, true, localKeys, operationLocations);
+  collectFrom(pathItem.parameters, pathEntry.fieldLocation("parameters"), "path", () =>
+    pathEntry.operationReportLocation(method),
+  );
+  collectFrom(
+    op.parameters,
+    pathEntry.operationLocation(method).child(["parameters"]),
+    "operation",
+    (usageLocation) =>
+      pathEntry.isOperationFromRef(method) ? pathEntry.pathUsageLocation.key() : usageLocation,
+  );
+
+  return [...effectiveByKey.values()];
 }
 
 export function iterateRootPathItems(

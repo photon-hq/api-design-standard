@@ -278,7 +278,7 @@ describe("docs-reference export", () => {
         id: "photon-ads/ads-0005-standard-http-methods",
         severity: "error",
         summary:
-          "Endpoints must use standard HTTP method semantics without CRUD verbs in URL segments, without combining PUT and PATCH on the same path, without GET request bodies, and without collection-level DELETE request bodies.",
+          "Endpoints must use standard HTTP method semantics without CRUD verbs in URL segments, without combining PUT and PATCH on the same path, without GET request bodies, without collection-level DELETE request bodies, and without non-deprecated Idempotency-Key headers or state-mutating terminal action verbs on GET or HEAD.",
       },
       {
         id: "photon-ads/ads-0005-standard-status-codes",

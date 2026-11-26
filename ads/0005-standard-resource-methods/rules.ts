@@ -7,6 +7,7 @@ import {
   inspectResponseContent,
   iterateRootPathItems,
   type ResolvedPathItem,
+  resolveOperationParameters,
 } from "../../src/openapi-utils.js";
 import {
   computeTypeConstraint,
@@ -57,7 +58,7 @@ export const ADS_0005_METADATA: AdsStandardMetadata = {
       id: `${PLUGIN_ID}/ads-0005-standard-http-methods`,
       severity: "error",
       summary:
-        "Endpoints must use standard HTTP method semantics without CRUD verbs in URL segments, without combining PUT and PATCH on the same path, without GET request bodies, and without collection-level DELETE request bodies.",
+        "Endpoints must use standard HTTP method semantics without CRUD verbs in URL segments, without combining PUT and PATCH on the same path, without GET request bodies, without collection-level DELETE request bodies, and without non-deprecated Idempotency-Key headers or state-mutating terminal action verbs on GET or HEAD.",
     },
     {
       name: "ads-0005-standard-status-codes",
@@ -111,6 +112,15 @@ const ACTION_VERB_PREFIXES = wordSet(`
   split start stop submit subscribe suspend sync terminate test transfer trigger
   unarchive unassign unbind undeploy unlink unlock unmute unpin unpublish unshare
   unsubscribe unsuspend validate verify void
+`);
+
+const SAFE_HTTP_METHODS = ["get", "head"] as const;
+
+const SAFE_METHOD_DISALLOWED_ACTION_SEGMENTS = wordSet(`
+  revoke cancel rotate retry resend archive restore enable disable transfer-ownership
+  pay purchase approve reject confirm submit trigger publish unpublish suspend
+  unsuspend activate deactivate refund void reset purge invalidate disconnect unlink
+  install uninstall deploy rollback pause resume verify
 `);
 
 const QUERY_OR_ACTION_POST_SEGMENTS = wordSet(`
@@ -213,6 +223,20 @@ export function findCrudVerbInPathSegment(segment: string): string | null {
     return camel[1].toLowerCase();
   }
   return null;
+}
+
+export function findMutatingTerminalActionSegment(pathTemplate: string): string | null {
+  const segments = splitPathSegments(pathTemplate);
+  const last = segments[segments.length - 1];
+  if (!last || isParamSegment(last) || last === ".well-known") {
+    return null;
+  }
+  if (findCrudVerbInPathSegment(last) !== null) {
+    return null;
+  }
+  const customMatch = CUSTOM_METHOD_PARAM_SEGMENT_RE.exec(last);
+  const target = (customMatch?.[2] ?? last).toLowerCase();
+  return SAFE_METHOD_DISALLOWED_ACTION_SEGMENTS.has(target) ? target : null;
 }
 
 export function isValidKebabCasePathSegment(segment: string, index: number): boolean {
@@ -1346,6 +1370,40 @@ export const ads0005StandardHttpMethods: RedoclyOas3Rule = createRootRule(
           loc,
           `DELETE "${pathTemplate}" must not declare a requestBody on a non-item path. Identify single-resource targets in the URL path, or use a dedicated POST batch endpoint for bulk deletions (ADS-0005).`,
         );
+      }
+
+      // 5 & 6. Safe RFC 9110 GET/HEAD checks: no Idempotency-Key header, no mutating terminal action verb
+      const mutatingAction = findMutatingTerminalActionSegment(pathTemplate);
+      for (const method of SAFE_HTTP_METHODS) {
+        const op = pathItem[method];
+        if (!isRecord(op) || ignoreMatcher.isIgnored({ path: pathTemplate, method })) {
+          continue;
+        }
+        const upperMethod = method.toUpperCase();
+
+        // 5. No non-deprecated Idempotency-Key header parameter on GET/HEAD
+        for (const param of resolveOperationParameters(pathEntry, method, ctx.resolve)) {
+          if (
+            param.in === "header" &&
+            !param.deprecated &&
+            param.name.toLowerCase() === "idempotency-key"
+          ) {
+            report(
+              `safe-method-idempotency-key:${method}`,
+              param.reportLocation,
+              `${upperMethod} "${pathTemplate}" must not declare a non-deprecated "${param.name}" header parameter. ${upperMethod} operations must be safe and side-effect-free per RFC 9110; use POST, PUT, PATCH, or DELETE for state-changing operations that require idempotency keys (ADS-0005).`,
+            );
+          }
+        }
+
+        // 6. No unmistakable state-mutating terminal action verb on GET/HEAD
+        if (mutatingAction !== null) {
+          report(
+            `safe-method-mutating-action:${method}:${mutatingAction}`,
+            pathEntry.operationReportLocation(method),
+            `${upperMethod} "${pathTemplate}" uses state-mutating action segment "${mutatingAction}". ${upperMethod} operations must be safe and read-only per RFC 9110; expose state-changing actions with POST instead (ADS-0005).`,
+          );
+        }
       }
     }
   },

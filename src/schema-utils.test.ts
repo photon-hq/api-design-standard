@@ -3,6 +3,8 @@ import {
   extractOperationJsonResponseSchemas,
   hasHeaderCaseInsensitive,
   inspectResponseContent,
+  resolveOperationParameters,
+  resolveParameterObject,
   resolvePathItemWithLocation,
 } from "./openapi-utils.js";
 import {
@@ -370,5 +372,88 @@ describe("shared schema and OpenAPI utilities", () => {
     expect(resolved.isOperationFromRef("patch")).toBe(true);
     expect(resolved.operationLocation("put").source?.absoluteRef).toBe("b.yaml");
     expect(resolved.operationLocation("patch").source?.absoluteRef).toBe("a.yaml");
+  });
+
+  it("merges path-level and operation-level parameters with $ref resolution and case-insensitive header overrides", () => {
+    const idempotencyTarget = {
+      name: "Idempotency-Key",
+      in: "header",
+      schema: { type: "string" },
+    };
+    const chainedAlias = {
+      $ref: "#/components/parameters/IdempotencyKey",
+      description: "Chained alias",
+    };
+    const resolve = makeResolver({
+      "#/components/parameters/IdempotencyKey": {
+        node: idempotencyTarget,
+        pointer: "#/components/parameters/IdempotencyKey",
+      },
+      "#/components/parameters/IdempotencyAlias": {
+        node: idempotencyTarget,
+        pointer: "#/components/parameters/IdempotencyKey",
+        chain: [
+          { node: chainedAlias, pointer: "#/components/parameters/IdempotencyAlias" },
+          { node: idempotencyTarget, pointer: "#/components/parameters/IdempotencyKey" },
+        ],
+      },
+    });
+
+    // OAS 3.1 sibling override on $ref Parameter
+    const deprecatedSibling = resolveParameterObject(
+      resolve,
+      { $ref: "#/components/parameters/IdempotencyAlias", deprecated: true },
+      makeLocation("#/paths/~1v1~1items/get/parameters/0"),
+    );
+    expect(deprecatedSibling?.resolvedFromRef).toBe(true);
+    expect(deprecatedSibling?.node.name).toBe("Idempotency-Key");
+    expect(deprecatedSibling?.node.deprecated).toBe(true);
+    expect(deprecatedSibling?.node.description).toBe("Chained alias");
+
+    // Path-level Idempotency-Key overridden case-insensitively on GET, inherited on HEAD,
+    // while case-sensitive query parameters with different casing stay distinct.
+    const rawPathItem = {
+      parameters: [
+        { $ref: "#/components/parameters/IdempotencyKey" },
+        { name: "Filter", in: "query", schema: { type: "string" } },
+      ],
+      get: {
+        operationId: "listItems",
+        parameters: [
+          { name: "idempotency-key", in: "header", deprecated: true, schema: { type: "string" } },
+          { name: "filter", in: "query", schema: { type: "string" } },
+        ],
+      },
+      head: {
+        operationId: "headItems",
+      },
+    };
+    const pathEntry = resolvePathItemWithLocation(
+      resolve,
+      "/v1/items",
+      rawPathItem,
+      makeLocation("#/paths/~1v1~1items"),
+    );
+
+    const getParams = resolveOperationParameters(pathEntry, "get", resolve);
+    expect(getParams).toHaveLength(3);
+    const getHeader = getParams.find((p) => p.in === "header");
+    expect(getHeader?.name).toBe("idempotency-key");
+    expect(getHeader?.deprecated).toBe(true);
+    expect(getHeader?.source).toBe("operation");
+    expect(getHeader?.reportLocation.pointer).toBe("#/paths/~1v1~1items/get/parameters/0");
+    expect(getParams.filter((p) => p.in === "query").map((p) => p.name)).toEqual([
+      "Filter",
+      "filter",
+    ]);
+
+    const headParams = resolveOperationParameters(pathEntry, "head", resolve);
+    expect(headParams).toHaveLength(2);
+    const headHeader = headParams.find((p) => p.in === "header");
+    expect(headHeader?.name).toBe("Idempotency-Key");
+    expect(headHeader?.deprecated).toBe(false);
+    expect(headHeader?.source).toBe("path");
+    expect(headHeader?.resolvedFromRef).toBe(true);
+    expect(headHeader?.reportLocation.pointer).toBe("#/paths/~1v1~1items/head");
   });
 });
