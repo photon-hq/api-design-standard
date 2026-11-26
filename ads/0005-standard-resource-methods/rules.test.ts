@@ -440,6 +440,13 @@ describe("ADS-0005 Redocly CLI end-to-end linting", () => {
   });
 
   it("allows valid CRUD resources, hoisted canonical reads, summary projections, lookup lists, composites, singletons, and custom actions", async () => {
+    // This ADS-0005 fixture intentionally includes legacy pagination fields (hasMore, nullable nextPageToken)
+    // to verify ADS-0005 collection-envelope recognition independently of ADS-0006.
+    const ads0005Config = await writeRedoclyConfig({
+      "photon-ads/ads-0006-standard-pagination-params": "off",
+      "photon-ads/ads-0006-page-size-bounds": "off",
+      "photon-ads/ads-0006-pagination-response-shape": "off",
+    });
     const doc = baseOpenApi({
       paths: {
         // Scoped list paired with hoisted canonical GET via identical $ref
@@ -842,7 +849,7 @@ describe("ADS-0005 Redocly CLI end-to-end linting", () => {
       },
     });
 
-    const { exitCode, report } = await lintOpenApi(doc);
+    const { exitCode, report } = await lintOpenApi(doc, ads0005Config);
     expect(ads0005Problems(report)).toEqual([]);
     expect(exitCode).toBe(0);
   });
@@ -1735,7 +1742,12 @@ describe("ADS-0005 Redocly CLI end-to-end linting", () => {
       },
     });
 
-    const { exitCode, report } = await lintOpenApi(validDoc);
+    const ads0005Oas30Config = await writeRedoclyConfig({
+      "photon-ads/ads-0006-standard-pagination-params": "off",
+      "photon-ads/ads-0006-page-size-bounds": "off",
+      "photon-ads/ads-0006-pagination-response-shape": "off",
+    });
+    const { exitCode, report } = await lintOpenApi(validDoc, ads0005Oas30Config);
     expect(exitCode).toBe(0);
     expect(ads0005Problems(report)).toEqual([]);
 

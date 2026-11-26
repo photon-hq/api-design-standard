@@ -128,7 +128,14 @@ describe("docs-reference export", () => {
       expect(first.overview.body).not.toMatch(pattern);
     }
 
-    expect(first.standards).toHaveLength(4);
+    expect(first.standards).toHaveLength(5);
+    expect(first.standards.map((standard) => standard.slug)).toEqual([
+      "ads-0001",
+      "ads-0002",
+      "ads-0004",
+      "ads-0005",
+      "ads-0006",
+    ]);
     const ads0001 = first.standards[0];
     expect(ads0001).toBeDefined();
     expect(ads0001?.ads).toBe("0001");
@@ -207,6 +214,9 @@ describe("docs-reference export", () => {
     expect(ads0002?.body).toContain("## Examples");
     expect(ads0002?.body).toContain("## Changelog");
     expect(ads0002?.body).toContain("Approved and published as `ADS-0002`.");
+    expect(ads0002?.body).toContain('"nextPageToken": "eyJjIjoiMjAyNi0xMS0yNiJ9"');
+    expect(ads0002?.body).toContain("`ADS-0006`");
+    expect(ads0002?.body).not.toContain("nextCursor");
     expect(ads0002?.body).not.toMatch(/^##\s+(?:Deterministic\s+)?Lint\s+Rules\b/im);
 
     const ads0004 = first.standards[2];
@@ -300,7 +310,53 @@ describe("docs-reference export", () => {
     expect(ads0005?.body).toContain("## Examples");
     expect(ads0005?.body).toContain("## Changelog");
     expect(ads0005?.body).toContain("Approved and published as `ADS-0005`.");
+    expect(ads0005?.body).toContain('"nextPageToken": "eyJjIjoiMjAyNi0xMS0yNiJ9"');
+    expect(ads0005?.body).not.toContain('"nextPageToken": null');
     expect(ads0005?.body).not.toMatch(/^##\s+(?:Deterministic\s+)?Lint\s+Rules\b/im);
+
+    const ads0006 = first.standards[4];
+    expect(ads0006).toBeDefined();
+    expect(ads0006?.ads).toBe("0006");
+    expect(ads0006?.slug).toBe("ads-0006");
+    expect(ads0006?.folder).toBe("0006-list-pagination");
+    expect(ads0006?.title).toBe("ADS-0006: List Pagination");
+    expect(ads0006?.sidebarTitle).toBe("ADS-0006 · List Pagination");
+    expect(ads0006?.description).toBe(
+      "Forward opaque token pagination using pageSize, pageToken, and nextPageToken, strict bounds validation, end-of-list omission, deterministic ordering, and unified error contracts across Photon public HTTP APIs.",
+    );
+    expect(ads0006?.status).toBe("Approved");
+    expect(ads0006?.updated).toBe("2026-11-26");
+    expect(ads0006?.rules).toEqual([
+      {
+        id: "photon-ads/ads-0006-standard-pagination-params",
+        severity: "error",
+        summary:
+          "GET operations must use optional pageSize, pageToken, and top-level nextPageToken symmetrically without non-standard pagination query parameters.",
+      },
+      {
+        id: "photon-ads/ads-0006-page-size-bounds",
+        severity: "error",
+        summary:
+          "GET query parameters pageSize (optional non-nullable integer with 1 <= minimum <= maximum <= 1000) and pageToken (optional non-nullable string with minLength >= 1) must declare strict schemas and bounds.",
+      },
+      {
+        id: "photon-ads/ads-0006-pagination-response-shape",
+        severity: "error",
+        summary:
+          "GET 200/2XX JSON responses must declare nextPageToken as an optional non-nullable string with minLength >= 1 at the top level, without legacy pagination properties or nested pagination wrappers.",
+      },
+    ]);
+    expect(ads0006?.body).not.toMatch(/^---/);
+    expect(ads0006?.body).not.toMatch(/^#\s+/);
+    expect(ads0006?.body).toContain("## Scope");
+    expect(ads0006?.body).toContain("## Normative Rules");
+    expect(ads0006?.body).toContain("## Examples");
+    expect(ads0006?.body).toContain("## Changelog");
+    expect(ads0006?.body).toContain("Approved and published as `ADS-0006`.");
+    expect(ads0006?.body).not.toMatch(/^##\s+(?:Deterministic\s+)?Lint\s+Rules\b/im);
+    expect(() =>
+      validateMintlifyMdxSafety("ads/0006-list-pagination/index.md", ads0006?.body ?? ""),
+    ).not.toThrow();
 
     for (const standard of first.standards) {
       expect(standard.status).toBe("Approved");
@@ -477,6 +533,7 @@ describe("docs-reference export", () => {
         "ads-0002",
         "ads-0004",
         "ads-0005",
+        "ads-0006",
       ]);
       expect(exported.standards.every((standard) => standard.status === "Approved")).toBe(true);
     } finally {
