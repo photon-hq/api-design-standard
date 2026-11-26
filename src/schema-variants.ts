@@ -62,10 +62,9 @@ export interface SchemaVariantWalkOps<T> {
   dedupeUnion?(variants: readonly T[]): readonly T[];
   tagUnionBranch?(
     unionKey: "oneOf" | "anyOf",
-    unionLocation: RedoclyLocation | undefined,
+    unionId: string,
     branchIndex: number,
     branchVariants: readonly T[],
-    nextAnonymousId: () => string,
   ): readonly T[];
   finalizeNode?(node: UnknownRecord, variants: readonly T[]): readonly T[];
 }
@@ -199,6 +198,11 @@ export function walkSchemaVariants<T>(
           continue;
         }
         const unionLocation = location?.child([unionKey]);
+        const unionId = ops.tagUnionBranch
+          ? unionLocation
+            ? locationKey(unionLocation)
+            : nextAnonymousId()
+          : "";
         const unionVariants: T[] = [];
         let branchHitCycle = false;
         for (const [index, branch] of branches.entries()) {
@@ -217,13 +221,7 @@ export function walkSchemaVariants<T>(
             truncated = true;
           }
           const tagged = ops.tagUnionBranch
-            ? ops.tagUnionBranch(
-                unionKey,
-                unionLocation,
-                index,
-                branchRes.variants,
-                nextAnonymousId,
-              )
+            ? ops.tagUnionBranch(unionKey, unionId, index, branchRes.variants)
             : branchRes.variants;
           unionVariants.push(...tagged);
         }
@@ -336,26 +334,26 @@ export function defaultFlattenedVariantSignature(
   resolve: ResolverFn,
 ): string {
   const types = formatAllowedTypes(variant.typeConstraint.allowed, ",");
-  const propKeys = [...variant.properties.keys()]
-    .sort()
-    .map((key) => {
-      const prop = variant.properties.get(key);
-      const tc = prop ? propertyTypeConstraint(prop, resolve) : UNCONSTRAINED_TYPE_CONSTRAINT;
-      const pTypes = formatAllowedTypes(tc.allowed, ",");
-      if (prop && tc.allowed.has("array")) {
-        const fragIds = prop.fragments
-          .map((frag) =>
-            frag.location ? locationKey(frag.location) : schemaNodeIdentity(frag.node),
-          )
-          .sort()
-          .join("+");
-        return `${key}:${pTypes}[${fragIds}]`;
-      }
-      return `${key}:${pTypes}`;
-    })
-    .join("|");
-  const reqKeys = [...variant.required].sort().join(",");
-  return `${types};${variant.isObjectLike ? 1 : 0};${variant.hasSchemaAdditionalProperties ? 1 : 0};${propKeys};${reqKeys}`;
+  const propEntries = [...variant.properties.keys()].sort().map((key) => {
+    const prop = variant.properties.get(key);
+    const tc = prop ? propertyTypeConstraint(prop, resolve) : UNCONSTRAINED_TYPE_CONSTRAINT;
+    const pTypes = formatAllowedTypes(tc.allowed, ",");
+    if (prop && tc.allowed.has("array")) {
+      const fragIds = prop.fragments
+        .map((frag) => (frag.location ? locationKey(frag.location) : schemaNodeIdentity(frag.node)))
+        .sort();
+      return [key, pTypes, fragIds] as const;
+    }
+    return [key, pTypes] as const;
+  });
+  const reqKeys = [...variant.required].sort();
+  return JSON.stringify([
+    types,
+    variant.isObjectLike ? 1 : 0,
+    variant.hasSchemaAdditionalProperties ? 1 : 0,
+    propEntries,
+    reqKeys,
+  ]);
 }
 
 export interface FlattenedVariantOptions {
@@ -543,19 +541,12 @@ export function collectFlattenedObjectVariants(
         combineFlattenedVariantSets(current, incoming, resolve, options),
       ...(options?.trackOneOfBranches
         ? {
-            tagUnionBranch: (
-              unionKey,
-              unionLocation,
-              branchIndex,
-              branchVariants,
-              nextAnonymousId,
-            ) => {
+            tagUnionBranch: (unionKey, unionId, branchIndex, branchVariants) => {
               if (unionKey !== "oneOf") {
                 return branchVariants;
               }
-              const oneOfId = unionLocation ? locationKey(unionLocation) : nextAnonymousId();
               const branchTag = new Map<string, ReadonlySet<number>>([
-                [oneOfId, new Set([branchIndex])],
+                [unionId, new Set([branchIndex])],
               ]);
               return branchVariants.map((variant) => ({
                 ...variant,

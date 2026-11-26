@@ -335,8 +335,11 @@ function collectArrayItemBranches(
     from: string | undefined,
     seen: ReadonlySet<unknown>,
   ): ArrayItemBranch[] => {
-    if (!isRecord(node) || seen.has(node)) {
+    if (node === false) {
       return [];
+    }
+    if (!isRecord(node) || seen.has(node)) {
+      return [[]];
     }
     if (!localTypeConstraint(node).allowed.has("array")) {
       return [];
@@ -348,6 +351,7 @@ function collectArrayItemBranches(
 
     const intersectWith = (incoming: ArrayItemBranch[]): void => {
       if (incoming.length === 0) {
+        branches = [];
         return;
       }
       const next: ArrayItemBranch[] = [];
@@ -376,10 +380,12 @@ function collectArrayItemBranches(
       ]);
     }
 
-    if (typeof node.$ref === "string") {
+    if (branches.length > 0 && typeof node.$ref === "string") {
       const resolved = safeResolveSchema(resolve, node, from);
       if (resolved) {
-        if (isRecord(resolved.node)) {
+        if (resolved.node === false) {
+          branches = [];
+        } else if (isRecord(resolved.node)) {
           intersectWith(
             visitNode(
               resolved.node,
@@ -389,58 +395,66 @@ function collectArrayItemBranches(
             ),
           );
         }
-        for (const hop of getRefIntermediateHops(node, resolved)) {
-          if (isRecord(hop.node.items)) {
-            const hopFrom = hop.location?.source?.absoluteRef;
-            const hopItemLoc = hop.location?.child(["items"]);
-            intersectWith([
-              [
-                {
-                  node: hop.node.items,
-                  ...(hopFrom !== undefined ? { from: hopFrom } : {}),
-                  ...(hopItemLoc ? { location: hopItemLoc } : {}),
-                },
-              ],
-            ]);
+        if (branches.length > 0) {
+          for (const hop of getRefIntermediateHops(node, resolved)) {
+            if (isRecord(hop.node.items)) {
+              const hopFrom = hop.location?.source?.absoluteRef;
+              const hopItemLoc = hop.location?.child(["items"]);
+              intersectWith([
+                [
+                  {
+                    node: hop.node.items,
+                    ...(hopFrom !== undefined ? { from: hopFrom } : {}),
+                    ...(hopItemLoc ? { location: hopItemLoc } : {}),
+                  },
+                ],
+              ]);
+            }
           }
         }
       }
     }
 
-    if (Array.isArray(node.allOf)) {
+    if (branches.length > 0 && Array.isArray(node.allOf)) {
       for (const [index, branch] of node.allOf.entries()) {
         intersectWith(visitNode(branch, location?.child(["allOf", index]), from, nextSeen));
+        if (branches.length === 0) {
+          break;
+        }
       }
     }
 
-    for (const unionKey of ["oneOf", "anyOf"] as const) {
-      const unionBranches = node[unionKey];
-      if (!Array.isArray(unionBranches) || unionBranches.length === 0) {
-        continue;
-      }
-      const collected: ArrayItemBranch[] = [];
-      for (const [index, branch] of unionBranches.entries()) {
-        if (!computeTypeConstraint(branch, resolve, from).allowed.has("array")) {
+    if (branches.length > 0) {
+      for (const unionKey of ["oneOf", "anyOf"] as const) {
+        const unionBranches = node[unionKey];
+        if (!Array.isArray(unionBranches) || unionBranches.length === 0) {
           continue;
         }
-        const sub = visitNode(branch, location?.child([unionKey, index]), from, nextSeen);
-        for (const item of sub) {
-          if (item.length > 0) {
+        const collected: ArrayItemBranch[] = [];
+        for (const [index, branch] of unionBranches.entries()) {
+          if (!computeTypeConstraint(branch, resolve, from).allowed.has("array")) {
+            continue;
+          }
+          const sub = visitNode(branch, location?.child([unionKey, index]), from, nextSeen);
+          for (const item of sub) {
             collected.push(item);
           }
         }
+        intersectWith(collected);
+        if (branches.length === 0) {
+          break;
+        }
       }
-      intersectWith(collected);
     }
 
-    return branches.filter((branch) => branch.length > 0);
+    return branches;
   };
 
   let combined: ArrayItemBranch[] = [[]];
   for (const frag of fragments) {
     const sub = visitNode(frag.node, frag.location, frag.from, new Set());
     if (sub.length === 0) {
-      continue;
+      return [];
     }
     const next: ArrayItemBranch[] = [];
     for (const a of combined) {
@@ -650,6 +664,19 @@ function variantsShareCompatibleScalarId(
   return false;
 }
 
+function arePropertyTypeConstraintsCompatible(a: TypeConstraint, b: TypeConstraint): boolean {
+  const overlap = intersectTypeSets(a.allowed, b.allowed);
+  if (overlap.size === 0) {
+    return false;
+  }
+  const aNonNull = new Set([...a.allowed].filter((t) => t !== "null"));
+  const bNonNull = new Set([...b.allowed].filter((t) => t !== "null"));
+  if (aNonNull.size > 0 && bNonNull.size > 0) {
+    return intersectTypeSets(aNonNull, bNonNull).size > 0;
+  }
+  return true;
+}
+
 function areVariantsStructurallyCompatible(
   listVariant: FlattenedObjectVariant,
   getVariant: FlattenedObjectVariant,
@@ -670,14 +697,14 @@ function areVariantsStructurallyCompatible(
       return false;
     }
     const listProp = listVariant.properties.get(reqName);
-    if (listProp) {
-      const overlap = intersectTypeSets(
-        propertyTypeConstraint(listProp, resolve).allowed,
-        propertyTypeConstraint(getProp, resolve).allowed,
-      );
-      if (overlap.size === 0) {
-        return false;
-      }
+    if (
+      listProp &&
+      !arePropertyTypeConstraintsCompatible(
+        propertyTypeConstraint(listProp, resolve),
+        propertyTypeConstraint(getProp, resolve),
+      )
+    ) {
+      return false;
     }
   }
 
@@ -694,11 +721,12 @@ function areVariantsStructurallyCompatible(
     if (!listProp || !getProp) {
       continue;
     }
-    const overlap = intersectTypeSets(
-      propertyTypeConstraint(listProp, resolve).allowed,
-      propertyTypeConstraint(getProp, resolve).allowed,
-    );
-    if (overlap.size === 0) {
+    if (
+      !arePropertyTypeConstraintsCompatible(
+        propertyTypeConstraint(listProp, resolve),
+        propertyTypeConstraint(getProp, resolve),
+      )
+    ) {
       return false;
     }
     hasCompatibleSharedField = true;
@@ -801,19 +829,28 @@ function getReturnsCollectionEnvelope(
   getOp: unknown,
   getLoc: RedoclyLocation,
   resolve: ResolverFn,
-): { readonly hasJsonSchema: boolean; readonly isCollection: boolean } {
+): {
+  readonly hasJsonSchema: boolean;
+  readonly isCollection: boolean;
+  readonly isAddressableCollection: boolean;
+} {
   if (!isRecord(getOp)) {
-    return { hasJsonSchema: false, isCollection: false };
+    return { hasJsonSchema: false, isCollection: false, isAddressableCollection: false };
   }
   const schemas = extractOperationJsonResponseSchemas(getOp, getLoc, resolve, ["200", "2XX"]);
   if (schemas.length === 0) {
-    return { hasJsonSchema: false, isCollection: false };
+    return { hasJsonSchema: false, isCollection: false, isAddressableCollection: false };
   }
+  let isCollection = false;
   for (const entry of schemas) {
     const collected = collectFlattenedObjectVariants(entry.schema, resolve, entry.schemaLocation);
     for (const variant of collected.variants) {
+      if (extractAddressableCollection(variant, resolve) !== null) {
+        return { hasJsonSchema: true, isCollection: true, isAddressableCollection: true };
+      }
       if (variant.typeConstraint.allowed.has("array")) {
-        return { hasJsonSchema: true, isCollection: true };
+        isCollection = true;
+        continue;
       }
       if (!variant.typeConstraint.allowed.has("object") || variant.properties.has("id")) {
         continue;
@@ -823,12 +860,12 @@ function getReturnsCollectionEnvelope(
           !COLLECTION_METADATA_KEYS.has(propName) &&
           propertyTypeConstraint(prop, resolve).allowed.has("array")
         ) {
-          return { hasJsonSchema: true, isCollection: true };
+          isCollection = true;
         }
       }
     }
   }
-  return { hasJsonSchema: true, isCollection: false };
+  return { hasJsonSchema: true, isCollection, isAddressableCollection: false };
 }
 
 interface IndexedPathEntry extends ResolvedPathItem {
@@ -929,6 +966,7 @@ function isOperationSatisfiedByHoistedGets(
   const responseSchemas = extractOperationJsonResponseSchemas(op, opLoc, resolve, [
     "200",
     "201",
+    "202",
     "2XX",
   ]);
   const addressableSchemas: Array<{
@@ -1101,7 +1139,7 @@ export const ads0005AddressableResourceRead: RedoclyOas3Rule = createRootRule(
           isRecord(pathItem.patch) ||
           isRecord(pathItem.put) ||
           isRecord(pathItem.delete) ||
-          hasAnyStrictDescendant(entries, structuralKey) ||
+          (!recognizedAction && hasAnyStrictDescendant(entries, structuralKey)) ||
           computeHoistedCollectionCandidates(segments).some((hoistedCol) =>
             hasAnyOperationOnStructuralKey(
               byStructuralKey,
@@ -1377,13 +1415,24 @@ export const ads0005StandardStatusCodes: RedoclyOas3Rule = createRootRule(
         const isQueryOrActionSegment = QUERY_OR_ACTION_POST_SEGMENTS.has(lastSegment.toLowerCase());
 
         let isCollectionCreation = hasDirectItemRoute;
-        if (!isCollectionCreation && hasSamePathGet && !isQueryOrActionSegment) {
+        if (!isCollectionCreation && hasSamePathGet) {
           const getInfo = getReturnsCollectionEnvelope(
             pathItem.get,
             entry.operationLocation("get"),
             ctx.resolve,
           );
-          if (getInfo.isCollection) {
+          if (isQueryOrActionSegment) {
+            if (
+              getInfo.isAddressableCollection &&
+              !getReturnsCollectionEnvelope(
+                pathItem.post,
+                entry.operationLocation("post"),
+                ctx.resolve,
+              ).isCollection
+            ) {
+              isCollectionCreation = true;
+            }
+          } else if (getInfo.isCollection) {
             isCollectionCreation = true;
           } else if (!getInfo.hasJsonSchema && looksLikePluralSubCollectionSegment(lastSegment)) {
             isCollectionCreation = true;

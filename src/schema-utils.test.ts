@@ -39,7 +39,15 @@ function makeLocation(pointer: string, absoluteRef = "openapi.yaml"): RedoclyLoc
 }
 
 function makeResolver(
-  targets: Record<string, { node: unknown; pointer: string; absoluteRef?: string }>,
+  targets: Record<
+    string,
+    {
+      node: unknown;
+      pointer: string;
+      absoluteRef?: string;
+      chain?: Array<{ node: unknown; pointer: string; absoluteRef?: string }>;
+    }
+  >,
 ): ResolverFn {
   return (<T = unknown>(node: { $ref: string }) => {
     const target = targets[node.$ref];
@@ -49,6 +57,14 @@ function makeResolver(
     return {
       node: target.node as T,
       location: makeLocation(target.pointer, target.absoluteRef ?? "openapi.yaml"),
+      ...(target.chain
+        ? {
+            chain: target.chain.map((hop) => ({
+              node: hop.node,
+              location: makeLocation(hop.pointer, hop.absoluteRef ?? "openapi.yaml"),
+            })),
+          }
+        : {}),
     };
   }) as ResolverFn;
 }
@@ -220,5 +236,139 @@ describe("shared schema and OpenAPI utilities", () => {
       true,
     );
     expect(hasHeaderCaseInsensitive({ "X-Other": {} }, "location")).toBe(false);
+  });
+
+  it("assigns one shared anonymous group ID across branches of a location-free oneOf", () => {
+    const resolve = makeResolver({});
+    const res = collectFlattenedObjectVariants(
+      {
+        oneOf: [
+          { type: "object", properties: { id: { type: "string" }, a: { type: "string" } } },
+          { type: "object", properties: { id: { type: "string" }, b: { type: "string" } } },
+        ],
+      },
+      resolve,
+      undefined,
+      { trackOneOfBranches: true },
+    );
+
+    expect(res.variants).toHaveLength(2);
+    const firstKeys = [...(res.variants[0]?.oneOfBranches.keys() ?? [])];
+    const secondKeys = [...(res.variants[1]?.oneOfBranches.keys() ?? [])];
+    expect(firstKeys).toHaveLength(1);
+    expect(secondKeys).toEqual(firstKeys);
+    expect([...(res.variants[0]?.oneOfBranches.get(firstKeys[0] ?? "") ?? [])]).toEqual([0]);
+    expect([...(res.variants[1]?.oneOfBranches.get(secondKeys[0] ?? "") ?? [])]).toEqual([1]);
+  });
+
+  it("keeps variants distinct when required or property names contain commas or delimiters", () => {
+    const resolve = makeResolver({});
+    const res = collectFlattenedObjectVariants(
+      {
+        oneOf: [
+          {
+            type: "object",
+            required: ["id", "city", "country"],
+            properties: {
+              id: { type: "string" },
+              city: { type: "string" },
+              country: { type: "string" },
+              "city,country": { type: "string" },
+            },
+          },
+          {
+            type: "object",
+            required: ["id", "city,country"],
+            properties: {
+              id: { type: "string" },
+              city: { type: "string" },
+              country: { type: "string" },
+              "city,country": { type: "string" },
+            },
+          },
+        ],
+      },
+      resolve,
+    );
+
+    expect(res.variants).toHaveLength(2);
+  });
+
+  it("gives declared explicit status codes precedence over 2XX in extractOperationJsonResponseSchemas", () => {
+    const resolve = makeResolver({});
+    const opLoc = makeLocation("#/paths/~1v1~1items~1{itemId}/get");
+
+    const text200With2xx = extractOperationJsonResponseSchemas(
+      {
+        responses: {
+          "200": { content: { "text/plain": { schema: { type: "string" } } } },
+          "2XX": {
+            content: { "application/json": { schema: { type: "object", properties: {} } } },
+          },
+        },
+      },
+      opLoc,
+      resolve,
+      ["200", "2XX"],
+    );
+    expect(text200With2xx).toHaveLength(0);
+
+    const text200WithJson201 = extractOperationJsonResponseSchemas(
+      {
+        responses: {
+          "200": { content: { "text/plain": { schema: { type: "string" } } } },
+          "201": {
+            content: { "application/json": { schema: { type: "object", properties: {} } } },
+          },
+        },
+      },
+      opLoc,
+      resolve,
+      ["200", "201", "2XX"],
+    );
+    expect(text200WithJson201).toHaveLength(1);
+    expect(text200WithJson201[0]?.responseLocation.pointer).toContain("/responses/201");
+  });
+
+  it("preserves intermediate Path Item operations and declaring locations across chained $refs", () => {
+    const targetB = {
+      put: { operationId: "putItem", responses: { "200": { description: "ok" } } },
+    };
+    const hopA = {
+      $ref: "./b.yaml",
+      patch: { operationId: "patchItem", responses: { "200": { description: "ok" } } },
+    };
+    const rootPathItem = { $ref: "./a.yaml" };
+    const resolve = makeResolver({
+      "./a.yaml": {
+        node: targetB,
+        pointer: "#",
+        absoluteRef: "b.yaml",
+        chain: [
+          {
+            node: rootPathItem,
+            pointer: "#/paths/~1v1~1items~1{itemId}",
+            absoluteRef: "root.yaml",
+          },
+          { node: hopA, pointer: "#", absoluteRef: "a.yaml" },
+          { node: targetB, pointer: "#", absoluteRef: "b.yaml" },
+        ],
+      },
+    });
+
+    const usageLoc = makeLocation("#/paths/~1v1~1items~1{itemId}", "root.yaml");
+    const resolved = resolvePathItemWithLocation(
+      resolve,
+      "/v1/items/{itemId}",
+      rootPathItem,
+      usageLoc,
+    );
+
+    expect(resolved.pathItem?.put).toBeDefined();
+    expect(resolved.pathItem?.patch).toBeDefined();
+    expect(resolved.isOperationFromRef("put")).toBe(true);
+    expect(resolved.isOperationFromRef("patch")).toBe(true);
+    expect(resolved.operationLocation("put").source?.absoluteRef).toBe("b.yaml");
+    expect(resolved.operationLocation("patch").source?.absoluteRef).toBe("a.yaml");
   });
 });

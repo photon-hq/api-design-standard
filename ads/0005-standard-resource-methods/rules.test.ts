@@ -2360,4 +2360,392 @@ describe("ADS-0005 Redocly CLI end-to-end linting", () => {
     ).toBe(true);
     expect(readMessages.some((m) => m.includes("/diamonds"))).toBe(false);
   });
+
+  it("enforces read symmetry, compatibility, status codes, and chained Path Item refs for edge cases", async () => {
+    const diamondSchemas: Record<string, unknown> = {
+      Diamond0: {
+        type: "object",
+        required: ["id", "title"],
+        properties: { id: { type: "string" }, title: { type: "string" } },
+      },
+    };
+    for (let i = 1; i <= 24; i += 1) {
+      diamondSchemas[`Diamond${i}`] = {
+        allOf: [
+          { $ref: `#/components/schemas/Diamond${i - 1}` },
+          { $ref: `#/components/schemas/Diamond${i - 1}` },
+        ],
+      };
+    }
+
+    const doc = baseOpenApi({
+      paths: {
+        // 1. Negative control for diamond DAG without hoisted GET
+        "/v1/organizations/{organizationId}/diamonds": {
+          parameters: [pathParam("organizationId")],
+          get: {
+            operationId: "listDiamondsNoGet",
+            summary: "List diamond items without item GET",
+            responses: {
+              "200": jsonResponse({
+                type: "object",
+                properties: {
+                  items: { type: "array", items: { $ref: "#/components/schemas/Diamond24" } },
+                },
+              }),
+            },
+          },
+        },
+        // 2. Array items with anyOf alternative inheriting outer items via minItems
+        "/v1/projects/{projectId}/inherited-items": {
+          parameters: [pathParam("projectId")],
+          get: {
+            operationId: "listInheritedItems",
+            summary: "List inherited array items",
+            responses: {
+              "200": jsonResponse({
+                type: "object",
+                properties: {
+                  data: {
+                    type: "array",
+                    items: {
+                      type: "object",
+                      required: ["id"],
+                      properties: { id: { type: "string" }, label: { type: "string" } },
+                    },
+                    anyOf: [{ minItems: 1 }, { items: { type: "string" } }],
+                  },
+                },
+              }),
+            },
+          },
+        },
+        // 3. Nullable shared field type mismatch ([string, null] vs [integer, null])
+        "/v1/organizations/{organizationId}/scores": {
+          parameters: [pathParam("organizationId")],
+          get: {
+            operationId: "listScores",
+            summary: "List scores",
+            responses: {
+              "200": jsonResponse({
+                type: "object",
+                properties: {
+                  data: {
+                    type: "array",
+                    items: {
+                      type: "object",
+                      required: ["id"],
+                      properties: {
+                        id: { type: "string" },
+                        score: { type: ["string", "null"] },
+                      },
+                    },
+                  },
+                },
+              }),
+            },
+          },
+        },
+        "/v1/scores/{scoreId}": {
+          parameters: [pathParam("scoreId")],
+          get: {
+            operationId: "getScore",
+            summary: "Get score with incompatible nullable type",
+            responses: {
+              "200": jsonResponse({
+                type: "object",
+                required: ["id"],
+                properties: {
+                  id: { type: "string" },
+                  score: { type: ["integer", "null"] },
+                },
+              }),
+            },
+          },
+        },
+        // 4. Scoped PATCH returning lifecycle-bearing resource in 202 vs incompatible hoisted GET
+        "/v1/organizations/{organizationId}/jobs/{jobId}": {
+          parameters: [pathParam("organizationId"), pathParam("jobId")],
+          patch: {
+            operationId: "patchJobAsyncResource",
+            summary: "Patch job returning lifecycle-bearing resource in 202",
+            responses: {
+              "202": jsonResponse({
+                type: "object",
+                required: ["id", "status", "title"],
+                properties: {
+                  id: { type: "string" },
+                  status: { type: "string" },
+                  title: { type: "string" },
+                },
+              }),
+            },
+          },
+        },
+        "/v1/jobs/{jobId}": {
+          parameters: [pathParam("jobId")],
+          get: {
+            operationId: "getJobIntId",
+            summary: "Incompatible hoisted job GET",
+            responses: {
+              "200": jsonResponse({
+                type: "object",
+                required: ["id", "title"],
+                properties: { id: { type: "integer" }, title: { type: "string" } },
+              }),
+            },
+          },
+        },
+        // 5. Scoped PATCH returning separate ADS-0004 Operation in 202 stays accepted
+        "/v1/organizations/{organizationId}/exports/{exportId}": {
+          parameters: [pathParam("organizationId"), pathParam("exportId")],
+          patch: {
+            operationId: "patchExportAsyncOp",
+            summary: "Patch export returning Operation in 202",
+            responses: {
+              "202": jsonResponse({
+                type: "object",
+                required: ["id", "status", "type", "createdAt", "updatedAt"],
+                properties: {
+                  id: { type: "string" },
+                  status: { type: "string" },
+                  type: { type: "string" },
+                  createdAt: { type: "string" },
+                  updatedAt: { type: "string" },
+                },
+              }),
+            },
+          },
+        },
+        "/v1/exports/{exportId}": {
+          parameters: [pathParam("exportId")],
+          get: {
+            operationId: "getExport",
+            summary: "Get export",
+            responses: {
+              "200": jsonResponse({
+                type: "object",
+                required: ["id", "format"],
+                properties: { id: { type: "integer" }, format: { type: "string" } },
+              }),
+            },
+          },
+        },
+        // 6. Attempt-history child route does not exempt parent custom action
+        "/v1/api-keys/{apiKeyId}/revoke": {
+          parameters: [pathParam("apiKeyId")],
+          post: {
+            operationId: "revokeWithAttemptChild",
+            summary: "Revoke API key with attempt history child",
+            responses: {
+              "200": jsonResponse({
+                type: "object",
+                properties: { revoked: { type: "boolean" } },
+              }),
+            },
+          },
+        },
+        "/v1/api-keys/{apiKeyId}/revoke/{attemptId}": {
+          parameters: [pathParam("apiKeyId"), pathParam("attemptId")],
+          get: {
+            operationId: "getRevokeAttempt",
+            summary: "Get revocation attempt",
+            responses: {
+              "200": jsonResponse({
+                type: "object",
+                properties: { id: { type: "string" }, ok: { type: "boolean" } },
+              }),
+            },
+          },
+        },
+        // 7. Query-like addressable collection (/stats) requires 201/202 on creation POST
+        "/v1/projects/{projectId}/stats": {
+          parameters: [pathParam("projectId")],
+          get: {
+            operationId: "listStats",
+            summary: "List addressable stat records",
+            responses: {
+              "200": jsonResponse({
+                type: "object",
+                properties: {
+                  data: {
+                    type: "array",
+                    items: {
+                      type: "object",
+                      required: ["id", "metric"],
+                      properties: { id: { type: "string" }, metric: { type: "string" } },
+                    },
+                  },
+                },
+              }),
+            },
+          },
+          post: {
+            operationId: "createStatWrongStatus",
+            summary: "Create stat returning only 200",
+            responses: {
+              "200": jsonResponse({
+                type: "object",
+                required: ["id", "metric"],
+                properties: { id: { type: "string" }, metric: { type: "string" } },
+              }),
+            },
+          },
+        },
+        "/v1/stats/{statId}": {
+          parameters: [pathParam("statId")],
+          get: {
+            operationId: "getStat",
+            summary: "Get stat",
+            responses: {
+              "200": jsonResponse({
+                type: "object",
+                required: ["id", "metric"],
+                properties: { id: { type: "string" }, metric: { type: "string" } },
+              }),
+            },
+          },
+        },
+        // 8. Dual GET/POST /search returning collection stays exempt from 201/202
+        "/v1/projects/{projectId}/search": {
+          parameters: [pathParam("projectId")],
+          get: {
+            operationId: "getSearchHits",
+            summary: "Search via GET",
+            responses: {
+              "200": jsonResponse({
+                type: "object",
+                properties: {
+                  data: {
+                    type: "array",
+                    items: {
+                      type: "object",
+                      properties: { id: { type: "string" }, snippet: { type: "string" } },
+                    },
+                  },
+                },
+              }),
+            },
+          },
+          post: {
+            operationId: "postSearchHits",
+            summary: "Search via POST",
+            responses: {
+              "200": jsonResponse({
+                type: "object",
+                properties: {
+                  data: {
+                    type: "array",
+                    items: {
+                      type: "object",
+                      properties: { id: { type: "string" }, snippet: { type: "string" } },
+                    },
+                  },
+                },
+              }),
+            },
+          },
+        },
+        "/v1/search/{searchId}": {
+          parameters: [pathParam("searchId")],
+          get: {
+            operationId: "getSearchItem",
+            summary: "Get search item",
+            responses: {
+              "200": jsonResponse({
+                type: "object",
+                properties: { id: { type: "string" }, snippet: { type: "string" } },
+              }),
+            },
+          },
+        },
+        // 9. Chained Path Item $ref (root -> HopA(patch) -> HopB(put)) caught for PUT+PATCH
+        "/v1/chained-items/{itemId}": {
+          $ref: "#/components/pathItems/ChainedHopA",
+        },
+      },
+      components: {
+        schemas: diamondSchemas,
+        pathItems: {
+          ChainedHopA: {
+            $ref: "#/components/pathItems/ChainedHopB",
+            patch: {
+              operationId: "patchChained",
+              summary: "Patch chained item",
+              responses: {
+                "200": jsonResponse({
+                  type: "object",
+                  properties: { id: { type: "string" } },
+                }),
+              },
+            },
+          },
+          ChainedHopB: {
+            parameters: [pathParam("itemId")],
+            get: {
+              operationId: "getChained",
+              summary: "Get chained item",
+              responses: {
+                "200": jsonResponse({
+                  type: "object",
+                  properties: { id: { type: "string" } },
+                }),
+              },
+            },
+            put: {
+              operationId: "putChained",
+              summary: "Put chained item",
+              responses: {
+                "200": jsonResponse({
+                  type: "object",
+                  properties: { id: { type: "string" } },
+                }),
+              },
+            },
+          },
+        },
+      },
+    });
+
+    const { report } = await lintOpenApi(doc);
+    const readMessages = ads0005ProblemsFor(report, "ads-0005-addressable-resource-read").map(
+      (e) => e.message,
+    );
+    const methodMessages = ads0005ProblemsFor(report, "ads-0005-standard-http-methods").map(
+      (e) => e.message,
+    );
+    const statusMessages = ads0005ProblemsFor(report, "ads-0005-standard-status-codes").map(
+      (e) => e.message,
+    );
+
+    expect(
+      readMessages.some((m) => m.includes('GET "/v1/organizations/{organizationId}/diamonds"')),
+    ).toBe(true);
+    expect(
+      readMessages.some((m) => m.includes('GET "/v1/projects/{projectId}/inherited-items"')),
+    ).toBe(true);
+    expect(
+      readMessages.some((m) => m.includes('GET "/v1/organizations/{organizationId}/scores"')),
+    ).toBe(true);
+    expect(
+      readMessages.some((m) =>
+        m.includes('PATCH "/v1/organizations/{organizationId}/jobs/{jobId}"'),
+      ),
+    ).toBe(true);
+    expect(
+      readMessages.some((m) =>
+        m.includes('PATCH "/v1/organizations/{organizationId}/exports/{exportId}"'),
+      ),
+    ).toBe(false);
+    expect(readMessages.some((m) => m.includes('POST "/v1/api-keys/{apiKeyId}/revoke"'))).toBe(
+      true,
+    );
+    expect(
+      statusMessages.some(
+        (m) => m.includes('POST "/v1/projects/{projectId}/stats"') && m.includes('"201"'),
+      ),
+    ).toBe(true);
+    expect(statusMessages.some((m) => m.includes("/search"))).toBe(false);
+    expect(methodMessages.some((m) => m.includes('"/v1/chained-items/{itemId}"'))).toBe(true);
+  });
 });

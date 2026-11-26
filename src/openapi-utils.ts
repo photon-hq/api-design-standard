@@ -1,9 +1,11 @@
 import { createRuleIgnoreMatcher, type RuleIgnoreMatcher } from "./ignore.js";
 import {
+  getRefIntermediateHops,
   isRecord,
   locationKey,
   type ResolverFn,
   resolveRecordWithLocation,
+  safeResolveRecord,
   type UnknownRecord,
 } from "./schema-utils.js";
 import type { RedoclyLocation, RedoclyOas3Rule, RedoclyUserContext } from "./types.js";
@@ -12,7 +14,9 @@ export const JSON_MEDIA_TYPE_RE =
   /^application\/(?!problem\+json(?:\s*;|$))(?:[^;]+\+)?json(?:\s*;|$)/i;
 export const EXACT_2XX_STATUS_RE = /^2\d\d$/;
 
+const STATUS_RANGE_RE = /^([1-5])XX$/i;
 const EMPTY_STRING_SET: ReadonlySet<string> = new Set();
+const EMPTY_LOCATION_MAP: ReadonlyMap<string, RedoclyLocation> = new Map();
 
 export function reportOnce(
   ctx: RedoclyUserContext,
@@ -85,10 +89,11 @@ export function resolvePathItemWithLocation(
     pathItemLocation: RedoclyLocation,
     pathFromRef: boolean,
     localKeys: ReadonlySet<string>,
+    operationLocations: ReadonlyMap<string, RedoclyLocation>,
   ): ResolvedPathItem => {
     const isOperationFromRef = (method: string): boolean => pathFromRef && !localKeys.has(method);
     const operationLocation = (method: string): RedoclyLocation =>
-      localKeys.has(method) ? pathUsageLocation.child([method]) : pathItemLocation.child([method]);
+      (operationLocations.get(method) ?? pathItemLocation).child([method]);
     const operationReportLocation = (method: string): RedoclyLocation =>
       isOperationFromRef(method) ? pathUsageLocation.key() : operationLocation(method).key();
 
@@ -106,40 +111,58 @@ export function resolvePathItemWithLocation(
   };
 
   if (!isRecord(rawPathItem)) {
-    return buildEntry(undefined, pathUsageLocation, false, EMPTY_STRING_SET);
+    return buildEntry(undefined, pathUsageLocation, false, EMPTY_STRING_SET, EMPTY_LOCATION_MAP);
   }
 
   if (typeof rawPathItem.$ref !== "string") {
-    return buildEntry(rawPathItem, pathUsageLocation, false, EMPTY_STRING_SET);
+    return buildEntry(rawPathItem, pathUsageLocation, false, EMPTY_STRING_SET, EMPTY_LOCATION_MAP);
   }
 
-  const resolved = resolveRecordWithLocation(resolve, rawPathItem, pathUsageLocation);
+  const resolved = safeResolveRecord(resolve, rawPathItem, pathUsageLocation.source?.absoluteRef);
   const localEntries = Object.entries(rawPathItem).filter(([key]) => key !== "$ref");
 
-  if (!resolved) {
+  if (!resolved?.node) {
     if (localEntries.length === 0) {
-      return buildEntry(undefined, pathUsageLocation, true, EMPTY_STRING_SET);
+      return buildEntry(undefined, pathUsageLocation, true, EMPTY_STRING_SET, EMPTY_LOCATION_MAP);
     }
     const localOnly: UnknownRecord = {};
     const localKeys = new Set<string>();
+    const operationLocations = new Map<string, RedoclyLocation>();
     for (const [key, value] of localEntries) {
       localOnly[key] = value;
       localKeys.add(key);
+      operationLocations.set(key, pathUsageLocation);
     }
-    return buildEntry(localOnly, pathUsageLocation, false, localKeys);
+    return buildEntry(localOnly, pathUsageLocation, false, localKeys, operationLocations);
   }
 
-  if (localEntries.length === 0) {
-    return buildEntry(resolved.node, resolved.location, true, EMPTY_STRING_SET);
+  const targetLocation = resolved.location ?? pathUsageLocation;
+  const intermediateHops = getRefIntermediateHops(rawPathItem, resolved, { reverse: true });
+
+  if (intermediateHops.length === 0 && localEntries.length === 0) {
+    return buildEntry(resolved.node, targetLocation, true, EMPTY_STRING_SET, EMPTY_LOCATION_MAP);
   }
 
   const merged: UnknownRecord = { ...resolved.node };
+  const operationLocations = new Map<string, RedoclyLocation>();
+  for (const hop of intermediateHops) {
+    const hopLocation = hop.location ?? targetLocation;
+    for (const [key, value] of Object.entries(hop.node)) {
+      if (key === "$ref") {
+        continue;
+      }
+      merged[key] = value;
+      operationLocations.set(key, hopLocation);
+    }
+  }
+
   const localKeys = new Set<string>();
   for (const [key, value] of localEntries) {
     merged[key] = value;
     localKeys.add(key);
+    operationLocations.set(key, pathUsageLocation);
   }
-  return buildEntry(merged, resolved.location, true, localKeys);
+  return buildEntry(merged, targetLocation, true, localKeys, operationLocations);
 }
 
 export function iterateRootPathItems(
@@ -212,10 +235,24 @@ export function extractOperationJsonResponseSchemas(
   if (!isRecord(operation.responses)) {
     return [];
   }
+  const responses = operation.responses;
+  const declaredExplicitClasses = new Set<string>();
+  for (const statusCode of statusCodes) {
+    if (!STATUS_RANGE_RE.test(statusCode) && responses[statusCode] !== undefined) {
+      const statusClass = statusCode[0];
+      if (statusClass) {
+        declaredExplicitClasses.add(statusClass);
+      }
+    }
+  }
   const results: ResponseJsonSchemaEntry[] = [];
   for (const statusCode of statusCodes) {
+    const rangeMatch = STATUS_RANGE_RE.exec(statusCode);
+    if (rangeMatch?.[1] && declaredExplicitClasses.has(rangeMatch[1])) {
+      continue;
+    }
     const entries = extractResponseJsonSchemas(
-      operation.responses[statusCode],
+      responses[statusCode],
       operationLocation.child(["responses", statusCode]),
       resolve,
     );
