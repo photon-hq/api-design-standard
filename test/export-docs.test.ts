@@ -436,6 +436,60 @@ describe("docs-reference export", () => {
     }
   });
 
+  it("exports ADS-0005 cleanly with Mintlify MDX safety and stripped Lint Rules when promoted to Approved", async () => {
+    const fixtureRoot = await createTempRepoFixture();
+    process.env.GITHUB_SHA = "d".repeat(40);
+    try {
+      const ads0005Path = resolve(fixtureRoot, "ads/0005-standard-resource-methods/index.md");
+      const draftContent = await readFile(ads0005Path, "utf8");
+      expect(draftContent).toContain('status: "Draft"');
+      await writeFile(
+        ads0005Path,
+        draftContent
+          .replace('status: "Draft"', 'status: "Approved"')
+          .replace("- **Status**: Draft", "- **Status**: Approved"),
+        "utf8",
+      );
+
+      const exported = await buildDocsReference(fixtureRoot);
+      expect(exported.standards.map((standard) => standard.slug)).toEqual([
+        "ads-0001",
+        "ads-0002",
+        "ads-0004",
+        "ads-0005",
+      ]);
+
+      const ads0005 = exported.standards[3];
+      expect(ads0005).toBeDefined();
+      expect(ads0005?.ads).toBe("0005");
+      expect(ads0005?.folder).toBe("0005-standard-resource-methods");
+      expect(ads0005?.title).toBe("ADS-0005: Standard Resource Methods and Lifecycle");
+      expect(ads0005?.sidebarTitle).toBe("ADS-0005 · Standard Resource Methods");
+      expect(ads0005?.status).toBe("Approved");
+      expect(ads0005?.updated).toBe("2026-11-26");
+      expect(ads0005?.rules.map((rule) => rule.id)).toEqual([
+        "photon-ads/ads-0005-addressable-resource-read",
+        "photon-ads/ads-0005-standard-http-methods",
+        "photon-ads/ads-0005-standard-status-codes",
+        "photon-ads/ads-0005-url-path-naming",
+      ]);
+      expect(ads0005?.body).not.toMatch(/^---/);
+      expect(ads0005?.body).not.toMatch(/^#s+/);
+      expect(ads0005?.body).toContain("## Scope");
+      expect(ads0005?.body).toContain("## Normative Rules");
+      expect(ads0005?.body).toContain("## Examples");
+      expect(ads0005?.body).toContain("## Changelog");
+      expect(ads0005?.body).not.toMatch(/^##\s+(?:Deterministic\s+)?Lint\s+Rules\b/im);
+
+      for (const pattern of FORBIDDEN_DOCS_PATTERNS) {
+        expect(ads0005?.description).not.toMatch(pattern);
+        expect(ads0005?.body).not.toMatch(pattern);
+      }
+    } finally {
+      await rm(fixtureRoot, { recursive: true, force: true });
+    }
+  });
+
   it("rejects export when no Approved standard exists", async () => {
     const fixtureRoot = await createTempRepoFixture();
     process.env.GITHUB_SHA = "b".repeat(40);
