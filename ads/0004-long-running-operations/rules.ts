@@ -1,13 +1,45 @@
-import { createRuleIgnoreMatcher, HTTP_METHODS } from "../../src/ignore.js";
+import { HTTP_METHODS, type RuleIgnoreMatcher } from "../../src/ignore.js";
 import {
+  createRootRule,
+  extractOperationJsonResponseSchemas,
+  extractResponseJsonSchemas,
+  iterateRootPathItems,
+  reportOnce,
+} from "../../src/openapi-utils.js";
+import {
+  ALL_JSON_TYPE_SET,
+  ALL_JSON_TYPES,
+  allowsNonNullConstraint,
+  allowsNullConstraint,
+  combineTypeConstraintAllOf,
+  extractComponentSchemaName,
+  foldSchemaFragments,
+  formatAllowedTypes,
+  isNonNullObjectConstraint,
+  isNonNullStringConstraint,
   isRecord,
+  isStrictlyNullConstraint,
+  type JsonSchemaType,
+  localTypeConstraint,
   locationKey,
+  MAX_OBJECT_VARIANTS,
+  propertyTypeConstraint,
   type ResolverFn,
-  resolveRecordWithLocation,
+  type SchemaFragment,
   safeResolveSchema,
+  selectPropertyReportLocation,
+  someSchemaBranch,
+  type TrackedProperty,
+  type TypeConstraint,
   type UnknownRecord,
   walkSchemaLattice,
 } from "../../src/schema-utils.js";
+import {
+  collectFlattenedObjectVariants as collectBaseFlattenedObjectVariants,
+  collectFragmentsObjectVariants,
+  type FlattenedObjectVariant,
+  type FlattenedVariantOptions,
+} from "../../src/schema-variants.js";
 import type {
   AdsStandardMetadata,
   RedoclyLocation,
@@ -83,8 +115,6 @@ const RFC9457_CORE_FIELDS = ["type", "title", "status", "code"] as const;
 const OPERATION_ITEM_PATH_RE = /(?:^|\/)operations\/\{([^}]+)\}\/?$/;
 const OPERATION_CANCEL_PATH_RE = /(?:^|\/)operations\/\{([^}]+)\}\/cancel\/?$/;
 const OPERATION_DELETE_PATH_RE = /(?:^|\/)operations\/\{[^}]+\}(?:\/cancel)?\/?$/;
-const JSON_MEDIA_TYPE_RE = /^application\/(?!problem\+json(?:\s*;|$))(?:[^;]+\+)?json(?:\s*;|$)/i;
-const COMPONENT_SCHEMA_REF_RE = /#\/components\/schemas\/([^/]+)$/;
 const OPERATION_SCHEMA_NAME_RE =
   /^(?:[A-Za-z0-9._-]*Operation)(?:Response|Status|Resource)?$|^(?:[a-z0-9._-]*[_.-])?operation(?:[_.-](?:response|status|resource))?$/;
 const SNAKE_CASE_RE = /^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$/;
@@ -97,62 +127,20 @@ const SENSITIVE_CREDENTIAL_CAMEL_SUFFIX_RE =
 const SENSITIVE_CREDENTIAL_SNAKE_SUFFIX_RE =
   /_(?:secret|password|passphrase|api_key|private_key|token)$/i;
 
-const PROHIBITED_CREDENTIAL_PROBES = [
-  "secret",
-  "password",
-  "passphrase",
-  "token",
-  "apiKey",
-  "api_key",
-  "privateKey",
-  "private_key",
-  "clientSecret",
-  "client_secret",
-  "accessToken",
-  "access_token",
-  "refreshToken",
-  "refresh_token",
-  "idToken",
-  "id_token",
-  "sessionToken",
-  "session_token",
-  "authToken",
-  "auth_token",
-  "bearerToken",
-  "bearer_token",
-  "signingSecret",
-  "signing_secret",
-] as const;
+const PROHIBITED_CREDENTIAL_PROBES = `
+  secret password passphrase token apiKey api_key privateKey private_key
+  clientSecret client_secret accessToken access_token refreshToken refresh_token
+  idToken id_token sessionToken session_token authToken auth_token
+  bearerToken bearer_token signingSecret signing_secret
+`
+  .trim()
+  .split(/\s+/);
 
-const BENIGN_KEY_PROBES = [
-  "id",
-  "name",
-  "value",
-  "record",
-  "status",
-  "type",
-  "hostname",
-  "foo",
-  "exampleKey",
-  "example_key",
-] as const;
-
-const MAX_OBJECT_VARIANTS = 256;
-
-type JsonSchemaType = "object" | "array" | "string" | "number" | "integer" | "boolean" | "null";
-
-const ALL_JSON_TYPES: readonly JsonSchemaType[] = [
-  "object",
-  "array",
-  "string",
-  "number",
-  "integer",
-  "boolean",
-  "null",
-];
-
-const ALL_JSON_TYPE_SET: ReadonlySet<JsonSchemaType> = new Set(ALL_JSON_TYPES);
-const EMPTY_TYPE_SET: ReadonlySet<JsonSchemaType> = new Set();
+const BENIGN_KEY_PROBES = `
+  id name value record status type hostname foo exampleKey example_key
+`
+  .trim()
+  .split(/\s+/);
 
 export function isCanonicalOperationStatus(value: string): value is CanonicalOperationStatus {
   return CANONICAL_STATUS_SET.has(value);
@@ -191,172 +179,6 @@ export function isOperationSchemaName(schemaName: string): boolean {
   return OPERATION_SCHEMA_NAME_RE.test(schemaName);
 }
 
-function isJsonSchemaType(value: unknown): value is JsonSchemaType {
-  return typeof value === "string" && ALL_JSON_TYPE_SET.has(value as JsonSchemaType);
-}
-
-function jsonTypeOfValue(value: unknown): JsonSchemaType | null {
-  if (value === null) {
-    return "null";
-  }
-  if (Array.isArray(value)) {
-    return "array";
-  }
-  switch (typeof value) {
-    case "string":
-      return "string";
-    case "boolean":
-      return "boolean";
-    case "number":
-      return Number.isInteger(value) ? "integer" : "number";
-    case "object":
-      return "object";
-    default:
-      return null;
-  }
-}
-
-interface TypeConstraint {
-  readonly allowed: ReadonlySet<JsonSchemaType>;
-}
-
-const UNCONSTRAINED_TYPE_CONSTRAINT: TypeConstraint = {
-  allowed: ALL_JSON_TYPE_SET,
-};
-
-const FALSE_TYPE_CONSTRAINT: TypeConstraint = {
-  allowed: EMPTY_TYPE_SET,
-};
-
-function intersectTypeSets(
-  a: ReadonlySet<JsonSchemaType>,
-  b: ReadonlySet<JsonSchemaType>,
-): Set<JsonSchemaType> {
-  const out = new Set<JsonSchemaType>();
-  for (const t of a) {
-    if (b.has(t)) {
-      out.add(t);
-    } else if ((t === "integer" && b.has("number")) || (t === "number" && b.has("integer"))) {
-      out.add("integer");
-    }
-  }
-  return out;
-}
-
-function combineTypeConstraintAllOf(a: TypeConstraint, b: TypeConstraint): TypeConstraint {
-  return { allowed: intersectTypeSets(a.allowed, b.allowed) };
-}
-
-function combineTypeConstraintUnion(values: readonly TypeConstraint[]): TypeConstraint {
-  if (values.length === 0) {
-    return UNCONSTRAINED_TYPE_CONSTRAINT;
-  }
-  const allowed = new Set<JsonSchemaType>();
-  for (const item of values) {
-    for (const t of item.allowed) {
-      allowed.add(t);
-    }
-  }
-  return { allowed };
-}
-
-function localTypeConstraint(node: UnknownRecord): TypeConstraint {
-  let result = UNCONSTRAINED_TYPE_CONSTRAINT;
-
-  if (typeof node.type === "string" && isJsonSchemaType(node.type)) {
-    const types = new Set<JsonSchemaType>([node.type]);
-    if (node.nullable === true) {
-      types.add("null");
-    }
-    result = combineTypeConstraintAllOf(result, { allowed: types });
-  } else if (Array.isArray(node.type)) {
-    const validTypes = node.type.filter(isJsonSchemaType);
-    if (validTypes.length > 0) {
-      const types = new Set<JsonSchemaType>(validTypes);
-      if (node.nullable === true) {
-        types.add("null");
-      }
-      result = combineTypeConstraintAllOf(result, { allowed: types });
-    }
-  }
-
-  if (node.const !== undefined) {
-    const constType = jsonTypeOfValue(node.const);
-    if (constType !== null) {
-      result = combineTypeConstraintAllOf(result, { allowed: new Set([constType]) });
-    }
-  }
-
-  if (Array.isArray(node.enum) && node.enum.length > 0) {
-    const enumTypes = new Set<JsonSchemaType>();
-    for (const item of node.enum) {
-      const itemType = jsonTypeOfValue(item);
-      if (itemType !== null) {
-        enumTypes.add(itemType);
-      }
-    }
-    if (enumTypes.size > 0) {
-      result = combineTypeConstraintAllOf(result, { allowed: enumTypes });
-    }
-  }
-
-  return result;
-}
-
-function finalizeTypeConstraint(node: UnknownRecord, value: TypeConstraint): TypeConstraint {
-  if (node.nullable !== true) {
-    return value;
-  }
-  if (node.type !== undefined) {
-    return value;
-  }
-  if (node.const !== undefined && node.const !== null) {
-    return value;
-  }
-  if (Array.isArray(node.enum) && node.enum.length > 0 && !node.enum.includes(null)) {
-    return value;
-  }
-  const allowed = new Set<JsonSchemaType>(value.allowed);
-  allowed.add("null");
-  return { allowed };
-}
-
-function computeTypeConstraint(
-  schema: unknown,
-  resolve: ResolverFn,
-  from?: string,
-): TypeConstraint {
-  return walkSchemaLattice<TypeConstraint>(schema, resolve, from, {
-    falseValue: FALSE_TYPE_CONSTRAINT,
-    unknownValue: UNCONSTRAINED_TYPE_CONSTRAINT,
-    local: localTypeConstraint,
-    combineAllOf: combineTypeConstraintAllOf,
-    combineUnion: (values) => combineTypeConstraintUnion(values),
-    finalize: finalizeTypeConstraint,
-  });
-}
-
-function isStrictlyNullConstraint(tc: TypeConstraint): boolean {
-  return tc.allowed.size === 1 && tc.allowed.has("null");
-}
-
-function allowsNullConstraint(tc: TypeConstraint): boolean {
-  return tc.allowed.has("null");
-}
-
-function allowsNonNullConstraint(tc: TypeConstraint): boolean {
-  for (const t of tc.allowed) {
-    if (t !== "null") {
-      return true;
-    }
-  }
-  return false;
-}
-
-function isNonNullStringConstraint(tc: TypeConstraint): boolean {
-  return tc.allowed.size === 1 && tc.allowed.has("string");
-}
-
 function isNonNullBooleanConstraint(tc: TypeConstraint): boolean {
   return tc.allowed.size === 1 && tc.allowed.has("boolean");
 }
@@ -387,10 +209,6 @@ function allowsOnlyNullOrObject(tc: TypeConstraint): boolean {
     }
   }
   return true;
-}
-
-function isNonNullObjectConstraint(tc: TypeConstraint): boolean {
-  return tc.allowed.size === 1 && tc.allowed.has("object");
 }
 
 function nonNullTypesOf(tc: TypeConstraint): JsonSchemaType[] {
@@ -649,43 +467,10 @@ function schemaHasExtraConstraints(
   schema: unknown,
   resolve: ResolverFn,
   from: string | undefined,
-  seen: Set<unknown> = new Set(),
 ): boolean {
-  if (!isRecord(schema) || seen.has(schema)) {
-    return false;
-  }
-  seen.add(schema);
-  for (const kw of EXTRA_CONSTRAINT_KEYWORDS) {
-    if (schema[kw] !== undefined) {
-      return true;
-    }
-  }
-  if (typeof schema.$ref === "string") {
-    const resolved = safeResolveSchema(resolve, schema, from);
-    if (
-      resolved &&
-      schemaHasExtraConstraints(
-        resolved.node,
-        resolve,
-        resolved.location?.source?.absoluteRef,
-        seen,
-      )
-    ) {
-      return true;
-    }
-  }
-  for (const combiner of ["allOf", "oneOf", "anyOf"] as const) {
-    const branches = schema[combiner];
-    if (!Array.isArray(branches)) {
-      continue;
-    }
-    for (const branch of branches) {
-      if (schemaHasExtraConstraints(branch, resolve, from, seen)) {
-        return true;
-      }
-    }
-  }
-  return false;
+  return someSchemaBranch(schema, resolve, from, (node) =>
+    EXTRA_CONSTRAINT_KEYWORDS.some((kw) => node[kw] !== undefined),
+  );
 }
 
 type FormatLattice = "yes" | "no" | "null-only" | "unknown";
@@ -743,104 +528,16 @@ function checkSchemaStringFormat(
   });
 }
 
-interface SchemaFragment {
-  readonly node: unknown;
-  readonly from?: string;
-  readonly location?: RedoclyLocation;
-}
-
-interface TrackedProperty {
-  readonly name: string;
-  readonly fragments: readonly SchemaFragment[];
-  readonly location?: RedoclyLocation;
-}
-
-interface FlattenedObjectVariant {
-  readonly typeConstraint: TypeConstraint;
-  readonly isObjectLike: boolean;
-  readonly openAdditionalProperties: boolean;
-  readonly properties: ReadonlyMap<string, TrackedProperty>;
-  readonly required: ReadonlySet<string>;
-  readonly schemaNames: ReadonlySet<string>;
-  readonly oneOfBranches: ReadonlyMap<string, ReadonlySet<number>>;
-}
-
-interface CollectVariantsResult {
-  readonly variants: readonly FlattenedObjectVariant[];
-  readonly hitCycle: boolean;
-  readonly truncated: boolean;
-  readonly sawOperationFingerprint: boolean;
-}
-
-interface DedupeVariantsResult {
-  readonly variants: FlattenedObjectVariant[];
-  readonly truncated: boolean;
-  readonly sawOperationFingerprint: boolean;
-}
-
-function mergeOneOfBranchMaps(
-  left: ReadonlyMap<string, ReadonlySet<number>>,
-  right: ReadonlyMap<string, ReadonlySet<number>>,
-): Map<string, Set<number>> {
-  const merged = new Map<string, Set<number>>();
-  for (const [id, branches] of left.entries()) {
-    merged.set(id, new Set(branches));
-  }
-  for (const [id, branches] of right.entries()) {
-    const existing = merged.get(id);
-    if (existing) {
-      for (const index of branches) {
-        existing.add(index);
-      }
-    } else {
-      merged.set(id, new Set(branches));
-    }
-  }
-  return merged;
-}
-
-function mergeTrackedProperty(
-  existing: TrackedProperty | undefined,
-  incoming: TrackedProperty,
-): TrackedProperty {
-  if (!existing) {
-    return incoming;
-  }
-  const fragments: SchemaFragment[] = [...existing.fragments];
-  for (const frag of incoming.fragments) {
-    if (!fragments.some((prev) => prev.node === frag.node && prev.from === frag.from)) {
-      fragments.push(frag);
-    }
-  }
-  const location = existing.location ?? incoming.location;
-  return {
-    name: existing.name,
-    fragments,
-    ...(location ? { location } : {}),
-  };
-}
-
-function mergeVariants(
+function isAds0004MergeSatisfiable(
   base: FlattenedObjectVariant,
   addition: FlattenedObjectVariant,
+  merged: FlattenedObjectVariant,
   resolve: ResolverFn,
-): FlattenedObjectVariant | null {
-  const typeConstraint = combineTypeConstraintAllOf(base.typeConstraint, addition.typeConstraint);
-  if (typeConstraint.allowed.size === 0) {
-    return null;
-  }
-  const properties = new Map<string, TrackedProperty>(base.properties);
-  for (const [name, prop] of addition.properties.entries()) {
-    properties.set(name, mergeTrackedProperty(properties.get(name), prop));
-  }
-  const required = new Set<string>(base.required);
-  for (const name of addition.required) {
-    required.add(name);
-  }
-  for (const name of required) {
+): boolean {
+  for (const name of merged.required) {
     const baseProp = base.properties.get(name);
     const addProp = addition.properties.get(name);
-    const mergedProp = properties.get(name);
+    const mergedProp = merged.properties.get(name);
     if (!baseProp || !addProp || !mergedProp) {
       continue;
     }
@@ -848,7 +545,7 @@ function mergeVariants(
     const addTc = propertyTypeConstraint(addProp, resolve);
     const mergedTc = propertyTypeConstraint(mergedProp, resolve);
     if (baseTc.allowed.size > 0 && addTc.allowed.size > 0 && mergedTc.allowed.size === 0) {
-      return null;
+      return false;
     }
     const baseExact = propertyExactLiterals(baseProp, resolve);
     const addExact = propertyExactLiterals(addProp, resolve);
@@ -866,68 +563,30 @@ function mergeVariants(
           canonicalKeyMatchesAllowedTypes(key, mergedTc.allowed),
         )
       ) {
-        return null;
+        return false;
       }
     }
   }
-  const schemaNames = new Set<string>(base.schemaNames);
-  for (const name of addition.schemaNames) {
-    schemaNames.add(name);
-  }
-  const isObjectLike =
-    typeConstraint.allowed.has("object") &&
-    (base.isObjectLike || addition.isObjectLike || isNonNullObjectConstraint(typeConstraint));
-  return {
-    typeConstraint,
-    isObjectLike,
-    openAdditionalProperties: base.openAdditionalProperties || addition.openAdditionalProperties,
-    properties,
-    required,
-    schemaNames,
-    oneOfBranches: mergeOneOfBranchMaps(base.oneOfBranches, addition.oneOfBranches),
-  };
-}
-
-function propertyTypeConstraint(prop: TrackedProperty, resolve: ResolverFn): TypeConstraint {
-  let combined = UNCONSTRAINED_TYPE_CONSTRAINT;
-  for (const frag of prop.fragments) {
-    combined = combineTypeConstraintAllOf(
-      combined,
-      computeTypeConstraint(frag.node, resolve, frag.from),
-    );
-  }
-  return combined;
+  return true;
 }
 
 function propertyStringLiterals(prop: TrackedProperty, resolve: ResolverFn): LiteralLattice {
-  let combined: LiteralLattice = UNCONSTRAINED_LITERALS;
-  for (const frag of prop.fragments) {
-    combined = combineLiteralsAllOf(
-      combined,
-      extractSchemaStringLiterals(frag.node, resolve, frag.from),
-    );
-  }
-  return combined;
+  return foldSchemaFragments(prop.fragments, UNCONSTRAINED_LITERALS, combineLiteralsAllOf, (frag) =>
+    extractSchemaStringLiterals(frag.node, resolve, frag.from),
+  );
 }
 
 function propertyExactLiterals(prop: TrackedProperty, resolve: ResolverFn): ExactLiteralLattice {
-  let combined: ExactLiteralLattice = UNCONSTRAINED_EXACT_LITERALS;
-  for (const frag of prop.fragments) {
-    combined = combineExactLiteralsAllOf(
-      combined,
-      extractSchemaExactLiterals(frag.node, resolve, frag.from),
-    );
-  }
-  return combined;
+  return foldSchemaFragments(
+    prop.fragments,
+    UNCONSTRAINED_EXACT_LITERALS,
+    combineExactLiteralsAllOf,
+    (frag) => extractSchemaExactLiterals(frag.node, resolve, frag.from),
+  );
 }
 
 function propertyHasExtraConstraints(prop: TrackedProperty, resolve: ResolverFn): boolean {
-  for (const frag of prop.fragments) {
-    if (schemaHasExtraConstraints(frag.node, resolve, frag.from)) {
-      return true;
-    }
-  }
-  return false;
+  return prop.fragments.some((frag) => schemaHasExtraConstraints(frag.node, resolve, frag.from));
 }
 
 function propertyStringFormat(
@@ -935,22 +594,27 @@ function propertyStringFormat(
   expectedFormat: string,
   resolve: ResolverFn,
 ): FormatLattice {
-  let combined: FormatLattice = "unknown";
-  for (const frag of prop.fragments) {
-    const next = checkSchemaStringFormat(frag.node, expectedFormat, resolve, frag.from);
-    if (combined === "null-only" || next === "null-only") {
-      combined = "null-only";
-    } else if (combined === "yes" || next === "yes") {
-      combined = "yes";
-    } else if (combined === "no" || next === "no") {
-      combined = "no";
-    }
-  }
-  return combined;
+  return foldSchemaFragments<FormatLattice>(
+    prop.fragments,
+    "unknown",
+    (combined, next) => {
+      if (combined === "null-only" || next === "null-only") {
+        return "null-only";
+      }
+      if (combined === "yes" || next === "yes") {
+        return "yes";
+      }
+      if (combined === "no" || next === "no") {
+        return "no";
+      }
+      return combined;
+    },
+    (frag) => checkSchemaStringFormat(frag.node, expectedFormat, resolve, frag.from),
+  );
 }
 
 function variantSignature(variant: FlattenedObjectVariant, resolve: ResolverFn): string {
-  const typesSig = ALL_JSON_TYPES.filter((t) => variant.typeConstraint.allowed.has(t)).join("|");
+  const typesSig = formatAllowedTypes(variant.typeConstraint.allowed);
   const reqSig = [...variant.required].sort().join(",");
   const schemaNamesSig = [...variant.schemaNames].sort().join(",");
   const propKeys = [...variant.properties.keys()].sort();
@@ -960,7 +624,7 @@ function variantSignature(variant: FlattenedObjectVariant, resolve: ResolverFn):
       return key;
     }
     const tc = propertyTypeConstraint(prop, resolve);
-    const tcSig = ALL_JSON_TYPES.filter((t) => tc.allowed.has(t)).join("|");
+    const tcSig = formatAllowedTypes(tc.allowed);
     const exact = propertyExactLiterals(prop, resolve);
     const exactSig = exact.kind === "values" ? `[${[...exact.values].sort().join("|")}]` : "";
     const parts = [key, tcSig];
@@ -999,67 +663,11 @@ function variantSignature(variant: FlattenedObjectVariant, resolve: ResolverFn):
   return `${variant.isObjectLike ? "1" : "0"}:${typesSig}:s[${schemaNamesSig}]:r[${reqSig}]:p[${propSigs.join(";")}]`;
 }
 
-function combineVariantSets(
-  left: readonly FlattenedObjectVariant[],
-  right: readonly FlattenedObjectVariant[],
-  resolve: ResolverFn,
-): DedupeVariantsResult {
-  if (left.length === 0 || right.length === 0) {
-    return { variants: [], truncated: false, sawOperationFingerprint: false };
-  }
-  const indexBySig = new Map<string, number>();
-  const out: FlattenedObjectVariant[] = [];
-  let truncated = false;
-  let sawOperationFingerprint = false;
-  for (const a of left) {
-    for (const b of right) {
-      const merged = mergeVariants(a, b, resolve);
-      if (!merged) {
-        continue;
-      }
-      const sig = variantSignature(merged, resolve);
-      const existingIndex = indexBySig.get(sig);
-      if (existingIndex !== undefined) {
-        const existing = out[existingIndex];
-        if (existing && merged.oneOfBranches.size > 0) {
-          out[existingIndex] = {
-            ...existing,
-            oneOfBranches: mergeOneOfBranchMaps(existing.oneOfBranches, merged.oneOfBranches),
-          };
-        }
-        continue;
-      }
-      if (out.length >= MAX_OBJECT_VARIANTS) {
-        truncated = true;
-        if (!sawOperationFingerprint && hasOperationStructuralFingerprint([merged], resolve)) {
-          sawOperationFingerprint = true;
-        }
-        continue;
-      }
-      indexBySig.set(sig, out.length);
-      out.push(merged);
-    }
-  }
-  return { variants: out, truncated, sawOperationFingerprint };
-}
-
-const EMPTY_SEED_VARIANT: FlattenedObjectVariant = {
-  typeConstraint: UNCONSTRAINED_TYPE_CONSTRAINT,
-  isObjectLike: false,
-  openAdditionalProperties: false,
-  properties: new Map(),
-  required: new Set(),
-  schemaNames: new Set(),
-  oneOfBranches: new Map(),
+const ADS_0004_VARIANT_OPTIONS: FlattenedVariantOptions = {
+  variantSignature,
+  isMergeSatisfiable: isAds0004MergeSatisfiable,
+  trackOneOfBranches: true,
 };
-
-function extractComponentSchemaName(refOrPointer: string | undefined): string | undefined {
-  if (!refOrPointer) {
-    return undefined;
-  }
-  const match = COMPONENT_SCHEMA_REF_RE.exec(refOrPointer);
-  return match?.[1];
-}
 
 function collectFlattenedObjectVariants(
   schema: unknown,
@@ -1070,276 +678,19 @@ function collectFlattenedObjectVariants(
   readonly truncated: boolean;
   readonly sawOperationFingerprint: boolean;
 } {
-  const memo = new Map<object, Map<string, CollectVariantsResult>>();
-  let anonymousOneOfCounter = 0;
-
-  const visit = (
-    node: unknown,
-    location: RedoclyLocation | undefined,
-    seen: ReadonlySet<unknown>,
-    followRef: boolean,
-  ): CollectVariantsResult => {
-    if (node === false) {
-      return { variants: [], hitCycle: false, truncated: false, sawOperationFingerprint: false };
-    }
-    if (node === true || !isRecord(node)) {
-      return {
-        variants: [EMPTY_SEED_VARIANT],
-        hitCycle: false,
-        truncated: false,
-        sawOperationFingerprint: false,
-      };
-    }
-    if (seen.has(node)) {
-      return {
-        variants: [EMPTY_SEED_VARIANT],
-        hitCycle: true,
-        truncated: false,
-        sawOperationFingerprint: false,
-      };
-    }
-
-    const cacheKey = `${followRef ? "1" : "0"}:${location ? locationKey(location) : ""}`;
-    const cached = memo.get(node)?.get(cacheKey);
-    if (cached) {
-      return cached;
-    }
-
-    const nextSeen = new Set(seen);
-    nextSeen.add(node);
-
-    let hitCycle = false;
-    let truncated = false;
-    let sawOperationFingerprint = false;
-    let variants: FlattenedObjectVariant[] = [EMPTY_SEED_VARIANT];
-
-    const localSchemaNames = new Set<string>();
-    const pointerName = extractComponentSchemaName(location?.pointer);
-    if (pointerName) {
-      localSchemaNames.add(pointerName);
-    }
-
-    if (followRef && typeof node.$ref === "string") {
-      const refName = extractComponentSchemaName(node.$ref);
-      if (refName) {
-        localSchemaNames.add(refName);
-      }
-      const resolved = safeResolveSchema(resolve, node, location?.source?.absoluteRef);
-      if (resolved) {
-        const targetResult = visit(resolved.node, resolved.location, nextSeen, true);
-        if (targetResult.hitCycle) {
-          hitCycle = true;
-        }
-        if (targetResult.truncated) {
-          truncated = true;
-        }
-        if (targetResult.sawOperationFingerprint) {
-          sawOperationFingerprint = true;
-        }
-        const mergedTarget = combineVariantSets(variants, targetResult.variants, resolve);
-        variants = mergedTarget.variants;
-        if (mergedTarget.truncated) {
-          truncated = true;
-        }
-        if (mergedTarget.sawOperationFingerprint) {
-          sawOperationFingerprint = true;
-        }
-
-        const chain = resolved.chain ?? [];
-        for (let index = chain.length - 1; index >= 0; index -= 1) {
-          const hop = chain[index];
-          if (!hop || !isRecord(hop.node) || hop.node === node || hop.node === resolved.node) {
-            continue;
-          }
-          if (nextSeen.has(hop.node)) {
-            hitCycle = true;
-            continue;
-          }
-          const hopResult = visit(hop.node, hop.location, nextSeen, false);
-          if (hopResult.hitCycle) {
-            hitCycle = true;
-          }
-          if (hopResult.truncated) {
-            truncated = true;
-          }
-          if (hopResult.sawOperationFingerprint) {
-            sawOperationFingerprint = true;
-          }
-          const mergedHop = combineVariantSets(variants, hopResult.variants, resolve);
-          variants = mergedHop.variants;
-          if (mergedHop.truncated) {
-            truncated = true;
-          }
-          if (mergedHop.sawOperationFingerprint) {
-            sawOperationFingerprint = true;
-          }
-        }
-      }
-    }
-
-    if (Array.isArray(node.allOf)) {
-      for (const [index, branch] of node.allOf.entries()) {
-        const branchResult = visit(branch, location?.child(["allOf", index]), nextSeen, true);
-        if (branchResult.hitCycle) {
-          hitCycle = true;
-        }
-        if (branchResult.truncated) {
-          truncated = true;
-        }
-        if (branchResult.sawOperationFingerprint) {
-          sawOperationFingerprint = true;
-        }
-        const mergedBranch = combineVariantSets(variants, branchResult.variants, resolve);
-        variants = mergedBranch.variants;
-        if (mergedBranch.truncated) {
-          truncated = true;
-        }
-        if (mergedBranch.sawOperationFingerprint) {
-          sawOperationFingerprint = true;
-        }
-        if (variants.length === 0) {
-          break;
-        }
-      }
-    }
-
-    if (variants.length > 0) {
-      const localTc = localTypeConstraint(node);
-      const localProps = new Map<string, TrackedProperty>();
-      const from = location?.source?.absoluteRef;
-
-      if (isRecord(node.properties)) {
-        for (const [propName, propSchema] of Object.entries(node.properties)) {
-          const propLocation = location?.child(["properties", propName]);
-          localProps.set(propName, {
-            name: propName,
-            fragments: [
-              {
-                node: propSchema,
-                ...(from !== undefined ? { from } : {}),
-                ...(propLocation ? { location: propLocation } : {}),
-              },
-            ],
-            ...(propLocation ? { location: propLocation } : {}),
-          });
-        }
-      }
-
-      const localRequired = new Set<string>();
-      if (Array.isArray(node.required)) {
-        for (const item of node.required) {
-          if (typeof item === "string") {
-            localRequired.add(item);
-          }
-        }
-      }
-
-      const openAdditionalProperties =
-        node.additionalProperties === true || isRecord(node.additionalProperties);
-      const hasObjectShape =
-        isRecord(node.properties) ||
-        node.additionalProperties !== undefined ||
-        localRequired.size > 0 ||
-        isNonNullObjectConstraint(localTc) ||
-        (localTc.allowed.has("object") &&
-          localTc.allowed.size < ALL_JSON_TYPE_SET.size &&
-          (node.type === "object" || (Array.isArray(node.type) && node.type.includes("object"))));
-
-      const localVariant: FlattenedObjectVariant = {
-        typeConstraint: localTc,
-        isObjectLike: hasObjectShape,
-        openAdditionalProperties,
-        properties: localProps,
-        required: localRequired,
-        schemaNames: localSchemaNames,
-        oneOfBranches: new Map(),
-      };
-      const mergedLocal = combineVariantSets(variants, [localVariant], resolve);
-      variants = mergedLocal.variants;
-      if (mergedLocal.truncated) {
-        truncated = true;
-      }
-      if (mergedLocal.sawOperationFingerprint) {
+  let sawOperationFingerprint = false;
+  const result = collectBaseFlattenedObjectVariants(schema, resolve, baseLocation, {
+    ...ADS_0004_VARIANT_OPTIONS,
+    onTruncatedVariant: (variant, res) => {
+      if (!sawOperationFingerprint && hasOperationStructuralFingerprint([variant], res)) {
         sawOperationFingerprint = true;
       }
-    }
-
-    if (variants.length > 0) {
-      for (const unionKey of ["oneOf", "anyOf"] as const) {
-        const branches = node[unionKey];
-        if (!Array.isArray(branches) || branches.length === 0) {
-          continue;
-        }
-        const oneOfId =
-          unionKey === "oneOf"
-            ? location
-              ? locationKey(location.child(["oneOf"]))
-              : `oneOf#${++anonymousOneOfCounter}`
-            : undefined;
-        const unionVariants: FlattenedObjectVariant[] = [];
-        for (const [index, branch] of branches.entries()) {
-          const branchResult = visit(branch, location?.child([unionKey, index]), nextSeen, true);
-          if (branchResult.hitCycle) {
-            hitCycle = true;
-          }
-          if (branchResult.truncated) {
-            truncated = true;
-          }
-          if (branchResult.sawOperationFingerprint) {
-            sawOperationFingerprint = true;
-          }
-          if (oneOfId !== undefined) {
-            const branchTag = new Map<string, ReadonlySet<number>>([[oneOfId, new Set([index])]]);
-            for (const branchVariant of branchResult.variants) {
-              unionVariants.push({
-                ...branchVariant,
-                oneOfBranches: mergeOneOfBranchMaps(branchVariant.oneOfBranches, branchTag),
-              });
-            }
-          } else {
-            unionVariants.push(...branchResult.variants);
-          }
-        }
-        const mergedUnion = combineVariantSets(variants, unionVariants, resolve);
-        variants = mergedUnion.variants;
-        if (mergedUnion.truncated) {
-          truncated = true;
-        }
-        if (mergedUnion.sawOperationFingerprint) {
-          sawOperationFingerprint = true;
-        }
-      }
-    }
-
-    if (node.nullable === true && variants.length > 0) {
-      variants = variants.map((variant) => ({
-        ...variant,
-        typeConstraint: finalizeTypeConstraint(node, variant.typeConstraint),
-      }));
-    }
-
-    const result: CollectVariantsResult = {
-      variants,
-      hitCycle,
-      truncated,
-      sawOperationFingerprint,
-    };
-    if (!hitCycle) {
-      let nodeCache = memo.get(node);
-      if (!nodeCache) {
-        nodeCache = new Map();
-        memo.set(node, nodeCache);
-      }
-      nodeCache.set(cacheKey, result);
-    }
-    return result;
-  };
-
-  const finalResult = visit(schema, baseLocation, new Set(), true);
+    },
+  });
   return {
-    variants: finalResult.variants,
-    truncated: finalResult.truncated,
-    sawOperationFingerprint: finalResult.sawOperationFingerprint,
+    variants: result.variants,
+    truncated: result.truncated,
+    sawOperationFingerprint,
   };
 }
 
@@ -1347,23 +698,7 @@ function collectPropertyObjectVariants(
   prop: TrackedProperty,
   resolve: ResolverFn,
 ): { readonly variants: FlattenedObjectVariant[]; readonly truncated: boolean } {
-  let variants: FlattenedObjectVariant[] = [EMPTY_SEED_VARIANT];
-  let truncated = false;
-  for (const frag of prop.fragments) {
-    const fragResult = collectFlattenedObjectVariants(frag.node, resolve, frag.location);
-    if (fragResult.truncated) {
-      truncated = true;
-    }
-    const merged = combineVariantSets(variants, fragResult.variants, resolve);
-    variants = merged.variants;
-    if (merged.truncated) {
-      truncated = true;
-    }
-    if (variants.length === 0) {
-      break;
-    }
-  }
-  return { variants, truncated };
+  return collectFragmentsObjectVariants(prop.fragments, resolve, ADS_0004_VARIANT_OPTIONS);
 }
 
 function collectRootAndDirectBranchSchemaKeys(
@@ -1416,91 +751,36 @@ function schemaReferencesKnownOperation(
   from: string | undefined,
   knownKeys: ReadonlySet<string>,
   knownNodes: ReadonlySet<unknown>,
-  seen: Set<unknown> = new Set(),
 ): boolean {
-  if (!isRecord(schema) || seen.has(schema)) {
-    return false;
-  }
-  seen.add(schema);
-  if (knownNodes.has(schema)) {
-    return true;
-  }
-  if (typeof schema.$ref === "string") {
-    const resolved = safeResolveSchema(resolve, schema, from);
-    if (resolved) {
-      if (resolved.location && knownKeys.has(locationKey(resolved.location))) {
-        return true;
-      }
-      if (
-        isRecord(resolved.node) &&
-        schemaReferencesKnownOperation(
-          resolved.node,
-          resolve,
-          resolved.location?.source?.absoluteRef,
-          knownKeys,
-          knownNodes,
-          seen,
-        )
-      ) {
-        return true;
-      }
-    }
-  }
-  for (const unionKey of ["oneOf", "anyOf"] as const) {
-    const branches = schema[unionKey];
-    if (!Array.isArray(branches)) {
-      continue;
-    }
-    for (const branch of branches) {
-      if (schemaReferencesKnownOperation(branch, resolve, from, knownKeys, knownNodes, seen)) {
-        return true;
-      }
-    }
-  }
-  return false;
+  return someSchemaBranch(
+    schema,
+    resolve,
+    from,
+    (node, resolved) =>
+      knownNodes.has(node) ||
+      Boolean(resolved?.location && knownKeys.has(locationKey(resolved.location))),
+    { combinators: ["oneOf", "anyOf"], requireRecordRefTarget: true },
+  );
 }
 
 function schemaHasOperationComponentName(
   schema: unknown,
   resolve: ResolverFn,
   from: string | undefined,
-  seen: Set<unknown> = new Set(),
 ): boolean {
-  if (!isRecord(schema) || seen.has(schema)) {
-    return false;
-  }
-  seen.add(schema);
-  if (typeof schema.$ref === "string") {
-    const name = extractComponentSchemaName(schema.$ref);
-    if (name && isOperationSchemaName(name)) {
-      return true;
-    }
-    const resolved = safeResolveSchema(resolve, schema, from);
-    if (
-      resolved &&
-      isRecord(resolved.node) &&
-      schemaHasOperationComponentName(
-        resolved.node,
-        resolve,
-        resolved.location?.source?.absoluteRef,
-        seen,
-      )
-    ) {
-      return true;
-    }
-  }
-  for (const unionKey of ["oneOf", "anyOf"] as const) {
-    const branches = schema[unionKey];
-    if (!Array.isArray(branches)) {
-      continue;
-    }
-    for (const branch of branches) {
-      if (schemaHasOperationComponentName(branch, resolve, from, seen)) {
-        return true;
+  return someSchemaBranch(
+    schema,
+    resolve,
+    from,
+    (node) => {
+      if (typeof node.$ref !== "string") {
+        return false;
       }
-    }
-  }
-  return false;
+      const name = extractComponentSchemaName(node.$ref);
+      return Boolean(name && isOperationSchemaName(name));
+    },
+    { combinators: ["oneOf", "anyOf"], requireRecordRefTarget: true },
+  );
 }
 
 function isSingleKeyOperationWrapper(
@@ -1604,20 +884,17 @@ interface OperationResponseEntry {
  *   Lifecycle-bearing resources and fire-and-forget `202` endpoints remain unaffected.
  */
 function collectOperationResponses(
-  root: unknown,
+  root: UnknownRecord,
   ctx: RedoclyUserContext,
-  options: Record<string, unknown>,
+  ignoreMatcher: RuleIgnoreMatcher,
 ): OperationResponseEntry[] {
-  if (!isRecord(root) || !isRecord(root.paths)) {
-    return [];
-  }
-
-  const ignoreMatcher = createRuleIgnoreMatcher(options);
+  const pathEntries = iterateRootPathItems(root, ctx);
   const knownOperationKeys = new Set<string>();
   const knownOperationNodes = new Set<unknown>();
 
-  for (const [pathTemplate, rawPathItem] of Object.entries(root.paths)) {
-    if (!pathTemplate.startsWith("/")) {
+  for (const pathEntry of pathEntries) {
+    const { pathTemplate, pathItem } = pathEntry;
+    if (!pathItem) {
       continue;
     }
     const isPollPath = extractOperationItemParam(pathTemplate) !== null;
@@ -1625,41 +902,23 @@ function collectOperationResponses(
     if (!isPollPath && !isCancelPath) {
       continue;
     }
-    const resolvedPathItem = resolveRecordWithLocation(
-      ctx.resolve,
-      rawPathItem,
-      ctx.location.child(["paths", pathTemplate]),
-    );
-    if (!resolvedPathItem) {
-      continue;
-    }
     const methodsToInspect = isPollPath ? (["get"] as const) : (["post"] as const);
     for (const method of methodsToInspect) {
-      const operation = resolvedPathItem.node[method];
+      const operation = pathItem[method];
       if (!isRecord(operation) || !isRecord(operation.responses)) {
         continue;
       }
+      const opLoc = pathEntry.operationLocation(method);
       for (const statusCode of ["200", "2XX"] as const) {
-        const rawResponse = operation.responses[statusCode];
-        if (!isRecord(rawResponse)) {
-          continue;
-        }
-        const resolvedResponse = resolveRecordWithLocation(
+        for (const jsonEntry of extractResponseJsonSchemas(
+          operation.responses[statusCode],
+          opLoc.child(["responses", statusCode]),
           ctx.resolve,
-          rawResponse,
-          resolvedPathItem.location.child([method, "responses", statusCode]),
-        );
-        if (!resolvedResponse || !isRecord(resolvedResponse.node.content)) {
-          continue;
-        }
-        for (const [mediaType, mediaObj] of Object.entries(resolvedResponse.node.content)) {
-          if (!JSON_MEDIA_TYPE_RE.test(mediaType) || !isRecord(mediaObj)) {
-            continue;
-          }
+        )) {
           collectRootAndDirectBranchSchemaKeys(
-            mediaObj.schema,
+            jsonEntry.schema,
             ctx.resolve,
-            resolvedResponse.location.source?.absoluteRef,
+            jsonEntry.responseLocation.source?.absoluteRef,
             knownOperationKeys,
             knownOperationNodes,
           );
@@ -1670,20 +929,11 @@ function collectOperationResponses(
 
   const entries: OperationResponseEntry[] = [];
 
-  for (const [pathTemplate, rawPathItem] of Object.entries(root.paths)) {
-    if (!pathTemplate.startsWith("/")) {
+  for (const pathEntry of pathEntries) {
+    const { pathTemplate, pathItem, pathUsageLocation } = pathEntry;
+    if (!pathItem) {
       continue;
     }
-    const pathUsageLocation = ctx.location.child(["paths", pathTemplate]);
-    const resolvedPathItem = resolveRecordWithLocation(ctx.resolve, rawPathItem, pathUsageLocation);
-    if (!resolvedPathItem) {
-      continue;
-    }
-    const {
-      node: pathItem,
-      location: pathItemLocation,
-      resolvedFromRef: pathFromRef,
-    } = resolvedPathItem;
     const isPollPath = extractOperationItemParam(pathTemplate) !== null;
     const isCancelPath = extractOperationCancelParam(pathTemplate) !== null;
 
@@ -1696,6 +946,8 @@ function collectOperationResponses(
         continue;
       }
       const operationResponses = operation.responses;
+      const opLoc = pathEntry.operationLocation(method);
+      const opFromRef = pathEntry.isOperationFromRef(method);
 
       const inspectStatusResponse = (
         statusCode: string,
@@ -1706,36 +958,22 @@ function collectOperationResponses(
         if (!isRecord(rawResponse)) {
           return false;
         }
-        const operationResponseLocation = pathFromRef
-          ? pathUsageLocation
-          : pathItemLocation.child([method, "responses", statusCode]);
-        const resolvedResponse = resolveRecordWithLocation(
-          ctx.resolve,
+        const responseUsageLocation = opLoc.child(["responses", statusCode]);
+        const operationResponseLocation = opFromRef ? pathUsageLocation : responseUsageLocation;
+        const jsonEntries = extractResponseJsonSchemas(
           rawResponse,
-          pathItemLocation.child([method, "responses", statusCode]),
+          responseUsageLocation,
+          ctx.resolve,
         );
-        if (!resolvedResponse || !isRecord(resolvedResponse.node.content)) {
+        if (jsonEntries.length === 0) {
           return false;
         }
-        const responseContent = resolvedResponse.node.content;
-        const {
-          node: responseNode,
-          location: responseLocation,
-          resolvedFromRef: responseFromRef,
-        } = resolvedResponse;
 
         let matchedAny = false;
-        for (const [mediaType, mediaObj] of Object.entries(responseContent)) {
-          if (!JSON_MEDIA_TYPE_RE.test(mediaType)) {
-            continue;
-          }
-          if (!isRecord(mediaObj) || mediaObj.schema === undefined) {
-            continue;
-          }
-          const schema = mediaObj.schema;
-          const schemaLocation = responseLocation.child(["content", mediaType, "schema"]);
+        for (const jsonEntry of jsonEntries) {
+          const { mediaType, schema, schemaLocation, responseNode, responseLocation } = jsonEntry;
           const reportBaseLocation =
-            pathFromRef || responseFromRef ? operationResponseLocation : schemaLocation;
+            opFromRef || jsonEntry.responseFromRef ? operationResponseLocation : schemaLocation;
           const rootSchemaName =
             isRecord(schema) && typeof schema.$ref === "string"
               ? extractComponentSchemaName(schema.$ref)
@@ -1815,25 +1053,10 @@ function collectOperationResponses(
   return entries;
 }
 
-function selectPropertyReportLocation(
-  prop: TrackedProperty | undefined,
-  schemaLocation: RedoclyLocation,
-  reportBaseLocation: RedoclyLocation,
-): RedoclyLocation {
-  if (
-    prop?.location &&
-    prop.location.source?.absoluteRef === reportBaseLocation.source?.absoluteRef &&
-    prop.location.pointer.startsWith(`${schemaLocation.pointer}/`)
-  ) {
-    return prop.location.key();
-  }
-  return reportBaseLocation;
-}
-
 function isVariantIgnored(
   variant: FlattenedObjectVariant,
   entry: OperationResponseEntry,
-  ignoreMatcher: ReturnType<typeof createRuleIgnoreMatcher>,
+  ignoreMatcher: RuleIgnoreMatcher,
 ): boolean {
   for (const schemaName of variant.schemaNames) {
     if (
@@ -1847,21 +1070,6 @@ function isVariantIgnored(
     }
   }
   return false;
-}
-
-function reportOnce(
-  ctx: RedoclyUserContext,
-  reported: Set<string>,
-  dedupeTag: string,
-  location: RedoclyLocation,
-  message: string,
-): void {
-  const key = `${locationKey(location)}::${dedupeTag}`;
-  if (reported.has(key)) {
-    return;
-  }
-  reported.add(key);
-  ctx.report({ message, location });
 }
 
 function entryPrefix(entry: OperationResponseEntry): string {
@@ -2213,372 +1421,335 @@ function validateErrorProblemDetails(
   }
 }
 
-export const ads0004OperationResourceShape: RedoclyOas3Rule = (options = {}) => {
-  const ignoreMatcher = createRuleIgnoreMatcher(options);
+export const ads0004OperationResourceShape: RedoclyOas3Rule = createRootRule(
+  ({ root, ctx, ignoreMatcher }) => {
+    const reported = new Set<string>();
 
-  return {
-    Root: {
-      leave(root, ctx) {
-        if (!isRecord(root) || !isRecord(root.paths)) {
-          return;
+    for (const pathEntry of iterateRootPathItems(root, ctx)) {
+      const { pathTemplate, pathItem, pathUsageLocation } = pathEntry;
+      if (!pathItem) {
+        continue;
+      }
+      const itemParam = extractOperationItemParam(pathTemplate);
+      const cancelParam = extractOperationCancelParam(pathTemplate);
+      const param = itemParam ?? cancelParam;
+      if (!param || param === "operationId") {
+        continue;
+      }
+      const relevantMethod = itemParam !== null ? "get" : "post";
+      if (!isRecord(pathItem[relevantMethod])) {
+        continue;
+      }
+      if (ignoreMatcher.isIgnored({ path: pathTemplate, method: relevantMethod })) {
+        continue;
+      }
+      reportOnce(
+        ctx,
+        reported,
+        `path-param:${param}`,
+        pathUsageLocation.key(),
+        `Operation route "${pathTemplate}" uses path parameter "{${param}}". Long-running operation routes must use "{operationId}" (ADS-0004).`,
+      );
+    }
+
+    const entries = collectOperationResponses(root, ctx, ignoreMatcher);
+    for (const entry of entries) {
+      if (entry.truncated) {
+        reportOnce(
+          ctx,
+          reported,
+          "variant-cap-exceeded",
+          entry.reportBaseLocation,
+          `${entryPrefix(entry)}: Operation schema exceeds the ${MAX_OBJECT_VARIANTS}-variant union analysis cap and could not be fully verified (ADS-0004).`,
+        );
+      }
+      for (const variant of entry.variants) {
+        if (isVariantIgnored(variant, entry, ignoreMatcher)) {
+          continue;
         }
-        const reported = new Set<string>();
-
-        for (const [pathTemplate, rawPathItem] of Object.entries(root.paths)) {
-          if (!pathTemplate.startsWith("/")) {
-            continue;
-          }
-          const itemParam = extractOperationItemParam(pathTemplate);
-          const cancelParam = extractOperationCancelParam(pathTemplate);
-          const param = itemParam ?? cancelParam;
-          if (!param || param === "operationId") {
-            continue;
-          }
-          const resolvedPathItem = resolveRecordWithLocation(
-            ctx.resolve,
-            rawPathItem,
-            ctx.location.child(["paths", pathTemplate]),
-          );
-          if (!resolvedPathItem) {
-            continue;
-          }
-          const relevantMethod = itemParam !== null ? "get" : "post";
-          if (!isRecord(resolvedPathItem.node[relevantMethod])) {
-            continue;
-          }
-          if (ignoreMatcher.isIgnored({ path: pathTemplate, method: relevantMethod })) {
-            continue;
-          }
+        if (!isNonNullObjectConstraint(variant.typeConstraint)) {
           reportOnce(
             ctx,
             reported,
-            `path-param:${param}`,
-            ctx.location.child(["paths", pathTemplate]).key(),
-            `Operation route "${pathTemplate}" uses path parameter "{${param}}". Long-running operation routes must use "{operationId}" (ADS-0004).`,
+            "non-object",
+            entry.reportBaseLocation,
+            `${entryPrefix(entry)}: Operation response must be a non-null flat top-level JSON object (ADS-0004).`,
           );
+          continue;
         }
 
-        const entries = collectOperationResponses(root, ctx, options);
-        for (const entry of entries) {
-          if (entry.truncated) {
+        const wrapperProp = isSingleKeyOperationWrapper(variant, ctx.resolve);
+        if (wrapperProp) {
+          reportOnce(
+            ctx,
+            reported,
+            "wrapped-operation",
+            selectPropertyReportLocation(
+              wrapperProp,
+              entry.schemaLocation,
+              entry.reportBaseLocation,
+            ),
+            `${entryPrefix(entry)}: Wraps the Operation resource under top-level key "operation". Return Operation fields directly at the top level (ADS-0004).`,
+          );
+          continue;
+        }
+
+        const props = variant.properties;
+        const synonymsFound = new Set<string>();
+
+        const checkSynonym = (
+          badKey: string,
+          canonicalKey: string,
+          customMessage: string,
+        ): void => {
+          const badProp = props.get(badKey);
+          if (!badProp) {
+            return;
+          }
+          synonymsFound.add(canonicalKey);
+          reportOnce(
+            ctx,
+            reported,
+            `synonym:${badKey}`,
+            selectPropertyReportLocation(badProp, entry.schemaLocation, entry.reportBaseLocation),
+            `${entryPrefix(entry)}: ${customMessage} (ADS-0004).`,
+          );
+        };
+
+        if (props.has("operationId")) {
+          checkSynonym(
+            "operationId",
+            "id",
+            props.has("id")
+              ? 'Operation schema defines "operationId" alongside "id". Use "id" as the primary identifier and qualify any related operation reference (for example "parentOperationId")'
+              : 'Operation schema uses "operationId" as its primary identifier without "id". Operation objects must use "id" as their primary identifier field',
+          );
+        }
+        checkSynonym(
+          "kind",
+          "type",
+          'Operation schema defines non-canonical field "kind". Use "type" in "<resource>.<action>" format instead',
+        );
+        checkSynonym(
+          "state",
+          "status",
+          'Operation schema defines non-canonical field "state". Use "status" as the lifecycle discriminator instead',
+        );
+        checkSynonym(
+          "submittedAt",
+          "createdAt",
+          'Operation schema defines non-canonical timestamp field "submittedAt". Use "createdAt" instead',
+        );
+        checkSynonym(
+          "resolvedAt",
+          "completedAt",
+          'Operation schema defines non-canonical timestamp field "resolvedAt". Use "completedAt" instead',
+        );
+        checkSynonym(
+          "endedAt",
+          "completedAt",
+          'Operation schema defines non-canonical timestamp field "endedAt". Use "completedAt" instead',
+        );
+        checkSynonym(
+          "result",
+          "response",
+          'Operation schema defines non-canonical field "result". Use "response" for the operation outcome instead',
+        );
+        checkSynonym(
+          "failure",
+          "error",
+          'Operation schema defines non-canonical field "failure". Use "error" (RFC 9457 Problem Details) instead',
+        );
+
+        for (const field of UNIVERSAL_OPERATION_FIELDS) {
+          const prop = props.get(field);
+          if (!prop) {
+            if (!synonymsFound.has(field)) {
+              reportOnce(
+                ctx,
+                reported,
+                `missing-field:${field}`,
+                entry.reportBaseLocation,
+                `${entryPrefix(entry)}: Operation schema is missing required canonical field "${field}" (ADS-0004).`,
+              );
+            }
+            continue;
+          }
+          if (!variant.required.has(field)) {
             reportOnce(
               ctx,
               reported,
-              "variant-cap-exceeded",
-              entry.reportBaseLocation,
-              `${entryPrefix(entry)}: Operation schema exceeds the ${MAX_OBJECT_VARIANTS}-variant union analysis cap and could not be fully verified (ADS-0004).`,
+              `optional-field:${field}`,
+              selectPropertyReportLocation(prop, entry.schemaLocation, entry.reportBaseLocation),
+              `${entryPrefix(entry)}: Operation schema must mark canonical field "${field}" as required (ADS-0004).`,
             );
           }
-          for (const variant of entry.variants) {
-            if (isVariantIgnored(variant, entry, ignoreMatcher)) {
-              continue;
-            }
-            if (!isNonNullObjectConstraint(variant.typeConstraint)) {
+        }
+
+        const idProp = props.get("id");
+        if (idProp && !isNonNullStringConstraint(propertyTypeConstraint(idProp, ctx.resolve))) {
+          reportOnce(
+            ctx,
+            reported,
+            "field-type:id",
+            selectPropertyReportLocation(idProp, entry.schemaLocation, entry.reportBaseLocation),
+            `${entryPrefix(entry)}: Operation "id" must be a non-null string (ADS-0004).`,
+          );
+        }
+
+        const typeProp = props.get("type");
+        if (typeProp && !isNonNullStringConstraint(propertyTypeConstraint(typeProp, ctx.resolve))) {
+          reportOnce(
+            ctx,
+            reported,
+            "field-type:type",
+            selectPropertyReportLocation(typeProp, entry.schemaLocation, entry.reportBaseLocation),
+            `${entryPrefix(entry)}: Operation "type" must be a non-null string (ADS-0004).`,
+          );
+        }
+
+        const statusProp = props.get("status");
+        if (statusProp) {
+          const statusLoc = selectPropertyReportLocation(
+            statusProp,
+            entry.schemaLocation,
+            entry.reportBaseLocation,
+          );
+          const statusTc = propertyTypeConstraint(statusProp, ctx.resolve);
+          if (!isNonNullStringConstraint(statusTc)) {
+            reportOnce(
+              ctx,
+              reported,
+              "field-type:status",
+              statusLoc,
+              `${entryPrefix(entry)}: Operation "status" must be a non-null string (ADS-0004).`,
+            );
+          } else {
+            const literals = propertyStringLiterals(statusProp, ctx.resolve);
+            if (literals.kind === "unconstrained") {
               reportOnce(
                 ctx,
                 reported,
-                "non-object",
-                entry.reportBaseLocation,
-                `${entryPrefix(entry)}: Operation response must be a non-null flat top-level JSON object (ADS-0004).`,
+                "status-unconstrained",
+                statusLoc,
+                `${entryPrefix(entry)}: Operation "status" must declare explicit enum or const value(s) from the canonical vocabulary (${CANONICAL_OPERATION_STATUSES.join(", ")}) (ADS-0004).`,
               );
-              continue;
-            }
-
-            const wrapperProp = isSingleKeyOperationWrapper(variant, ctx.resolve);
-            if (wrapperProp) {
-              reportOnce(
-                ctx,
-                reported,
-                "wrapped-operation",
-                selectPropertyReportLocation(
-                  wrapperProp,
-                  entry.schemaLocation,
-                  entry.reportBaseLocation,
-                ),
-                `${entryPrefix(entry)}: Wraps the Operation resource under top-level key "operation". Return Operation fields directly at the top level (ADS-0004).`,
-              );
-              continue;
-            }
-
-            const props = variant.properties;
-            const synonymsFound = new Set<string>();
-
-            const checkSynonym = (
-              badKey: string,
-              canonicalKey: string,
-              customMessage: string,
-            ): void => {
-              const badProp = props.get(badKey);
-              if (!badProp) {
-                return;
-              }
-              synonymsFound.add(canonicalKey);
-              reportOnce(
-                ctx,
-                reported,
-                `synonym:${badKey}`,
-                selectPropertyReportLocation(
-                  badProp,
-                  entry.schemaLocation,
-                  entry.reportBaseLocation,
-                ),
-                `${entryPrefix(entry)}: ${customMessage} (ADS-0004).`,
-              );
-            };
-
-            if (props.has("operationId")) {
-              checkSynonym(
-                "operationId",
-                "id",
-                props.has("id")
-                  ? 'Operation schema defines "operationId" alongside "id". Use "id" as the primary identifier and qualify any related operation reference (for example "parentOperationId")'
-                  : 'Operation schema uses "operationId" as its primary identifier without "id". Operation objects must use "id" as their primary identifier field',
-              );
-            }
-            checkSynonym(
-              "kind",
-              "type",
-              'Operation schema defines non-canonical field "kind". Use "type" in "<resource>.<action>" format instead',
-            );
-            checkSynonym(
-              "state",
-              "status",
-              'Operation schema defines non-canonical field "state". Use "status" as the lifecycle discriminator instead',
-            );
-            checkSynonym(
-              "submittedAt",
-              "createdAt",
-              'Operation schema defines non-canonical timestamp field "submittedAt". Use "createdAt" instead',
-            );
-            checkSynonym(
-              "resolvedAt",
-              "completedAt",
-              'Operation schema defines non-canonical timestamp field "resolvedAt". Use "completedAt" instead',
-            );
-            checkSynonym(
-              "endedAt",
-              "completedAt",
-              'Operation schema defines non-canonical timestamp field "endedAt". Use "completedAt" instead',
-            );
-            checkSynonym(
-              "result",
-              "response",
-              'Operation schema defines non-canonical field "result". Use "response" for the operation outcome instead',
-            );
-            checkSynonym(
-              "failure",
-              "error",
-              'Operation schema defines non-canonical field "failure". Use "error" (RFC 9457 Problem Details) instead',
-            );
-
-            for (const field of UNIVERSAL_OPERATION_FIELDS) {
-              const prop = props.get(field);
-              if (!prop) {
-                if (!synonymsFound.has(field)) {
-                  reportOnce(
-                    ctx,
-                    reported,
-                    `missing-field:${field}`,
-                    entry.reportBaseLocation,
-                    `${entryPrefix(entry)}: Operation schema is missing required canonical field "${field}" (ADS-0004).`,
-                  );
-                }
-                continue;
-              }
-              if (!variant.required.has(field)) {
+            } else {
+              const invalid = [...literals.values]
+                .filter((v) => !isCanonicalOperationStatus(v))
+                .sort();
+              if (invalid.length > 0 || literals.hasNonString || literals.values.size === 0) {
+                const formatted =
+                  invalid.length > 0 ? invalid.map((v) => `"${v}"`).join(", ") : "non-string value";
                 reportOnce(
                   ctx,
                   reported,
-                  `optional-field:${field}`,
-                  selectPropertyReportLocation(
-                    prop,
-                    entry.schemaLocation,
-                    entry.reportBaseLocation,
-                  ),
-                  `${entryPrefix(entry)}: Operation schema must mark canonical field "${field}" as required (ADS-0004).`,
-                );
-              }
-            }
-
-            const idProp = props.get("id");
-            if (idProp && !isNonNullStringConstraint(propertyTypeConstraint(idProp, ctx.resolve))) {
-              reportOnce(
-                ctx,
-                reported,
-                "field-type:id",
-                selectPropertyReportLocation(
-                  idProp,
-                  entry.schemaLocation,
-                  entry.reportBaseLocation,
-                ),
-                `${entryPrefix(entry)}: Operation "id" must be a non-null string (ADS-0004).`,
-              );
-            }
-
-            const typeProp = props.get("type");
-            if (
-              typeProp &&
-              !isNonNullStringConstraint(propertyTypeConstraint(typeProp, ctx.resolve))
-            ) {
-              reportOnce(
-                ctx,
-                reported,
-                "field-type:type",
-                selectPropertyReportLocation(
-                  typeProp,
-                  entry.schemaLocation,
-                  entry.reportBaseLocation,
-                ),
-                `${entryPrefix(entry)}: Operation "type" must be a non-null string (ADS-0004).`,
-              );
-            }
-
-            const statusProp = props.get("status");
-            if (statusProp) {
-              const statusLoc = selectPropertyReportLocation(
-                statusProp,
-                entry.schemaLocation,
-                entry.reportBaseLocation,
-              );
-              const statusTc = propertyTypeConstraint(statusProp, ctx.resolve);
-              if (!isNonNullStringConstraint(statusTc)) {
-                reportOnce(
-                  ctx,
-                  reported,
-                  "field-type:status",
+                  `status-invalid:${formatted}`,
                   statusLoc,
-                  `${entryPrefix(entry)}: Operation "status" must be a non-null string (ADS-0004).`,
-                );
-              } else {
-                const literals = propertyStringLiterals(statusProp, ctx.resolve);
-                if (literals.kind === "unconstrained") {
-                  reportOnce(
-                    ctx,
-                    reported,
-                    "status-unconstrained",
-                    statusLoc,
-                    `${entryPrefix(entry)}: Operation "status" must declare explicit enum or const value(s) from the canonical vocabulary (${CANONICAL_OPERATION_STATUSES.join(", ")}) (ADS-0004).`,
-                  );
-                } else {
-                  const invalid = [...literals.values]
-                    .filter((v) => !isCanonicalOperationStatus(v))
-                    .sort();
-                  if (invalid.length > 0 || literals.hasNonString || literals.values.size === 0) {
-                    const formatted =
-                      invalid.length > 0
-                        ? invalid.map((v) => `"${v}"`).join(", ")
-                        : "non-string value";
-                    reportOnce(
-                      ctx,
-                      reported,
-                      `status-invalid:${formatted}`,
-                      statusLoc,
-                      `${entryPrefix(entry)}: Operation "status" declares non-canonical value(s) ${formatted}. Status values must be a subset of: ${CANONICAL_OPERATION_STATUSES.join(", ")} (ADS-0004).`,
-                    );
-                  }
-                }
-              }
-            }
-
-            for (const tsField of ["createdAt", "updatedAt"] as const) {
-              const prop = props.get(tsField);
-              if (!prop) {
-                continue;
-              }
-              const loc = selectPropertyReportLocation(
-                prop,
-                entry.schemaLocation,
-                entry.reportBaseLocation,
-              );
-              const tc = propertyTypeConstraint(prop, ctx.resolve);
-              if (
-                !isNonNullStringConstraint(tc) ||
-                propertyStringFormat(prop, "date-time", ctx.resolve) !== "yes"
-              ) {
-                reportOnce(
-                  ctx,
-                  reported,
-                  `timestamp:${tsField}`,
-                  loc,
-                  `${entryPrefix(entry)}: Operation "${tsField}" must be a non-null RFC 3339 timestamp string with "format: date-time" (ADS-0004).`,
+                  `${entryPrefix(entry)}: Operation "status" declares non-canonical value(s) ${formatted}. Status values must be a subset of: ${CANONICAL_OPERATION_STATUSES.join(", ")} (ADS-0004).`,
                 );
               }
-            }
-
-            for (const nullableTsField of ["completedAt", "startedAt"] as const) {
-              const prop = props.get(nullableTsField);
-              if (!prop) {
-                continue;
-              }
-              const tc = propertyTypeConstraint(prop, ctx.resolve);
-              if (isStrictlyNullConstraint(tc)) {
-                continue;
-              }
-              const loc = selectPropertyReportLocation(
-                prop,
-                entry.schemaLocation,
-                entry.reportBaseLocation,
-              );
-              if (
-                !allowsOnlyNullOrString(tc) ||
-                propertyStringFormat(prop, "date-time", ctx.resolve) !== "yes"
-              ) {
-                reportOnce(
-                  ctx,
-                  reported,
-                  `timestamp:${nullableTsField}`,
-                  loc,
-                  `${entryPrefix(entry)}: Operation "${nullableTsField}" must be an RFC 3339 timestamp string with "format: date-time" when non-null (ADS-0004).`,
-                );
-              }
-            }
-
-            const cancellableProp = props.get("cancellable");
-            if (
-              cancellableProp &&
-              !isNonNullBooleanConstraint(propertyTypeConstraint(cancellableProp, ctx.resolve))
-            ) {
-              reportOnce(
-                ctx,
-                reported,
-                "field-type:cancellable",
-                selectPropertyReportLocation(
-                  cancellableProp,
-                  entry.schemaLocation,
-                  entry.reportBaseLocation,
-                ),
-                `${entryPrefix(entry)}: Operation "cancellable" must be a non-null boolean (ADS-0004).`,
-              );
-            }
-
-            const metadataProp = props.get("metadata");
-            if (metadataProp) {
-              const metaTc = propertyTypeConstraint(metadataProp, ctx.resolve);
-              if (!allowsOnlyNullOrObject(metaTc)) {
-                reportOnce(
-                  ctx,
-                  reported,
-                  "field-type:metadata",
-                  selectPropertyReportLocation(
-                    metadataProp,
-                    entry.schemaLocation,
-                    entry.reportBaseLocation,
-                  ),
-                  `${entryPrefix(entry)}: Operation "metadata" must be a structured JSON object (ADS-0004).`,
-                );
-              }
-            }
-
-            const errorProp = props.get("error");
-            if (errorProp) {
-              validateErrorProblemDetails(errorProp, entry, ctx, reported);
             }
           }
         }
-      },
-    },
-  };
-};
+
+        for (const tsField of ["createdAt", "updatedAt"] as const) {
+          const prop = props.get(tsField);
+          if (!prop) {
+            continue;
+          }
+          const loc = selectPropertyReportLocation(
+            prop,
+            entry.schemaLocation,
+            entry.reportBaseLocation,
+          );
+          const tc = propertyTypeConstraint(prop, ctx.resolve);
+          if (
+            !isNonNullStringConstraint(tc) ||
+            propertyStringFormat(prop, "date-time", ctx.resolve) !== "yes"
+          ) {
+            reportOnce(
+              ctx,
+              reported,
+              `timestamp:${tsField}`,
+              loc,
+              `${entryPrefix(entry)}: Operation "${tsField}" must be a non-null RFC 3339 timestamp string with "format: date-time" (ADS-0004).`,
+            );
+          }
+        }
+
+        for (const nullableTsField of ["completedAt", "startedAt"] as const) {
+          const prop = props.get(nullableTsField);
+          if (!prop) {
+            continue;
+          }
+          const tc = propertyTypeConstraint(prop, ctx.resolve);
+          if (isStrictlyNullConstraint(tc)) {
+            continue;
+          }
+          const loc = selectPropertyReportLocation(
+            prop,
+            entry.schemaLocation,
+            entry.reportBaseLocation,
+          );
+          if (
+            !allowsOnlyNullOrString(tc) ||
+            propertyStringFormat(prop, "date-time", ctx.resolve) !== "yes"
+          ) {
+            reportOnce(
+              ctx,
+              reported,
+              `timestamp:${nullableTsField}`,
+              loc,
+              `${entryPrefix(entry)}: Operation "${nullableTsField}" must be an RFC 3339 timestamp string with "format: date-time" when non-null (ADS-0004).`,
+            );
+          }
+        }
+
+        const cancellableProp = props.get("cancellable");
+        if (
+          cancellableProp &&
+          !isNonNullBooleanConstraint(propertyTypeConstraint(cancellableProp, ctx.resolve))
+        ) {
+          reportOnce(
+            ctx,
+            reported,
+            "field-type:cancellable",
+            selectPropertyReportLocation(
+              cancellableProp,
+              entry.schemaLocation,
+              entry.reportBaseLocation,
+            ),
+            `${entryPrefix(entry)}: Operation "cancellable" must be a non-null boolean (ADS-0004).`,
+          );
+        }
+
+        const metadataProp = props.get("metadata");
+        if (metadataProp) {
+          const metaTc = propertyTypeConstraint(metadataProp, ctx.resolve);
+          if (!allowsOnlyNullOrObject(metaTc)) {
+            reportOnce(
+              ctx,
+              reported,
+              "field-type:metadata",
+              selectPropertyReportLocation(
+                metadataProp,
+                entry.schemaLocation,
+                entry.reportBaseLocation,
+              ),
+              `${entryPrefix(entry)}: Operation "metadata" must be a structured JSON object (ADS-0004).`,
+            );
+          }
+        }
+
+        const errorProp = props.get("error");
+        if (errorProp) {
+          validateErrorProblemDetails(errorProp, entry, ctx, reported);
+        }
+      }
+    }
+  },
+);
 
 function validateRequiresActionNextAction(
   nextActionProp: TrackedProperty,
@@ -2917,319 +2088,302 @@ function shareDifferentOneOfBranch(a: FlattenedObjectVariant, b: FlattenedObject
   return false;
 }
 
-export const ads0004OperationStatusInvariants: RedoclyOas3Rule = (options = {}) => {
-  const ignoreMatcher = createRuleIgnoreMatcher(options);
+export const ads0004OperationStatusInvariants: RedoclyOas3Rule = createRootRule(
+  ({ root, ctx, ignoreMatcher }) => {
+    const entries = collectOperationResponses(root, ctx, ignoreMatcher);
+    const reported = new Set<string>();
 
-  return {
-    Root: {
-      leave(root, ctx) {
-        const entries = collectOperationResponses(root, ctx, options);
-        const reported = new Set<string>();
+    for (const entry of entries) {
+      if (entry.truncated) {
+        reportOnce(
+          ctx,
+          reported,
+          "variant-cap-exceeded",
+          entry.reportBaseLocation,
+          `${entryPrefix(entry)}: Operation schema exceeds the ${MAX_OBJECT_VARIANTS}-variant union analysis cap and could not be fully verified (ADS-0004).`,
+        );
+      }
 
-        for (const entry of entries) {
-          if (entry.truncated) {
-            reportOnce(
-              ctx,
-              reported,
-              "variant-cap-exceeded",
-              entry.reportBaseLocation,
-              `${entryPrefix(entry)}: Operation schema exceeds the ${MAX_OBJECT_VARIANTS}-variant union analysis cap and could not be fully verified (ADS-0004).`,
-            );
-          }
+      const checkedVariants: {
+        readonly variant: FlattenedObjectVariant;
+        readonly statuses: readonly CanonicalOperationStatus[];
+      }[] = [];
 
-          const checkedVariants: {
-            readonly variant: FlattenedObjectVariant;
-            readonly statuses: readonly CanonicalOperationStatus[];
-          }[] = [];
+      for (const variant of entry.variants) {
+        if (isVariantIgnored(variant, entry, ignoreMatcher)) {
+          continue;
+        }
+        if (
+          !isNonNullObjectConstraint(variant.typeConstraint) ||
+          isSingleKeyOperationWrapper(variant, ctx.resolve)
+        ) {
+          continue;
+        }
 
-          for (const variant of entry.variants) {
-            if (isVariantIgnored(variant, entry, ignoreMatcher)) {
-              continue;
-            }
-            if (
-              !isNonNullObjectConstraint(variant.typeConstraint) ||
-              isSingleKeyOperationWrapper(variant, ctx.resolve)
-            ) {
-              continue;
-            }
+        const statusProp = variant.properties.get("status");
+        if (!statusProp) {
+          continue;
+        }
+        const statusLits = propertyStringLiterals(statusProp, ctx.resolve);
+        if (statusLits.kind !== "values" || statusLits.values.size === 0) {
+          continue;
+        }
+        const statuses = [...statusLits.values]
+          .filter((v): v is CanonicalOperationStatus => isCanonicalOperationStatus(v))
+          .sort();
+        if (statuses.length === 0) {
+          continue;
+        }
 
-            const statusProp = variant.properties.get("status");
-            if (!statusProp) {
-              continue;
-            }
-            const statusLits = propertyStringLiterals(statusProp, ctx.resolve);
-            if (statusLits.kind !== "values" || statusLits.values.size === 0) {
-              continue;
-            }
-            const statuses = [...statusLits.values]
-              .filter((v): v is CanonicalOperationStatus => isCanonicalOperationStatus(v))
-              .sort();
-            if (statuses.length === 0) {
-              continue;
-            }
+        checkedVariants.push({ variant, statuses });
 
-            checkedVariants.push({ variant, statuses });
-
-            for (const branchSet of variant.oneOfBranches.values()) {
-              if (branchSet.size >= 2) {
-                for (const overlapStatus of statuses) {
-                  reportOnce(
-                    ctx,
-                    reported,
-                    `oneof-status-overlap:${overlapStatus}`,
-                    entry.reportBaseLocation,
-                    `${entryPrefix(entry)}: Operation "oneOf" union matches status "${overlapStatus}" in multiple branches. Each status value in a discriminated "oneOf" union must match at most one branch (ADS-0004).`,
-                  );
-                }
-              }
-            }
-
-            const hasRequiresAction = statuses.includes("requires_action");
-            const hasNonRequiresAction = statuses.some((s) => s !== "requires_action");
-            const hasNonTerminal = statuses.some((s) => NON_TERMINAL_STATUS_SET.has(s));
-            const hasTerminal = statuses.some((s) => TERMINAL_STATUS_SET.has(s));
-            const hasFailed = statuses.includes("failed");
-            const hasNonFailedTerminal = statuses.some(
-              (s) => s === "succeeded" || s === "cancelled",
-            );
-            const hasSucceeded = statuses.includes("succeeded");
-            const hasCancelled = statuses.includes("cancelled");
-
-            if (hasRequiresAction && hasNonRequiresAction) {
-              const others = statuses.filter((s) => s !== "requires_action").join(", ");
+        for (const branchSet of variant.oneOfBranches.values()) {
+          if (branchSet.size >= 2) {
+            for (const overlapStatus of statuses) {
               reportOnce(
                 ctx,
                 reported,
-                `mixed-requires-action:${statuses.join(",")}`,
+                `oneof-status-overlap:${overlapStatus}`,
                 entry.reportBaseLocation,
-                `${entryPrefix(entry)}: Operation variant combines "requires_action" with other status value(s) (${others}). Split "requires_action" into its own discriminated branch so "nextAction" is required and non-null exclusively when status is "requires_action" (ADS-0004).`,
+                `${entryPrefix(entry)}: Operation "oneOf" union matches status "${overlapStatus}" in multiple branches. Each status value in a discriminated "oneOf" union must match at most one branch (ADS-0004).`,
               );
-              continue;
-            }
-
-            if (hasNonTerminal && hasTerminal) {
-              reportOnce(
-                ctx,
-                reported,
-                `mixed-terminal:${statuses.join(",")}`,
-                entry.reportBaseLocation,
-                `${entryPrefix(entry)}: Operation variant mixes non-terminal and terminal statuses (${statuses.join(", ")}). Model the Operation as a discriminated union on "status" so non-terminal and terminal invariants hold per branch (ADS-0004).`,
-              );
-              continue;
-            }
-
-            if (hasFailed && hasNonFailedTerminal) {
-              reportOnce(
-                ctx,
-                reported,
-                `mixed-failed:${statuses.join(",")}`,
-                entry.reportBaseLocation,
-                `${entryPrefix(entry)}: Operation variant mixes "failed" with other terminal statuses (${statuses.join(", ")}). Split "failed" into its own discriminated branch so "error" is non-null exclusively when status is "failed" (ADS-0004).`,
-              );
-              continue;
-            }
-
-            const completedAtProp = variant.properties.get("completedAt");
-            const responseProp = variant.properties.get("response");
-            const errorProp = variant.properties.get("error");
-            const nextActionProp = variant.properties.get("nextAction");
-
-            if (hasRequiresAction) {
-              if (!nextActionProp) {
-                reportOnce(
-                  ctx,
-                  reported,
-                  "requires-action-missing-next-action",
-                  entry.reportBaseLocation,
-                  `${entryPrefix(entry)}: Operation "requires_action" branch must declare a required non-null "nextAction" object (ADS-0004).`,
-                );
-              } else {
-                if (!variant.required.has("nextAction")) {
-                  reportOnce(
-                    ctx,
-                    reported,
-                    "requires-action-optional-next-action",
-                    selectPropertyReportLocation(
-                      nextActionProp,
-                      entry.schemaLocation,
-                      entry.reportBaseLocation,
-                    ),
-                    `${entryPrefix(entry)}: Operation "requires_action" branch must mark "nextAction" as required (ADS-0004).`,
-                  );
-                }
-                validateRequiresActionNextAction(nextActionProp, entry, ctx, reported);
-              }
-            } else if (nextActionProp) {
-              const nextActionTc = propertyTypeConstraint(nextActionProp, ctx.resolve);
-              if (allowsNonNullConstraint(nextActionTc)) {
-                reportOnce(
-                  ctx,
-                  reported,
-                  `non-requires-action-next-action:${statuses.join(",")}`,
-                  selectPropertyReportLocation(
-                    nextActionProp,
-                    entry.schemaLocation,
-                    entry.reportBaseLocation,
-                  ),
-                  `${entryPrefix(entry)}: Operation branch (${statuses.join(", ")}) allows non-null "nextAction". "nextAction" must be null (or omitted) on every status other than "requires_action" (ADS-0004).`,
-                );
-              }
-            }
-
-            if (hasNonTerminal) {
-              for (const nullField of ["completedAt", "response", "error"] as const) {
-                const prop = variant.properties.get(nullField);
-                if (!prop) {
-                  continue;
-                }
-                const tc = propertyTypeConstraint(prop, ctx.resolve);
-                if (allowsNonNullConstraint(tc)) {
-                  reportOnce(
-                    ctx,
-                    reported,
-                    `non-terminal-non-null:${statuses.join(",")}:${nullField}`,
-                    selectPropertyReportLocation(
-                      prop,
-                      entry.schemaLocation,
-                      entry.reportBaseLocation,
-                    ),
-                    `${entryPrefix(entry)}: Non-terminal Operation branch (${statuses.join(", ")}) must constrain "${nullField}" to null (ADS-0004).`,
-                  );
-                }
-              }
-              continue;
-            }
-
-            if (completedAtProp) {
-              const completedAtTc = propertyTypeConstraint(completedAtProp, ctx.resolve);
-              if (
-                allowsNullConstraint(completedAtTc) ||
-                !isNonNullStringConstraint(completedAtTc)
-              ) {
-                reportOnce(
-                  ctx,
-                  reported,
-                  `terminal-completed-at:${statuses.join(",")}`,
-                  selectPropertyReportLocation(
-                    completedAtProp,
-                    entry.schemaLocation,
-                    entry.reportBaseLocation,
-                  ),
-                  `${entryPrefix(entry)}: Terminal Operation branch (${statuses.join(", ")}) must constrain "completedAt" to a non-null RFC 3339 date-time string (ADS-0004).`,
-                );
-              }
-            }
-
-            if (hasFailed) {
-              if (errorProp) {
-                const errorTc = propertyTypeConstraint(errorProp, ctx.resolve);
-                if (allowsNullConstraint(errorTc) || !isNonNullObjectConstraint(errorTc)) {
-                  reportOnce(
-                    ctx,
-                    reported,
-                    "failed-error-nullable",
-                    selectPropertyReportLocation(
-                      errorProp,
-                      entry.schemaLocation,
-                      entry.reportBaseLocation,
-                    ),
-                    `${entryPrefix(entry)}: Operation "failed" branch must require a non-null RFC 9457 Problem Details object in "error" (ADS-0004).`,
-                  );
-                }
-              }
-              if (responseProp) {
-                const responseTc = propertyTypeConstraint(responseProp, ctx.resolve);
-                if (allowsNonNullConstraint(responseTc)) {
-                  reportOnce(
-                    ctx,
-                    reported,
-                    "failed-response-non-null",
-                    selectPropertyReportLocation(
-                      responseProp,
-                      entry.schemaLocation,
-                      entry.reportBaseLocation,
-                    ),
-                    `${entryPrefix(entry)}: Operation "failed" branch must constrain "response" to null (ADS-0004).`,
-                  );
-                }
-              }
-              continue;
-            }
-
-            if (errorProp) {
-              const errorTc = propertyTypeConstraint(errorProp, ctx.resolve);
-              if (allowsNonNullConstraint(errorTc)) {
-                reportOnce(
-                  ctx,
-                  reported,
-                  `terminal-error-non-null:${statuses.join(",")}`,
-                  selectPropertyReportLocation(
-                    errorProp,
-                    entry.schemaLocation,
-                    entry.reportBaseLocation,
-                  ),
-                  `${entryPrefix(entry)}: Operation branch (${statuses.join(", ")}) must constrain "error" to null (ADS-0004).`,
-                );
-              }
-            }
-
-            if (hasCancelled && responseProp) {
-              const responseTc = propertyTypeConstraint(responseProp, ctx.resolve);
-              if (allowsNonNullConstraint(responseTc)) {
-                reportOnce(
-                  ctx,
-                  reported,
-                  hasSucceeded
-                    ? "mixed-succeeded-cancelled-response"
-                    : "cancelled-response-non-null",
-                  selectPropertyReportLocation(
-                    responseProp,
-                    entry.schemaLocation,
-                    entry.reportBaseLocation,
-                  ),
-                  hasSucceeded
-                    ? `${entryPrefix(entry)}: Operation variant combines "succeeded" and "cancelled" with a non-null "response". Split "cancelled" into its own branch with "response: null" (ADS-0004).`
-                    : `${entryPrefix(entry)}: Operation "cancelled" branch must constrain "response" to null (ADS-0004).`,
-                );
-              }
-            }
-          }
-
-          for (let i = 0; i < checkedVariants.length; i += 1) {
-            const left = checkedVariants[i];
-            if (!left) {
-              continue;
-            }
-            for (let j = i + 1; j < checkedVariants.length; j += 1) {
-              const right = checkedVariants[j];
-              if (!right || !shareDifferentOneOfBranch(left.variant, right.variant)) {
-                continue;
-              }
-              const overlappingStatuses = left.statuses.filter((status) =>
-                right.statuses.includes(status),
-              );
-              if (overlappingStatuses.length === 0) {
-                continue;
-              }
-              if (areVariantsDisjointOnOtherFields(left.variant, right.variant, ctx.resolve)) {
-                continue;
-              }
-              for (const overlapStatus of overlappingStatuses) {
-                reportOnce(
-                  ctx,
-                  reported,
-                  `oneof-status-overlap:${overlapStatus}`,
-                  entry.reportBaseLocation,
-                  `${entryPrefix(entry)}: Operation "oneOf" union matches status "${overlapStatus}" in multiple branches. Each status value in a discriminated "oneOf" union must match at most one branch (ADS-0004).`,
-                );
-              }
             }
           }
         }
-      },
-    },
-  };
-};
+
+        const hasRequiresAction = statuses.includes("requires_action");
+        const hasNonRequiresAction = statuses.some((s) => s !== "requires_action");
+        const hasNonTerminal = statuses.some((s) => NON_TERMINAL_STATUS_SET.has(s));
+        const hasTerminal = statuses.some((s) => TERMINAL_STATUS_SET.has(s));
+        const hasFailed = statuses.includes("failed");
+        const hasNonFailedTerminal = statuses.some((s) => s === "succeeded" || s === "cancelled");
+        const hasSucceeded = statuses.includes("succeeded");
+        const hasCancelled = statuses.includes("cancelled");
+
+        if (hasRequiresAction && hasNonRequiresAction) {
+          const others = statuses.filter((s) => s !== "requires_action").join(", ");
+          reportOnce(
+            ctx,
+            reported,
+            `mixed-requires-action:${statuses.join(",")}`,
+            entry.reportBaseLocation,
+            `${entryPrefix(entry)}: Operation variant combines "requires_action" with other status value(s) (${others}). Split "requires_action" into its own discriminated branch so "nextAction" is required and non-null exclusively when status is "requires_action" (ADS-0004).`,
+          );
+          continue;
+        }
+
+        if (hasNonTerminal && hasTerminal) {
+          reportOnce(
+            ctx,
+            reported,
+            `mixed-terminal:${statuses.join(",")}`,
+            entry.reportBaseLocation,
+            `${entryPrefix(entry)}: Operation variant mixes non-terminal and terminal statuses (${statuses.join(", ")}). Model the Operation as a discriminated union on "status" so non-terminal and terminal invariants hold per branch (ADS-0004).`,
+          );
+          continue;
+        }
+
+        if (hasFailed && hasNonFailedTerminal) {
+          reportOnce(
+            ctx,
+            reported,
+            `mixed-failed:${statuses.join(",")}`,
+            entry.reportBaseLocation,
+            `${entryPrefix(entry)}: Operation variant mixes "failed" with other terminal statuses (${statuses.join(", ")}). Split "failed" into its own discriminated branch so "error" is non-null exclusively when status is "failed" (ADS-0004).`,
+          );
+          continue;
+        }
+
+        const completedAtProp = variant.properties.get("completedAt");
+        const responseProp = variant.properties.get("response");
+        const errorProp = variant.properties.get("error");
+        const nextActionProp = variant.properties.get("nextAction");
+
+        if (hasRequiresAction) {
+          if (!nextActionProp) {
+            reportOnce(
+              ctx,
+              reported,
+              "requires-action-missing-next-action",
+              entry.reportBaseLocation,
+              `${entryPrefix(entry)}: Operation "requires_action" branch must declare a required non-null "nextAction" object (ADS-0004).`,
+            );
+          } else {
+            if (!variant.required.has("nextAction")) {
+              reportOnce(
+                ctx,
+                reported,
+                "requires-action-optional-next-action",
+                selectPropertyReportLocation(
+                  nextActionProp,
+                  entry.schemaLocation,
+                  entry.reportBaseLocation,
+                ),
+                `${entryPrefix(entry)}: Operation "requires_action" branch must mark "nextAction" as required (ADS-0004).`,
+              );
+            }
+            validateRequiresActionNextAction(nextActionProp, entry, ctx, reported);
+          }
+        } else if (nextActionProp) {
+          const nextActionTc = propertyTypeConstraint(nextActionProp, ctx.resolve);
+          if (allowsNonNullConstraint(nextActionTc)) {
+            reportOnce(
+              ctx,
+              reported,
+              `non-requires-action-next-action:${statuses.join(",")}`,
+              selectPropertyReportLocation(
+                nextActionProp,
+                entry.schemaLocation,
+                entry.reportBaseLocation,
+              ),
+              `${entryPrefix(entry)}: Operation branch (${statuses.join(", ")}) allows non-null "nextAction". "nextAction" must be null (or omitted) on every status other than "requires_action" (ADS-0004).`,
+            );
+          }
+        }
+
+        if (hasNonTerminal) {
+          for (const nullField of ["completedAt", "response", "error"] as const) {
+            const prop = variant.properties.get(nullField);
+            if (!prop) {
+              continue;
+            }
+            const tc = propertyTypeConstraint(prop, ctx.resolve);
+            if (allowsNonNullConstraint(tc)) {
+              reportOnce(
+                ctx,
+                reported,
+                `non-terminal-non-null:${statuses.join(",")}:${nullField}`,
+                selectPropertyReportLocation(prop, entry.schemaLocation, entry.reportBaseLocation),
+                `${entryPrefix(entry)}: Non-terminal Operation branch (${statuses.join(", ")}) must constrain "${nullField}" to null (ADS-0004).`,
+              );
+            }
+          }
+          continue;
+        }
+
+        if (completedAtProp) {
+          const completedAtTc = propertyTypeConstraint(completedAtProp, ctx.resolve);
+          if (allowsNullConstraint(completedAtTc) || !isNonNullStringConstraint(completedAtTc)) {
+            reportOnce(
+              ctx,
+              reported,
+              `terminal-completed-at:${statuses.join(",")}`,
+              selectPropertyReportLocation(
+                completedAtProp,
+                entry.schemaLocation,
+                entry.reportBaseLocation,
+              ),
+              `${entryPrefix(entry)}: Terminal Operation branch (${statuses.join(", ")}) must constrain "completedAt" to a non-null RFC 3339 date-time string (ADS-0004).`,
+            );
+          }
+        }
+
+        if (hasFailed) {
+          if (errorProp) {
+            const errorTc = propertyTypeConstraint(errorProp, ctx.resolve);
+            if (allowsNullConstraint(errorTc) || !isNonNullObjectConstraint(errorTc)) {
+              reportOnce(
+                ctx,
+                reported,
+                "failed-error-nullable",
+                selectPropertyReportLocation(
+                  errorProp,
+                  entry.schemaLocation,
+                  entry.reportBaseLocation,
+                ),
+                `${entryPrefix(entry)}: Operation "failed" branch must require a non-null RFC 9457 Problem Details object in "error" (ADS-0004).`,
+              );
+            }
+          }
+          if (responseProp) {
+            const responseTc = propertyTypeConstraint(responseProp, ctx.resolve);
+            if (allowsNonNullConstraint(responseTc)) {
+              reportOnce(
+                ctx,
+                reported,
+                "failed-response-non-null",
+                selectPropertyReportLocation(
+                  responseProp,
+                  entry.schemaLocation,
+                  entry.reportBaseLocation,
+                ),
+                `${entryPrefix(entry)}: Operation "failed" branch must constrain "response" to null (ADS-0004).`,
+              );
+            }
+          }
+          continue;
+        }
+
+        if (errorProp) {
+          const errorTc = propertyTypeConstraint(errorProp, ctx.resolve);
+          if (allowsNonNullConstraint(errorTc)) {
+            reportOnce(
+              ctx,
+              reported,
+              `terminal-error-non-null:${statuses.join(",")}`,
+              selectPropertyReportLocation(
+                errorProp,
+                entry.schemaLocation,
+                entry.reportBaseLocation,
+              ),
+              `${entryPrefix(entry)}: Operation branch (${statuses.join(", ")}) must constrain "error" to null (ADS-0004).`,
+            );
+          }
+        }
+
+        if (hasCancelled && responseProp) {
+          const responseTc = propertyTypeConstraint(responseProp, ctx.resolve);
+          if (allowsNonNullConstraint(responseTc)) {
+            reportOnce(
+              ctx,
+              reported,
+              hasSucceeded ? "mixed-succeeded-cancelled-response" : "cancelled-response-non-null",
+              selectPropertyReportLocation(
+                responseProp,
+                entry.schemaLocation,
+                entry.reportBaseLocation,
+              ),
+              hasSucceeded
+                ? `${entryPrefix(entry)}: Operation variant combines "succeeded" and "cancelled" with a non-null "response". Split "cancelled" into its own branch with "response: null" (ADS-0004).`
+                : `${entryPrefix(entry)}: Operation "cancelled" branch must constrain "response" to null (ADS-0004).`,
+            );
+          }
+        }
+      }
+
+      for (let i = 0; i < checkedVariants.length; i += 1) {
+        const left = checkedVariants[i];
+        if (!left) {
+          continue;
+        }
+        for (let j = i + 1; j < checkedVariants.length; j += 1) {
+          const right = checkedVariants[j];
+          if (!right || !shareDifferentOneOfBranch(left.variant, right.variant)) {
+            continue;
+          }
+          const overlappingStatuses = left.statuses.filter((status) =>
+            right.statuses.includes(status),
+          );
+          if (overlappingStatuses.length === 0) {
+            continue;
+          }
+          if (areVariantsDisjointOnOtherFields(left.variant, right.variant, ctx.resolve)) {
+            continue;
+          }
+          for (const overlapStatus of overlappingStatuses) {
+            reportOnce(
+              ctx,
+              reported,
+              `oneof-status-overlap:${overlapStatus}`,
+              entry.reportBaseLocation,
+              `${entryPrefix(entry)}: Operation "oneOf" union matches status "${overlapStatus}" in multiple branches. Each status value in a discriminated "oneOf" union must match at most one branch (ADS-0004).`,
+            );
+          }
+        }
+      }
+    }
+  },
+);
 
 function responseHasLocationHeader(responseNode: UnknownRecord): boolean {
   if (!isRecord(responseNode.headers)) {
@@ -3243,156 +2397,90 @@ function responseHasLocationHeader(responseNode: UnknownRecord): boolean {
   return false;
 }
 
-export const ads0004AcceptedOperationHeaders: RedoclyOas3Rule = (options = {}) => {
-  const ignoreMatcher = createRuleIgnoreMatcher(options);
+export const ads0004AcceptedOperationHeaders: RedoclyOas3Rule = createRootRule(
+  ({ root, ctx, ignoreMatcher, reportOnce: report }) => {
+    const entries = collectOperationResponses(root, ctx, ignoreMatcher);
 
-  return {
-    Root: {
-      leave(root, ctx) {
-        const entries = collectOperationResponses(root, ctx, options);
-        const reported = new Set<string>();
+    for (const entry of entries) {
+      if (entry.kind !== "accepted") {
+        continue;
+      }
+      if (
+        entry.variants.length > 0 &&
+        entry.variants.every((variant) => isVariantIgnored(variant, entry, ignoreMatcher))
+      ) {
+        continue;
+      }
+      if (responseHasLocationHeader(entry.responseNode)) {
+        continue;
+      }
+      report(
+        `missing-location:${entry.pathTemplate}:${entry.method}`,
+        entry.reportBaseLocation,
+        `${entryPrefix(entry)}: 202 Accepted Operation response must declare a "Location" header pointing to the canonical poll URL ("GET <scope>/operations/{operationId}") (ADS-0004).`,
+      );
+    }
+  },
+);
 
-        for (const entry of entries) {
-          if (entry.kind !== "accepted") {
-            continue;
-          }
-          if (
-            entry.variants.length > 0 &&
-            entry.variants.every((variant) => isVariantIgnored(variant, entry, ignoreMatcher))
-          ) {
-            continue;
-          }
-          if (responseHasLocationHeader(entry.responseNode)) {
-            continue;
-          }
-          reportOnce(
-            ctx,
-            reported,
-            `missing-location:${entry.pathTemplate}:${entry.method}`,
-            entry.reportBaseLocation,
-            `${entryPrefix(entry)}: 202 Accepted Operation response must declare a "Location" header pointing to the canonical poll URL ("GET <scope>/operations/{operationId}") (ADS-0004).`,
-          );
-        }
-      },
-    },
-  };
-};
+export const ads0004OperationCancelMethod: RedoclyOas3Rule = createRootRule(
+  ({ root, ctx, ignoreMatcher, reportOnce: report }) => {
+    for (const pathEntry of iterateRootPathItems(root, ctx)) {
+      const { pathTemplate, pathItem } = pathEntry;
+      if (!pathItem) {
+        continue;
+      }
+      const isDeleteTarget = isOperationDeletePath(pathTemplate);
+      const isCancelTarget = extractOperationCancelParam(pathTemplate) !== null;
+      if (!isDeleteTarget && !isCancelTarget) {
+        continue;
+      }
 
-export const ads0004OperationCancelMethod: RedoclyOas3Rule = (options = {}) => {
-  const ignoreMatcher = createRuleIgnoreMatcher(options);
+      if (
+        isDeleteTarget &&
+        isRecord(pathItem.delete) &&
+        !ignoreMatcher.isIgnored({ path: pathTemplate, method: "delete" })
+      ) {
+        report(
+          `forbid-delete:${pathTemplate}`,
+          pathEntry.operationReportLocation("delete"),
+          `DELETE "${pathTemplate}" is not allowed on operation endpoints. Cancellation must use POST ".../operations/{operationId}/cancel" instead of DELETE (ADS-0004).`,
+        );
+      }
 
-  return {
-    Root: {
-      leave(root, ctx) {
-        if (!isRecord(root) || !isRecord(root.paths)) {
-          return;
-        }
-        const reported = new Set<string>();
-
-        for (const [pathTemplate, rawPathItem] of Object.entries(root.paths)) {
-          if (!pathTemplate.startsWith("/")) {
-            continue;
-          }
-          const isDeleteTarget = isOperationDeletePath(pathTemplate);
-          const isCancelTarget = extractOperationCancelParam(pathTemplate) !== null;
-          if (!isDeleteTarget && !isCancelTarget) {
-            continue;
-          }
-
-          const pathUsageLocation = ctx.location.child(["paths", pathTemplate]);
-          const resolvedPathItem = resolveRecordWithLocation(
+      if (
+        isCancelTarget &&
+        isRecord(pathItem.post) &&
+        !ignoreMatcher.isIgnored({ path: pathTemplate, method: "post" })
+      ) {
+        const postOp = pathItem.post;
+        const responses = isRecord(postOp.responses) ? postOp.responses : null;
+        const postLoc = pathEntry.operationLocation("post");
+        const has200Json =
+          responses !== null &&
+          extractOperationJsonResponseSchemas(
+            postOp,
+            postLoc,
             ctx.resolve,
-            rawPathItem,
-            pathUsageLocation,
+            isRecord(responses["200"]) ? ["200"] : ["2XX"],
+          ).length > 0;
+
+        if (!has200Json) {
+          const postReportLoc = pathEntry.isOperationFromRef("post")
+            ? pathEntry.pathUsageLocation.key()
+            : responses
+              ? postLoc.child(["responses"]).key()
+              : postLoc.key();
+          report(
+            `cancel-missing-200:${pathTemplate}`,
+            postReportLoc,
+            `POST "${pathTemplate}" must declare a 200 JSON response returning the updated Operation resource (ADS-0004).`,
           );
-          if (!resolvedPathItem) {
-            continue;
-          }
-          const {
-            node: pathItem,
-            location: pathItemLocation,
-            resolvedFromRef: pathFromRef,
-          } = resolvedPathItem;
-
-          if (
-            isDeleteTarget &&
-            isRecord(pathItem.delete) &&
-            !ignoreMatcher.isIgnored({ path: pathTemplate, method: "delete" })
-          ) {
-            const deleteLoc = pathFromRef
-              ? pathUsageLocation.key()
-              : pathItemLocation.child(["delete"]).key();
-            reportOnce(
-              ctx,
-              reported,
-              `forbid-delete:${pathTemplate}`,
-              deleteLoc,
-              `DELETE "${pathTemplate}" is not allowed on operation endpoints. Cancellation must use POST ".../operations/{operationId}/cancel" instead of DELETE (ADS-0004).`,
-            );
-          }
-
-          if (
-            isCancelTarget &&
-            isRecord(pathItem.post) &&
-            !ignoreMatcher.isIgnored({ path: pathTemplate, method: "post" })
-          ) {
-            const postOp = pathItem.post;
-            const responses = isRecord(postOp.responses) ? postOp.responses : null;
-            let has200Json = false;
-
-            if (responses) {
-              const statusCodesToCheck = isRecord(responses["200"])
-                ? (["200"] as const)
-                : (["2XX"] as const);
-              for (const statusCode of statusCodesToCheck) {
-                const rawResponse = responses[statusCode];
-                if (!isRecord(rawResponse)) {
-                  continue;
-                }
-                const resolvedResponse = resolveRecordWithLocation(
-                  ctx.resolve,
-                  rawResponse,
-                  pathItemLocation.child(["post", "responses", statusCode]),
-                );
-                if (!resolvedResponse || !isRecord(resolvedResponse.node.content)) {
-                  continue;
-                }
-                for (const [mediaType, mediaObj] of Object.entries(resolvedResponse.node.content)) {
-                  if (
-                    JSON_MEDIA_TYPE_RE.test(mediaType) &&
-                    isRecord(mediaObj) &&
-                    mediaObj.schema !== undefined
-                  ) {
-                    has200Json = true;
-                    break;
-                  }
-                }
-                if (has200Json) {
-                  break;
-                }
-              }
-            }
-
-            if (!has200Json) {
-              const postLoc = pathFromRef
-                ? pathUsageLocation.key()
-                : responses
-                  ? pathItemLocation.child(["post", "responses"]).key()
-                  : pathItemLocation.child(["post"]).key();
-              reportOnce(
-                ctx,
-                reported,
-                `cancel-missing-200:${pathTemplate}`,
-                postLoc,
-                `POST "${pathTemplate}" must declare a 200 JSON response returning the updated Operation resource (ADS-0004).`,
-              );
-            }
-          }
         }
-      },
-    },
-  };
-};
+      }
+    }
+  },
+);
 
 export const ads0004Rules: Record<string, RedoclyOas3Rule> = {
   "ads-0004-operation-resource-shape": ads0004OperationResourceShape,
