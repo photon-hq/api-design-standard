@@ -11,7 +11,7 @@ Each standard in **Photon API Design Standards (ADS)** defines a service-agnosti
 | [ADS-0001](./ads/0001-resource-identifiers/index.md) | Resource Identifiers and Path Parameter Naming | Approved | `photon-ads/ads-0001-resource-primary-id`, `photon-ads/ads-0001-path-param-naming`, `photon-ads/ads-0001-path-param-consistency` |
 | [ADS-0002](./ads/0002-top-level-json-response/index.md) | Top-Level JSON Response Structure | Approved | `photon-ads/ads-0002-top-level-json-object`, `photon-ads/ads-0002-no-single-resource-wrapper`, `photon-ads/ads-0002-flat-creation-secret` |
 | [ADS-0004](./ads/0004-long-running-operations/index.md) | Long-Running Operations | Approved | `photon-ads/ads-0004-operation-resource-shape`, `photon-ads/ads-0004-operation-status-invariants`, `photon-ads/ads-0004-accepted-operation-headers`, `photon-ads/ads-0004-operation-cancel-method` |
-| [ADS-0005](./ads/0005-standard-resource-methods/index.md) | Standard Resource Methods and Lifecycle | Draft | `photon-ads/ads-0005-addressable-resource-read`, `photon-ads/ads-0005-standard-http-methods`, `photon-ads/ads-0005-standard-status-codes`, `photon-ads/ads-0005-url-path-naming` |
+| [ADS-0005](./ads/0005-standard-resource-methods/index.md) | Standard Resource Methods and Lifecycle | Approved | `photon-ads/ads-0005-addressable-resource-read`, `photon-ads/ads-0005-standard-http-methods`, `photon-ads/ads-0005-standard-status-codes`, `photon-ads/ads-0005-url-path-naming` |
 
 ### Status Lifecycle
 

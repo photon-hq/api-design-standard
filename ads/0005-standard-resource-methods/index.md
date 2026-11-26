@@ -3,13 +3,13 @@ title: "ADS-0005: Standard Resource Methods and Lifecycle"
 sidebarTitle: "ADS-0005 · Standard Resource Methods"
 description: "Standard HTTP methods, read symmetry for addressable resources, canonical success status codes, representation consistency, and URL path naming across Photon public HTTP APIs."
 ads: "0005"
-status: "Draft"
+status: "Approved"
 updated: "2026-11-26"
 ---
 
 # ADS-0005: Standard Resource Methods and Lifecycle
 
-- **Status**: Draft
+- **Status**: Approved
 - **Updated**: 2026-11-26
 
 Consistent HTTP methods, read symmetry, status codes, and URL structure let callers, generated SDKs, dashboards, CLIs, and automated agents navigate every Photon resource lifecycle without endpoint-specific special cases. This standard is part of Photon API Design Standards and uses the keywords **MUST**, **MUST NOT**, **SHOULD**, and **MAY** as described in RFC 2119.
@@ -323,4 +323,4 @@ The `@photon-hq/api-design-standards` Redocly plugin (`photon-ads`) enforces ADS
 
 ## Changelog
 
-- **2026-11-26**: Drafted as `ADS-0005`.
+- **2026-11-26**: Approved and published as `ADS-0005`.

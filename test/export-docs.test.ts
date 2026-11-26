@@ -128,7 +128,7 @@ describe("docs-reference export", () => {
       expect(first.overview.body).not.toMatch(pattern);
     }
 
-    expect(first.standards).toHaveLength(3);
+    expect(first.standards).toHaveLength(4);
     const ads0001 = first.standards[0];
     expect(ads0001).toBeDefined();
     expect(ads0001?.ads).toBe("0001");
@@ -254,6 +254,53 @@ describe("docs-reference export", () => {
     expect(ads0004?.body).toContain("## Changelog");
     expect(ads0004?.body).toContain("Approved and published as `ADS-0004`.");
     expect(ads0004?.body).not.toMatch(/^##\s+(?:Deterministic\s+)?Lint\s+Rules\b/im);
+
+    const ads0005 = first.standards[3];
+    expect(ads0005).toBeDefined();
+    expect(ads0005?.ads).toBe("0005");
+    expect(ads0005?.slug).toBe("ads-0005");
+    expect(ads0005?.folder).toBe("0005-standard-resource-methods");
+    expect(ads0005?.title).toBe("ADS-0005: Standard Resource Methods and Lifecycle");
+    expect(ads0005?.sidebarTitle).toBe("ADS-0005 · Standard Resource Methods");
+    expect(ads0005?.description).toBe(
+      "Standard HTTP methods, read symmetry for addressable resources, canonical success status codes, representation consistency, and URL path naming across Photon public HTTP APIs.",
+    );
+    expect(ads0005?.status).toBe("Approved");
+    expect(ads0005?.updated).toBe("2026-11-26");
+    expect(ads0005?.rules).toEqual([
+      {
+        id: "photon-ads/ads-0005-addressable-resource-read",
+        severity: "error",
+        summary:
+          "Addressable resources that support mutation, custom actions, or collection listing must expose a corresponding single-resource GET endpoint (directly or via a schema-compatible hoisted canonical route).",
+      },
+      {
+        id: "photon-ads/ads-0005-standard-http-methods",
+        severity: "error",
+        summary:
+          "Endpoints must use standard HTTP method semantics without CRUD verbs in URL segments, without combining PUT and PATCH on the same path, without GET request bodies, and without collection-level DELETE request bodies.",
+      },
+      {
+        id: "photon-ads/ads-0005-standard-status-codes",
+        severity: "error",
+        summary:
+          "Standard resource operations must use canonical 2xx success status codes (200 for GET, 201 or 202 for collection POST creation, 200 with body or 202 for PATCH, and 204 without body or 200/202 for DELETE).",
+      },
+      {
+        id: "photon-ads/ads-0005-url-path-naming",
+        severity: "error",
+        summary:
+          "Static URL path segments (excluding path parameters and leading version prefixes) must use lowercase kebab-case.",
+      },
+    ]);
+    expect(ads0005?.body).not.toMatch(/^---/);
+    expect(ads0005?.body).not.toMatch(/^#\s+/);
+    expect(ads0005?.body).toContain("## Scope");
+    expect(ads0005?.body).toContain("## Normative Rules");
+    expect(ads0005?.body).toContain("## Examples");
+    expect(ads0005?.body).toContain("## Changelog");
+    expect(ads0005?.body).toContain("Approved and published as `ADS-0005`.");
+    expect(ads0005?.body).not.toMatch(/^##\s+(?:Deterministic\s+)?Lint\s+Rules\b/im);
 
     for (const standard of first.standards) {
       expect(standard.status).toBe("Approved");
@@ -429,62 +476,9 @@ describe("docs-reference export", () => {
         "ads-0001",
         "ads-0002",
         "ads-0004",
-      ]);
-      expect(exported.standards.every((standard) => standard.status === "Approved")).toBe(true);
-    } finally {
-      await rm(fixtureRoot, { recursive: true, force: true });
-    }
-  });
-
-  it("exports ADS-0005 cleanly with Mintlify MDX safety and stripped Lint Rules when promoted to Approved", async () => {
-    const fixtureRoot = await createTempRepoFixture();
-    process.env.GITHUB_SHA = "d".repeat(40);
-    try {
-      const ads0005Path = resolve(fixtureRoot, "ads/0005-standard-resource-methods/index.md");
-      const draftContent = await readFile(ads0005Path, "utf8");
-      expect(draftContent).toContain('status: "Draft"');
-      await writeFile(
-        ads0005Path,
-        draftContent
-          .replace('status: "Draft"', 'status: "Approved"')
-          .replace("- **Status**: Draft", "- **Status**: Approved"),
-        "utf8",
-      );
-
-      const exported = await buildDocsReference(fixtureRoot);
-      expect(exported.standards.map((standard) => standard.slug)).toEqual([
-        "ads-0001",
-        "ads-0002",
-        "ads-0004",
         "ads-0005",
       ]);
-
-      const ads0005 = exported.standards[3];
-      expect(ads0005).toBeDefined();
-      expect(ads0005?.ads).toBe("0005");
-      expect(ads0005?.folder).toBe("0005-standard-resource-methods");
-      expect(ads0005?.title).toBe("ADS-0005: Standard Resource Methods and Lifecycle");
-      expect(ads0005?.sidebarTitle).toBe("ADS-0005 · Standard Resource Methods");
-      expect(ads0005?.status).toBe("Approved");
-      expect(ads0005?.updated).toBe("2026-11-26");
-      expect(ads0005?.rules.map((rule) => rule.id)).toEqual([
-        "photon-ads/ads-0005-addressable-resource-read",
-        "photon-ads/ads-0005-standard-http-methods",
-        "photon-ads/ads-0005-standard-status-codes",
-        "photon-ads/ads-0005-url-path-naming",
-      ]);
-      expect(ads0005?.body).not.toMatch(/^---/);
-      expect(ads0005?.body).not.toMatch(/^#\s+/);
-      expect(ads0005?.body).toContain("## Scope");
-      expect(ads0005?.body).toContain("## Normative Rules");
-      expect(ads0005?.body).toContain("## Examples");
-      expect(ads0005?.body).toContain("## Changelog");
-      expect(ads0005?.body).not.toMatch(/^##\s+(?:Deterministic\s+)?Lint\s+Rules\b/im);
-
-      for (const pattern of FORBIDDEN_DOCS_PATTERNS) {
-        expect(ads0005?.description).not.toMatch(pattern);
-        expect(ads0005?.body).not.toMatch(pattern);
-      }
+      expect(exported.standards.every((standard) => standard.status === "Approved")).toBe(true);
     } finally {
       await rm(fixtureRoot, { recursive: true, force: true });
     }
