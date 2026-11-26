@@ -1595,12 +1595,46 @@ describe("ADS-0005 Redocly CLI end-to-end linting", () => {
     expect(messages.some((m) => m.includes("badKeys"))).toBe(true);
   });
 
-  it("handles OpenAPI 3.0 nullable schemas and $ref PathItems cleanly", async () => {
-    const doc = baseOpenApi({
+  it("handles OpenAPI 3.0 nullable schemas and external $ref PathItems with negative control", async () => {
+    const externalPathItemPath = join(tempDir, "org-projects-path-item.yaml");
+    await writeFile(
+      externalPathItemPath,
+      stringifyYaml({
+        parameters: [pathParam("organizationId")],
+        get: {
+          operationId: "listOas30Projects",
+          summary: "List OAS 3.0 projects",
+          responses: {
+            "200": jsonResponse({
+              type: "object",
+              required: ["items"],
+              properties: {
+                items: {
+                  type: "array",
+                  items: {
+                    type: "object",
+                    required: ["id", "name"],
+                    properties: {
+                      id: { type: "string" },
+                      name: { type: "string" },
+                    },
+                  },
+                },
+                nextPageToken: { type: "string", nullable: true },
+              },
+            }),
+            "404": { description: "Not found" },
+          },
+        },
+      }),
+      "utf8",
+    );
+
+    const validDoc = baseOpenApi({
       openapi: "3.0.3",
       paths: {
         "/v1/organizations/{organizationId}/projects": {
-          $ref: "#/components/pathItems/OrgProjects",
+          $ref: "./org-projects-path-item.yaml",
         },
         "/v1/projects/{projectId}": {
           parameters: [pathParam("projectId")],
@@ -1622,44 +1656,28 @@ describe("ADS-0005 Redocly CLI end-to-end linting", () => {
           },
         },
       },
-      components: {
-        pathItems: {
-          OrgProjects: {
-            parameters: [pathParam("organizationId")],
-            get: {
-              operationId: "listOas30Projects",
-              summary: "List OAS 3.0 projects",
-              responses: {
-                "200": jsonResponse({
-                  type: "object",
-                  required: ["items"],
-                  properties: {
-                    items: {
-                      type: "array",
-                      items: {
-                        type: "object",
-                        required: ["id", "name"],
-                        properties: {
-                          id: { type: "string" },
-                          name: { type: "string" },
-                        },
-                      },
-                    },
-                    nextPageToken: { type: "string", nullable: true },
-                  },
-                }),
-                "404": { description: "Not found" },
-              },
-            },
-          },
+    });
+
+    const { exitCode, report } = await lintOpenApi(validDoc);
+    expect(exitCode).toBe(0);
+    expect(ads0005Problems(report)).toEqual([]);
+
+    // Negative control: removing the hoisted GET must flag the referenced Path Item list.
+    const missingGetDoc = baseOpenApi({
+      openapi: "3.0.3",
+      paths: {
+        "/v1/organizations/{organizationId}/projects": {
+          $ref: "./org-projects-path-item.yaml",
         },
       },
     });
-
-    // Note: Redocly's built-in oas3-schema validates OAS 3.0 doesn't have components.pathItems;
-    // verify our ADS-0005 rules report zero errors on the resolved OAS 3.0 document.
-    const { report } = await lintOpenApi(doc);
-    expect(ads0005Problems(report)).toEqual([]);
+    const missingRes = await lintOpenApi(missingGetDoc);
+    expect(missingRes.exitCode).toBe(1);
+    expect(
+      ads0005ProblemsFor(missingRes.report, "ads-0005-addressable-resource-read").some((e) =>
+        e.message.includes('GET "/v1/organizations/{organizationId}/projects"'),
+      ),
+    ).toBe(true);
   });
 
   it("preserves distinct array item variants in oneOf unions, ignores dictionary maps, checks custom-method suffixes, and handles cyclic item schemas safely", async () => {
@@ -1807,5 +1825,539 @@ describe("ADS-0005 Redocly CLI end-to-end linting", () => {
     expect(readErrors.some((e) => e.message.includes("/nodes"))).toBe(false);
     expect(methodErrors.some((e) => e.message.includes("{nodeId}:delete"))).toBe(true);
     expect(namingErrors.some((e) => e.message.includes("{nodeId}:Archive"))).toBe(true);
+  });
+
+  it("validates hoisted GET schema compatibility for custom actions, soft DELETE, OAS 3.1 $ref siblings, and optional fields", async () => {
+    const doc = baseOpenApi({
+      paths: {
+        // 1. Custom action returning addressable resource with string id vs hoisted GET with integer id
+        "/v1/organizations/{organizationId}/items/{itemId}/archive": {
+          parameters: [pathParam("organizationId"), pathParam("itemId")],
+          post: {
+            operationId: "archiveOrgItem",
+            summary: "Archive org item returning incompatible resource schema",
+            responses: {
+              "200": jsonResponse({
+                type: "object",
+                required: ["id", "title"],
+                properties: {
+                  id: { type: "string" },
+                  title: { type: "string" },
+                },
+              }),
+            },
+          },
+        },
+        // Compatible receipt-only custom action (no id) still passes with hoisted GET
+        "/v1/organizations/{organizationId}/items/{itemId}/touch": {
+          parameters: [pathParam("organizationId"), pathParam("itemId")],
+          post: {
+            operationId: "touchOrgItem",
+            summary: "Receipt-only custom action",
+            responses: {
+              "200": jsonResponse({
+                type: "object",
+                properties: { touched: { type: "boolean" } },
+              }),
+            },
+          },
+        },
+        "/v1/items/{itemId}": {
+          parameters: [pathParam("itemId")],
+          get: {
+            operationId: "getCatalogItem",
+            summary: "Unrelated hoisted GET with integer id",
+            responses: {
+              "200": jsonResponse({
+                type: "object",
+                required: ["id", "sku"],
+                properties: {
+                  id: { type: "integer" },
+                  sku: { type: "string" },
+                },
+              }),
+            },
+          },
+        },
+        // 2. Scoped soft DELETE returning incompatible resource schema vs hoisted GET
+        "/v1/organizations/{organizationId}/members/{memberId}": {
+          parameters: [pathParam("organizationId"), pathParam("memberId")],
+          delete: {
+            operationId: "softDeleteOrgMember",
+            summary: "Soft delete returning incompatible Member representation",
+            responses: {
+              "200": jsonResponse({
+                type: "object",
+                required: ["id", "email"],
+                properties: {
+                  id: { type: "string" },
+                  email: { type: "string" },
+                },
+              }),
+            },
+          },
+        },
+        "/v1/members/{memberId}": {
+          parameters: [pathParam("memberId")],
+          get: {
+            operationId: "getUnrelatedMember",
+            summary: "Hoisted GET with incompatible integer id",
+            responses: {
+              "200": jsonResponse({
+                type: "object",
+                required: ["id", "email"],
+                properties: {
+                  id: { type: "integer" },
+                  email: { type: "string" },
+                },
+              }),
+            },
+          },
+        },
+        // Valid scoped DELETE returning deletion receipt with matching string id passes
+        "/v1/organizations/{organizationId}/tokens/{tokenId}": {
+          parameters: [pathParam("organizationId"), pathParam("tokenId")],
+          delete: {
+            operationId: "deleteOrgToken",
+            summary: "Delete token returning deletion receipt",
+            responses: {
+              "200": jsonResponse({
+                type: "object",
+                required: ["id", "deleted"],
+                properties: {
+                  id: { type: "string" },
+                  deleted: { type: "boolean" },
+                },
+              }),
+            },
+          },
+        },
+        "/v1/tokens/{tokenId}": {
+          parameters: [pathParam("tokenId")],
+          get: {
+            operationId: "getToken",
+            summary: "Get token",
+            responses: {
+              "200": jsonResponse({
+                type: "object",
+                required: ["id", "name"],
+                properties: {
+                  id: { type: "string" },
+                  name: { type: "string" },
+                },
+              }),
+            },
+          },
+        },
+        // 3. OAS 3.1 $ref with sibling properties constraint overriding id type
+        "/v1/organizations/{organizationId}/contacts": {
+          parameters: [pathParam("organizationId")],
+          get: {
+            operationId: "listOrgContacts",
+            summary: "List contacts with sibling string id constraint",
+            responses: {
+              "200": jsonResponse({
+                type: "object",
+                properties: {
+                  items: {
+                    type: "array",
+                    items: {
+                      $ref: "#/components/schemas/SharedContact",
+                      properties: { id: { type: "string" } },
+                    },
+                  },
+                },
+              }),
+            },
+          },
+        },
+        "/v1/contacts/{contactId}": {
+          parameters: [pathParam("contactId")],
+          get: {
+            operationId: "getContact",
+            summary: "Get contact with sibling integer id constraint",
+            responses: {
+              "200": jsonResponse({
+                $ref: "#/components/schemas/SharedContact",
+                properties: { id: { type: "integer" } },
+              }),
+            },
+          },
+        },
+        // 4. Shared optional field with disjoint type (score: string vs score: integer)
+        "/v1/organizations/{organizationId}/leads": {
+          parameters: [pathParam("organizationId")],
+          get: {
+            operationId: "listOrgLeads",
+            summary: "List leads with optional string score",
+            responses: {
+              "200": jsonResponse({
+                type: "object",
+                properties: {
+                  items: {
+                    type: "array",
+                    items: {
+                      type: "object",
+                      required: ["id", "name"],
+                      properties: {
+                        id: { type: "string" },
+                        name: { type: "string" },
+                        score: { type: "string" },
+                      },
+                    },
+                  },
+                },
+              }),
+            },
+          },
+        },
+        "/v1/leads/{leadId}": {
+          parameters: [pathParam("leadId")],
+          get: {
+            operationId: "getLead",
+            summary: "Get lead with optional integer score",
+            responses: {
+              "200": jsonResponse({
+                type: "object",
+                required: ["id", "name"],
+                properties: {
+                  id: { type: "string" },
+                  name: { type: "string" },
+                  score: { type: "integer" },
+                },
+              }),
+            },
+          },
+        },
+      },
+      components: {
+        schemas: {
+          SharedContact: {
+            type: "object",
+            required: ["name"],
+            properties: {
+              name: { type: "string" },
+            },
+          },
+        },
+      },
+    });
+
+    const { report } = await lintOpenApi(doc);
+    const readErrors = ads0005ProblemsFor(report, "ads-0005-addressable-resource-read");
+    const messages = readErrors.map((e) => e.message);
+
+    expect(
+      messages.some((m) =>
+        m.includes('POST "/v1/organizations/{organizationId}/items/{itemId}/archive"'),
+      ),
+    ).toBe(true);
+    expect(
+      messages.some((m) =>
+        m.includes('POST "/v1/organizations/{organizationId}/items/{itemId}/touch"'),
+      ),
+    ).toBe(false);
+    expect(
+      messages.some((m) =>
+        m.includes('DELETE "/v1/organizations/{organizationId}/members/{memberId}"'),
+      ),
+    ).toBe(true);
+    expect(
+      messages.some((m) =>
+        m.includes('DELETE "/v1/organizations/{organizationId}/tokens/{tokenId}"'),
+      ),
+    ).toBe(false);
+    expect(
+      messages.some((m) => m.includes('GET "/v1/organizations/{organizationId}/contacts"')),
+    ).toBe(true);
+    expect(messages.some((m) => m.includes('GET "/v1/organizations/{organizationId}/leads"'))).toBe(
+      true,
+    );
+  });
+
+  it("handles trailing slashes, local $ref PathItem siblings, async actions, impossible array branches, search POST, missing 2xx creation POST, variant cap, and diamond allOf DAGs", async () => {
+    const sharedPathItemFile = join(tempDir, "shared-profile-path-item.yaml");
+    await writeFile(
+      sharedPathItemFile,
+      stringifyYaml({
+        get: {
+          operationId: "getSharedProfile",
+          summary: "Get shared profile",
+          responses: {
+            "200": jsonResponse({
+              type: "object",
+              properties: { displayName: { type: "string" } },
+            }),
+          },
+        },
+      }),
+      "utf8",
+    );
+
+    // 24-level diamond allOf DAG (2^24 naive paths; must complete linearly with memoization)
+    const diamondSchemas: Record<string, unknown> = {
+      Diamond0: {
+        type: "object",
+        required: ["id", "name"],
+        properties: {
+          id: { type: "string" },
+          name: { type: "string" },
+        },
+      },
+    };
+    for (let i = 1; i <= 24; i += 1) {
+      diamondSchemas[`Diamond${i}`] = {
+        allOf: [
+          { $ref: `#/components/schemas/Diamond${i - 1}` },
+          { $ref: `#/components/schemas/Diamond${i - 1}` },
+        ],
+      };
+    }
+
+    // 260 distinct anyOf branches with an addressable collection at the tail (index 259)
+    const overflowBranches: unknown[] = [];
+    for (let i = 0; i < 259; i += 1) {
+      overflowBranches.push({
+        type: "object",
+        properties: { [`flag${i}`]: { type: "string" } },
+      });
+    }
+    overflowBranches.push({
+      type: "object",
+      properties: {
+        items: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: { id: { type: "string" }, label: { type: "string" } },
+          },
+        },
+      },
+    });
+
+    const doc = baseOpenApi({
+      paths: {
+        // 1. Trailing-slash mismatch: PATCH /v1/profile must NOT be satisfied by GET /v1/profile/
+        "/v1/profile": {
+          patch: {
+            operationId: "patchProfileNoSlash",
+            summary: "Patch profile without trailing slash",
+            responses: {
+              "200": jsonResponse({
+                type: "object",
+                properties: { displayName: { type: "string" } },
+              }),
+            },
+          },
+        },
+        "/v1/profile/": {
+          get: {
+            operationId: "getProfileWithSlash",
+            summary: "Get profile with trailing slash",
+            responses: {
+              "200": jsonResponse({
+                type: "object",
+                properties: { displayName: { type: "string" } },
+              }),
+            },
+          },
+        },
+        // 2. Local sibling PATCH on a referenced Path Item must be inspected
+        "/v1/projects/{projectId}/shared-profile": {
+          $ref: "./shared-profile-path-item.yaml",
+          parameters: [pathParam("projectId")],
+          patch: {
+            operationId: "patchSharedProfile204",
+            summary: "Local sibling PATCH returning disallowed 204",
+            responses: {
+              "204": { description: "No content" },
+            },
+          },
+        },
+        // 3. Recognized item action returning only 202 without Location still requires parent GET
+        "/v1/api-keys/{apiKeyId}/revoke": {
+          parameters: [pathParam("apiKeyId")],
+          post: {
+            operationId: "revokeApiKeyAsync",
+            summary: "Async revoke without parent GET",
+            responses: {
+              "202": { description: "Accepted" },
+            },
+          },
+        },
+        // 4. Impossible string-only anyOf branch inside array property must not hide item id
+        "/v1/projects/{projectId}/filtered-widgets": {
+          parameters: [pathParam("projectId")],
+          get: {
+            operationId: "listFilteredWidgets",
+            summary: "Array with impossible string-only anyOf alternative",
+            responses: {
+              "200": jsonResponse({
+                type: "object",
+                properties: {
+                  items: {
+                    type: "array",
+                    anyOf: [
+                      {
+                        items: {
+                          type: "object",
+                          properties: { id: { type: "string" }, name: { type: "string" } },
+                        },
+                      },
+                      {
+                        type: "string",
+                        items: {
+                          type: "object",
+                          properties: { label: { type: "string" } },
+                        },
+                      },
+                    ],
+                  },
+                },
+              }),
+            },
+          },
+        },
+        // 5. GET + POST on /search must NOT require 201/202 on POST
+        "/v1/projects/{projectId}/search": {
+          parameters: [pathParam("projectId")],
+          get: {
+            operationId: "simpleSearch",
+            summary: "Simple query search",
+            responses: {
+              "200": jsonResponse({
+                type: "object",
+                properties: {
+                  results: {
+                    type: "array",
+                    items: { type: "object", properties: { title: { type: "string" } } },
+                  },
+                },
+              }),
+            },
+          },
+          post: {
+            operationId: "complexSearch",
+            summary: "Complex query search",
+            responses: {
+              "200": jsonResponse({
+                type: "object",
+                properties: {
+                  results: {
+                    type: "array",
+                    items: { type: "object", properties: { title: { type: "string" } } },
+                  },
+                },
+              }),
+            },
+          },
+        },
+        // 6. Collection creation POST declaring only 400 and default must still require 201/202
+        "/v1/projects/{projectId}/jobs": {
+          parameters: [pathParam("projectId")],
+          post: {
+            operationId: "createJobNo2xx",
+            summary: "Collection POST declaring only 400 and default",
+            responses: {
+              "400": { description: "Bad request" },
+              default: { description: "Unexpected error" },
+            },
+          },
+        },
+        "/v1/projects/{projectId}/jobs/{jobId}": {
+          parameters: [pathParam("projectId"), pathParam("jobId")],
+          get: {
+            operationId: "getJob",
+            summary: "Get job",
+            responses: {
+              "200": jsonResponse({
+                type: "object",
+                properties: { id: { type: "string" }, name: { type: "string" } },
+              }),
+            },
+          },
+        },
+        // 7. Truncated >256-variant union collection GET must report analysis cap
+        "/v1/projects/{projectId}/huge-union": {
+          parameters: [pathParam("projectId")],
+          get: {
+            operationId: "getHugeUnion",
+            summary: "Collection hidden past variant cap",
+            responses: {
+              "200": jsonResponse({ anyOf: overflowBranches }),
+            },
+          },
+        },
+        // 8. 24-level diamond allOf DAG paired with hoisted GET
+        "/v1/organizations/{organizationId}/diamonds": {
+          parameters: [pathParam("organizationId")],
+          get: {
+            operationId: "listDiamonds",
+            summary: "List diamond DAG items",
+            responses: {
+              "200": jsonResponse({
+                type: "object",
+                properties: {
+                  items: {
+                    type: "array",
+                    items: { $ref: "#/components/schemas/Diamond24" },
+                  },
+                },
+              }),
+            },
+          },
+        },
+        "/v1/diamonds/{diamondId}": {
+          parameters: [pathParam("diamondId")],
+          get: {
+            operationId: "getDiamond",
+            summary: "Get diamond",
+            responses: {
+              "200": jsonResponse({ $ref: "#/components/schemas/Diamond24" }),
+            },
+          },
+        },
+      },
+      components: {
+        schemas: diamondSchemas,
+      },
+    });
+
+    const { report } = await lintOpenApi(doc);
+    const readMessages = ads0005ProblemsFor(report, "ads-0005-addressable-resource-read").map(
+      (e) => e.message,
+    );
+    const statusMessages = ads0005ProblemsFor(report, "ads-0005-standard-status-codes").map(
+      (e) => e.message,
+    );
+
+    expect(readMessages.some((m) => m.includes('PATCH "/v1/profile"'))).toBe(true);
+    expect(
+      statusMessages.some(
+        (m) =>
+          m.includes('PATCH "/v1/projects/{projectId}/shared-profile"') &&
+          m.includes('"204 No Content"'),
+      ),
+    ).toBe(true);
+    expect(readMessages.some((m) => m.includes('POST "/v1/api-keys/{apiKeyId}/revoke"'))).toBe(
+      true,
+    );
+    expect(
+      readMessages.some((m) => m.includes('GET "/v1/projects/{projectId}/filtered-widgets"')),
+    ).toBe(true);
+    expect(statusMessages.some((m) => m.includes("/search"))).toBe(false);
+    expect(
+      statusMessages.some(
+        (m) => m.includes('POST "/v1/projects/{projectId}/jobs"') && m.includes('"201"'),
+      ),
+    ).toBe(true);
+    expect(
+      readMessages.some(
+        (m) =>
+          m.includes('GET "/v1/projects/{projectId}/huge-union"') &&
+          m.includes("256-variant union analysis cap"),
+      ),
+    ).toBe(true);
+    expect(readMessages.some((m) => m.includes("/diamonds"))).toBe(false);
   });
 });

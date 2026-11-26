@@ -474,7 +474,7 @@ describe("docs-reference export", () => {
         "photon-ads/ads-0005-url-path-naming",
       ]);
       expect(ads0005?.body).not.toMatch(/^---/);
-      expect(ads0005?.body).not.toMatch(/^#s+/);
+      expect(ads0005?.body).not.toMatch(/^#\s+/);
       expect(ads0005?.body).toContain("## Scope");
       expect(ads0005?.body).toContain("## Normative Rules");
       expect(ads0005?.body).toContain("## Examples");

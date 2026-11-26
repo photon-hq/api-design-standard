@@ -1,4 +1,4 @@
-import { isRecord } from "./schema-utils.js";
+import { isRecord, unescapeJsonPointerToken } from "./schema-utils.js";
 import type { AdsRuleOptions } from "./types.js";
 
 export const HTTP_METHODS = [
@@ -43,8 +43,20 @@ export interface RuleIgnoreMatcher {
   areAllPathOperationsIgnored(path: string, pathItem: unknown): boolean;
 }
 
-function unescapeJsonPointerToken(token: string): string {
-  return token.replaceAll("~1", "/").replaceAll("~0", "~");
+export function isPointerContextIgnored(
+  ignoreMatcher: RuleIgnoreMatcher,
+  pointerCtx: PointerContext,
+): boolean {
+  if (pointerCtx.schema !== undefined) {
+    return ignoreMatcher.isIgnored({ schema: pointerCtx.schema });
+  }
+  if (pointerCtx.path !== undefined) {
+    if (pointerCtx.method !== undefined) {
+      return ignoreMatcher.isIgnored({ path: pointerCtx.path, method: pointerCtx.method });
+    }
+    return ignoreMatcher.isIgnored({ path: pointerCtx.path });
+  }
+  return false;
 }
 
 export function normalizeIgnorePath(rawPath: string): string {
