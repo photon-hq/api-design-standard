@@ -421,6 +421,26 @@ describe("ADS-0002 Redocly CLI end-to-end linting", () => {
   });
 
   it("allows valid flat resources, flat creation secrets, collections, maps, utilities, composites, nullable sub-objects, 204, and non-JSON responses", async () => {
+    const ads0002Config = join(tempDir, "redocly-ads-0002-only.yaml");
+    await writeFile(
+      ads0002Config,
+      stringifyYaml({
+        plugins: [PLUGIN_DIST],
+        extends: ["recommended"],
+        rules: {
+          "security-defined": "off",
+          "no-server-example.com": "off",
+          "photon-ads/ads-0001-resource-primary-id": "error",
+          "photon-ads/ads-0001-path-param-naming": "error",
+          "photon-ads/ads-0001-path-param-consistency": "error",
+          "photon-ads/ads-0002-top-level-json-object": "error",
+          "photon-ads/ads-0002-no-single-resource-wrapper": "error",
+          "photon-ads/ads-0002-flat-creation-secret": "error",
+        },
+      }),
+      "utf8",
+    );
+
     const doc = baseOpenApi({
       paths: {
         "/v1/projects/{projectId}/api-keys": {
@@ -807,7 +827,7 @@ describe("ADS-0002 Redocly CLI end-to-end linting", () => {
       },
     });
 
-    const { report } = await lintOpenApi(doc);
+    const { report } = await lintOpenApi(doc, ads0002Config);
     expect(adsProblems(report)).toEqual([]);
   });
 

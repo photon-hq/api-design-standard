@@ -12,6 +12,23 @@ paths:
   /v1/organizations/{organizationId}/projects:
     parameters:
       - $ref: "#/components/parameters/OrganizationId"
+    get:
+      operationId: listOrganizationProjects
+      summary: List organization projects
+      description: Lists projects belonging to an organization, paired with hoisted canonical GET /v1/projects/{projectId}.
+      responses:
+        "200":
+          description: Collection of organization projects.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProjectListResponse"
+        "404":
+          description: Organization not found.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
     post:
       operationId: createProject
       summary: Create a project
@@ -25,6 +42,12 @@ paths:
       responses:
         "201":
           description: Created project.
+          headers:
+            Location:
+              description: Canonical URL for the created project.
+              schema:
+                type: string
+                format: uri
           content:
             application/json:
               schema:
@@ -45,6 +68,29 @@ paths:
       responses:
         "200":
           description: Project details.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Project"
+        "404":
+          description: Project not found.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+    patch:
+      operationId: updateProject
+      summary: Update a project
+      description: Partially updates an existing project and returns the updated representation.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateProjectRequest"
+      responses:
+        "200":
+          description: Updated project.
           content:
             application/json:
               schema:
@@ -153,6 +199,181 @@ paths:
                 $ref: "#/components/schemas/ApiKey"
         "404":
           description: API key not found.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+  /v1/projects/{projectId}/api-keys/{apiKeyId}/revoke:
+    parameters:
+      - $ref: "#/components/parameters/ProjectId"
+      - name: apiKeyId
+        in: path
+        required: true
+        description: Unique identifier of the API key.
+        schema:
+          type: string
+    post:
+      operationId: revokeApiKey
+      summary: Revoke an API key
+      description: Revokes an active project API key.
+      responses:
+        "200":
+          description: Revoked API key.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiKey"
+        "404":
+          description: API key not found.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+  /v1/projects/{projectId}/webhooks:
+    parameters:
+      - $ref: "#/components/parameters/ProjectId"
+    get:
+      operationId: listWebhooks
+      summary: List project webhooks
+      description: Lists webhook endpoints configured for a project.
+      responses:
+        "200":
+          description: Collection of project webhooks.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WebhookListResponse"
+        "404":
+          description: Project not found.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+    post:
+      operationId: createWebhook
+      summary: Create a project webhook
+      description: Creates a new webhook endpoint for a project.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateWebhookRequest"
+      responses:
+        "201":
+          description: Created webhook.
+          headers:
+            Location:
+              description: Canonical URL for the created webhook.
+              schema:
+                type: string
+                format: uri
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Webhook"
+        "400":
+          description: Invalid request.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+  /v1/projects/{projectId}/webhooks/{webhookId}:
+    parameters:
+      - $ref: "#/components/parameters/ProjectId"
+      - $ref: "#/components/parameters/WebhookId"
+    get:
+      operationId: getWebhook
+      summary: Get a project webhook
+      description: Retrieves a single webhook endpoint by identifier.
+      responses:
+        "200":
+          description: Webhook details.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Webhook"
+        "404":
+          description: Webhook not found.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+    patch:
+      operationId: updateWebhook
+      summary: Update a project webhook
+      description: Partially updates a webhook endpoint and returns the updated resource.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateWebhookRequest"
+      responses:
+        "200":
+          description: Updated webhook.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Webhook"
+        "404":
+          description: Webhook not found.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+    delete:
+      operationId: deleteWebhook
+      summary: Delete a project webhook
+      description: Deletes a webhook endpoint.
+      responses:
+        "204":
+          description: Webhook deleted.
+        "404":
+          description: Webhook not found.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+  /v1/projects/{projectId}/agent-profile:
+    parameters:
+      - $ref: "#/components/parameters/ProjectId"
+    get:
+      operationId: getAgentProfile
+      summary: Get project agent profile
+      description: Retrieves the singleton agent profile for a project.
+      responses:
+        "200":
+          description: Agent profile details.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentProfile"
+        "404":
+          description: Project not found.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+    patch:
+      operationId: updateAgentProfile
+      summary: Update project agent profile
+      description: Partially updates the singleton agent profile for a project.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateAgentProfileRequest"
+      responses:
+        "200":
+          description: Updated agent profile.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentProfile"
+        "404":
+          description: Project not found.
           content:
             application/problem+json:
               schema:
@@ -312,6 +533,13 @@ components:
       description: Unique identifier of the operation.
       schema:
         type: string
+    WebhookId:
+      name: webhookId
+      in: path
+      required: true
+      description: Unique identifier of the webhook.
+      schema:
+        type: string
   schemas:
     BaseResource:
       type: object
@@ -377,6 +605,19 @@ components:
       properties:
         name:
           type: string
+    ProjectListResponse:
+      type: object
+      required:
+        - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Project"
+        nextPageToken:
+          type:
+            - string
+            - "null"
     CreateProjectRequest:
       type: object
       required:
@@ -387,6 +628,81 @@ components:
           type: string
         name:
           type: string
+    UpdateProjectRequest:
+      type: object
+      properties:
+        name:
+          type: string
+    Webhook:
+      allOf:
+        - $ref: "#/components/schemas/BaseResource"
+        - type: object
+          required:
+            - projectId
+            - url
+            - enabled
+          properties:
+            projectId:
+              type: string
+            url:
+              type: string
+              format: uri
+            enabled:
+              type: boolean
+    WebhookListResponse:
+      type: object
+      required:
+        - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Webhook"
+        nextPageToken:
+          type:
+            - string
+            - "null"
+    CreateWebhookRequest:
+      type: object
+      required:
+        - url
+      properties:
+        url:
+          type: string
+          format: uri
+        enabled:
+          type: boolean
+    UpdateWebhookRequest:
+      type: object
+      properties:
+        url:
+          type: string
+          format: uri
+        enabled:
+          type: boolean
+    AgentProfile:
+      type: object
+      required:
+        - projectId
+        - displayName
+      properties:
+        projectId:
+          type: string
+        displayName:
+          type: string
+        bio:
+          type:
+            - string
+            - "null"
+    UpdateAgentProfileRequest:
+      type: object
+      properties:
+        displayName:
+          type: string
+        bio:
+          type:
+            - string
+            - "null"
     ProjectUsage:
       type: object
       required:

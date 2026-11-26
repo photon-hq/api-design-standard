@@ -12,6 +12,7 @@ Each standard in **Photon API Design Standards (ADS)** defines a service-agnosti
 | [ADS-0002](./ads/0002-top-level-json-response/index.md) | Top-Level JSON Response Structure | Approved | `photon-ads/ads-0002-top-level-json-object`, `photon-ads/ads-0002-no-single-resource-wrapper`, `photon-ads/ads-0002-flat-creation-secret` |
 | [ADS-0003](./ads/0003-idempotency-key/index.md) | Idempotency-Key | Draft | `photon-ads/ads-0003-idempotency-key-method`, `photon-ads/ads-0003-idempotency-key-optional`, `photon-ads/ads-0003-idempotency-key-name`, `photon-ads/ads-0003-idempotency-key-schema`, `photon-ads/ads-0003-idempotency-no-required-problem`, `photon-ads/ads-0003-idempotent-replayed-header`, `photon-ads/ads-0003-idempotency-problems` |
 | [ADS-0004](./ads/0004-long-running-operations/index.md) | Long-Running Operations | Approved | `photon-ads/ads-0004-operation-resource-shape`, `photon-ads/ads-0004-operation-status-invariants`, `photon-ads/ads-0004-accepted-operation-headers`, `photon-ads/ads-0004-operation-cancel-method` |
+| [ADS-0005](./ads/0005-standard-resource-methods/index.md) | Standard Resource Methods and Lifecycle | Approved | `photon-ads/ads-0005-addressable-resource-read`, `photon-ads/ads-0005-standard-http-methods`, `photon-ads/ads-0005-standard-status-codes`, `photon-ads/ads-0005-url-path-naming` |
 
 ### Status Lifecycle
 
@@ -81,6 +82,10 @@ rules:
   photon-ads/ads-0004-operation-status-invariants: error
   photon-ads/ads-0004-accepted-operation-headers: error
   photon-ads/ads-0004-operation-cancel-method: error
+  photon-ads/ads-0005-addressable-resource-read: error
+  photon-ads/ads-0005-standard-http-methods: error
+  photon-ads/ads-0005-standard-status-codes: error
+  photon-ads/ads-0005-url-path-naming: error
 ```
 
 Each `ignore` entry accepts `path`, `method`, `schema`, and an optional `reason` string:
@@ -116,6 +121,10 @@ ads/
     rules.ts       # Deterministic Redocly OpenAPI 3 rules
     rules.test.ts  # Unit and end-to-end Redocly CLI tests
   0004-long-running-operations/
+    index.md       # Authoritative Markdown specification and rule table
+    rules.ts       # Deterministic Redocly OpenAPI 3 rules
+    rules.test.ts  # Unit and end-to-end Redocly CLI tests
+  0005-standard-resource-methods/
     index.md       # Authoritative Markdown specification and rule table
     rules.ts       # Deterministic Redocly OpenAPI 3 rules
     rules.test.ts  # Unit and end-to-end Redocly CLI tests
