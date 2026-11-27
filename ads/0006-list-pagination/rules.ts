@@ -630,6 +630,7 @@ const standardPaginationParamsRule: RedoclyOas3Rule = createRootRule(
       const anyTruncatedNextPageToken = jsonResponses.some(
         (item) => item.sawTruncatedNextPageToken,
       );
+      const hasAnyNextPageToken = anyNextPageToken || anyTruncatedNextPageToken;
       const allResponsesHaveNextPageToken =
         jsonResponses.length > 0 &&
         jsonResponses.every(
@@ -638,7 +639,7 @@ const standardPaginationParamsRule: RedoclyOas3Rule = createRootRule(
             item.variants.every((variant) => hasNonDeprecatedNextPageToken(variant, ctx.resolve)),
         );
 
-      if (!hasPageSize && !hasPageToken && !anyNextPageToken && !anyTruncatedNextPageToken) {
+      if (!hasPageSize && !hasPageToken && !hasAnyNextPageToken) {
         return;
       }
 
@@ -661,7 +662,7 @@ const standardPaginationParamsRule: RedoclyOas3Rule = createRootRule(
       }
       if (!allResponsesHaveNextPageToken) {
         missing.push(
-          anyNextPageToken
+          hasAnyNextPageToken
             ? 'top-level 200/2XX JSON response property "nextPageToken" on every object response variant'
             : 'top-level 200/2XX JSON response property "nextPageToken"',
         );
@@ -675,7 +676,7 @@ const standardPaginationParamsRule: RedoclyOas3Rule = createRootRule(
         if (hasPageToken) {
           declared.push('"pageToken"');
         }
-        if (anyNextPageToken) {
+        if (hasAnyNextPageToken) {
           declared.push(
             allResponsesHaveNextPageToken ? '"nextPageToken"' : 'partial "nextPageToken"',
           );

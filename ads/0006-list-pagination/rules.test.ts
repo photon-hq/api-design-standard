@@ -1,4 +1,4 @@
-import { execFileSync, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -179,10 +179,6 @@ function ads0006ProblemsFor(report: RedoclyJsonReport, ruleName: string): Redocl
 
 beforeAll(async () => {
   tempDir = await mkdtemp(join(tmpdir(), "photon-ads-0006-"));
-  execFileSync(resolve(REPO_ROOT, "node_modules/.bin/tsc"), ["-p", "tsconfig.build.json"], {
-    cwd: REPO_ROOT,
-    stdio: "inherit",
-  });
 });
 
 afterAll(async () => {
@@ -1614,6 +1610,34 @@ describe("ADS-0006 Redocly CLI end-to-end linting", () => {
             },
           },
         },
+        "/v1/truncated-next-page-token-symmetry": {
+          get: {
+            operationId: "listTruncatedNextPageTokenSymmetry",
+            responses: {
+              "200": {
+                description:
+                  "Truncated nextPageToken branch past 256-variant cap formats partial pagination message cleanly",
+                content: {
+                  "application/json": {
+                    schema: {
+                      oneOf: [
+                        { allOf: paginationOverflowAllOf },
+                        {
+                          type: "object",
+                          required: ["items"],
+                          properties: {
+                            items: { type: "array", items: { type: "string" } },
+                            nextPageToken: { type: "string", minLength: 1 },
+                          },
+                        },
+                      ],
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
         "/v1/nested-variant-cap-overflow": {
           get: {
             operationId: "listNestedVariantCapOverflow",
@@ -1704,6 +1728,21 @@ describe("ADS-0006 Redocly CLI end-to-end linting", () => {
         (p) =>
           p.message.includes('GET "/v1/unpaginated-banned-variant-cap-overflow"') &&
           p.message.includes("256-variant union analysis cap"),
+      ),
+    ).toBe(true);
+    expect(
+      paramErrors.some(
+        (p) =>
+          p.message.includes('GET "/v1/truncated-next-page-token-symmetry"') &&
+          p.message.includes("256-variant union analysis cap"),
+      ),
+    ).toBe(true);
+    expect(
+      paramErrors.some(
+        (p) =>
+          p.message.includes('GET "/v1/truncated-next-page-token-symmetry"') &&
+          p.message.includes('declares partial pagination (partial "nextPageToken")') &&
+          !p.message.includes("partial pagination ()"),
       ),
     ).toBe(true);
     expect(
