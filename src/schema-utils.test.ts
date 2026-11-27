@@ -7,12 +7,18 @@ import {
   resolvePathItemWithLocation,
 } from "./openapi-utils.js";
 import {
+  computeFragmentsMinLength,
+  computeIntegerBounds,
+  computeMinLength,
   computeTypeConstraint,
   extractComponentSchemaName,
   intersectTypeSets,
+  isNonNullIntegerConstraint,
   isNonNullObjectConstraint,
   isNonNullStringConstraint,
+  isSchemaDeprecated,
   isStrictlyNullConstraint,
+  isTrackedPropertyDeprecated,
   jsonTypeOfValue,
   mergeTrackedProperty,
   type ResolverFn,
@@ -478,5 +484,149 @@ describe("shared schema and OpenAPI utilities", () => {
     expect(putHeader?.name).toBe("Idempotency-Key");
     expect(putHeader?.deprecated).toBe(true);
     expect(putHeader?.resolvedFromRef).toBe(true);
+  });
+
+  it("computes integer bounds, string minLength, and deprecation across $ref, allOf, and unions", () => {
+    const posInt = { type: "integer", minimum: 1 };
+    const nonEmpty = { type: "string", minLength: 1 };
+    const nullSchema = { type: "null" };
+    const deprecatedTarget = { type: "string", deprecated: true };
+    const hopOverride = { $ref: "#/components/schemas/DeprecatedTarget", deprecated: false };
+    const resolve = makeResolver({
+      "#/components/schemas/PosInt": { node: posInt, pointer: "#/components/schemas/PosInt" },
+      "#/components/schemas/NonEmpty": { node: nonEmpty, pointer: "#/components/schemas/NonEmpty" },
+      "#/components/schemas/NullSchema": {
+        node: nullSchema,
+        pointer: "#/components/schemas/NullSchema",
+      },
+      "#/components/schemas/DeprecatedTarget": {
+        node: deprecatedTarget,
+        pointer: "#/components/schemas/DeprecatedTarget",
+      },
+      "#/components/schemas/HopOverride": {
+        node: deprecatedTarget,
+        pointer: "#/components/schemas/DeprecatedTarget",
+        chain: [
+          { node: { $ref: "#/components/schemas/HopOverride" }, pointer: "#/root" },
+          { node: hopOverride, pointer: "#/components/schemas/HopOverride" },
+          { node: deprecatedTarget, pointer: "#/components/schemas/DeprecatedTarget" },
+        ],
+      },
+    });
+
+    expect(isNonNullIntegerConstraint(computeTypeConstraint({ type: "integer" }, resolve))).toBe(
+      true,
+    );
+    expect(
+      isNonNullIntegerConstraint(computeTypeConstraint({ type: ["integer", "null"] }, resolve)),
+    ).toBe(false);
+
+    expect(
+      computeIntegerBounds(
+        { allOf: [{ $ref: "#/components/schemas/PosInt" }, { maximum: 100 }] },
+        resolve,
+      ),
+    ).toEqual({ kind: "bounds", minimum: 1, maximum: 100 });
+    expect(
+      computeIntegerBounds(
+        { type: "integer", exclusiveMinimum: 0, exclusiveMaximum: 101 },
+        resolve,
+      ),
+    ).toEqual({ kind: "bounds", minimum: 1, maximum: 100 });
+    expect(
+      computeIntegerBounds(
+        { type: "integer", minimum: 0, exclusiveMinimum: true, maximum: 50 },
+        resolve,
+      ),
+    ).toEqual({ kind: "bounds", minimum: 1, maximum: 50 });
+    expect(
+      computeIntegerBounds(
+        {
+          oneOf: [
+            { type: "integer", minimum: 1, maximum: 50 },
+            { $ref: "#/components/schemas/NullSchema" },
+          ],
+        },
+        resolve,
+      ),
+    ).toEqual({ kind: "bounds", minimum: 1, maximum: 50 });
+    expect(
+      computeIntegerBounds(
+        {
+          oneOf: [
+            { type: "integer", minimum: 1, maximum: 50 },
+            { type: "integer", maximum: 100 },
+          ],
+        },
+        resolve,
+      ),
+    ).toEqual({ kind: "bounds", minimum: null, maximum: 100 });
+    expect(
+      computeIntegerBounds(
+        {
+          oneOf: [
+            { type: "integer", minimum: 100, maximum: 50 },
+            { type: "integer", minimum: 200, maximum: 150 },
+          ],
+        },
+        resolve,
+      ),
+    ).toEqual({ kind: "false" });
+    expect(
+      computeIntegerBounds(
+        {
+          oneOf: [
+            { type: "integer", minimum: 100, maximum: 50 },
+            { type: "integer", minimum: 1, maximum: 50 },
+          ],
+        },
+        resolve,
+      ),
+    ).toEqual({ kind: "bounds", minimum: 1, maximum: 50 });
+
+    expect(computeMinLength({ $ref: "#/components/schemas/NonEmpty" }, resolve)).toEqual({
+      kind: "value",
+      minLength: 1,
+    });
+    expect(
+      computeMinLength(
+        {
+          oneOf: [{ type: "string", minLength: 2 }, { $ref: "#/components/schemas/NullSchema" }],
+        },
+        resolve,
+      ),
+    ).toEqual({ kind: "value", minLength: 2 });
+    expect(
+      computeFragmentsMinLength(
+        [{ node: { type: "string" } }, { node: { minLength: 3 } }],
+        resolve,
+      ),
+    ).toEqual({ kind: "value", minLength: 3 });
+
+    expect(isSchemaDeprecated({ $ref: "#/components/schemas/DeprecatedTarget" }, resolve)).toBe(
+      true,
+    );
+    expect(
+      isSchemaDeprecated(
+        { $ref: "#/components/schemas/DeprecatedTarget", deprecated: false },
+        resolve,
+      ),
+    ).toBe(false);
+    expect(isSchemaDeprecated({ $ref: "#/components/schemas/HopOverride" }, resolve)).toBe(false);
+    expect(
+      isSchemaDeprecated(
+        { allOf: [{ type: "string" }, { $ref: "#/components/schemas/DeprecatedTarget" }] },
+        resolve,
+      ),
+    ).toBe(true);
+    expect(
+      isTrackedPropertyDeprecated(
+        {
+          name: "nextCursor",
+          fragments: [{ node: { type: "string" } }, { node: { deprecated: true } }],
+        },
+        resolve,
+      ),
+    ).toBe(true);
   });
 });

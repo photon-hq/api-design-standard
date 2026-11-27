@@ -361,6 +361,10 @@ export function isNonNullStringConstraint(tc: TypeConstraint): boolean {
   return tc.allowed.size === 1 && tc.allowed.has("string");
 }
 
+export function isNonNullIntegerConstraint(tc: TypeConstraint): boolean {
+  return tc.allowed.size === 1 && tc.allowed.has("integer");
+}
+
 export function isNonNullObjectConstraint(tc: TypeConstraint): boolean {
   return tc.allowed.size === 1 && tc.allowed.has("object");
 }
@@ -691,4 +695,271 @@ export function walkSchemaLattice<T>(
   };
 
   return visit(schema, from, new Set()).value;
+}
+
+export type MinLengthConstraint =
+  | { readonly kind: "false" }
+  | { readonly kind: "value"; readonly minLength: number | null };
+
+const FALSE_MIN_LENGTH: MinLengthConstraint = { kind: "false" };
+const UNCONSTRAINED_MIN_LENGTH: MinLengthConstraint = { kind: "value", minLength: null };
+
+function combineMinLengthAllOf(
+  a: MinLengthConstraint,
+  b: MinLengthConstraint,
+): MinLengthConstraint {
+  if (a.kind === "false" || b.kind === "false") {
+    return FALSE_MIN_LENGTH;
+  }
+  if (a.minLength === null) {
+    return b;
+  }
+  if (b.minLength === null) {
+    return a;
+  }
+  return { kind: "value", minLength: Math.max(a.minLength, b.minLength) };
+}
+
+function combineMinLengthUnion(values: readonly MinLengthConstraint[]): MinLengthConstraint {
+  if (values.length === 0) {
+    return UNCONSTRAINED_MIN_LENGTH;
+  }
+  const active = values.filter(
+    (item): item is Extract<MinLengthConstraint, { kind: "value" }> => item.kind === "value",
+  );
+  if (active.length === 0) {
+    return FALSE_MIN_LENGTH;
+  }
+  let lowest: number | null = null;
+  for (const item of active) {
+    if (item.minLength === null) {
+      return UNCONSTRAINED_MIN_LENGTH;
+    }
+    if (lowest === null || item.minLength < lowest) {
+      lowest = item.minLength;
+    }
+  }
+  return { kind: "value", minLength: lowest };
+}
+
+export function computeMinLength(
+  schema: unknown,
+  resolve: ResolverFn,
+  from?: string,
+): MinLengthConstraint {
+  return walkSchemaLattice<MinLengthConstraint>(schema, resolve, from, {
+    falseValue: FALSE_MIN_LENGTH,
+    unknownValue: UNCONSTRAINED_MIN_LENGTH,
+    isAbsorbing: (value) => value.kind === "false",
+    local: (node) => {
+      if (!localTypeConstraint(node).allowed.has("string")) {
+        return FALSE_MIN_LENGTH;
+      }
+      return typeof node.minLength === "number" && Number.isFinite(node.minLength)
+        ? { kind: "value", minLength: node.minLength }
+        : UNCONSTRAINED_MIN_LENGTH;
+    },
+    combineAllOf: combineMinLengthAllOf,
+    combineUnion: combineMinLengthUnion,
+  });
+}
+
+export function computeFragmentsMinLength(
+  fragments: readonly SchemaFragment[],
+  resolve: ResolverFn,
+): MinLengthConstraint {
+  return foldSchemaFragments(
+    fragments,
+    UNCONSTRAINED_MIN_LENGTH,
+    combineMinLengthAllOf,
+    (frag) => computeMinLength(frag.node, resolve, frag.from),
+    (acc) => acc.kind === "false",
+  );
+}
+
+export type NumericBoundsConstraint =
+  | { readonly kind: "false" }
+  | {
+      readonly kind: "bounds";
+      readonly minimum: number | null;
+      readonly maximum: number | null;
+    };
+
+const FALSE_NUMERIC_BOUNDS: NumericBoundsConstraint = { kind: "false" };
+const UNCONSTRAINED_NUMERIC_BOUNDS: NumericBoundsConstraint = {
+  kind: "bounds",
+  minimum: null,
+  maximum: null,
+};
+
+function tightenBound(
+  a: number | null,
+  b: number | null,
+  pick: (x: number, y: number) => number,
+): number | null {
+  if (a === null) {
+    return b;
+  }
+  if (b === null) {
+    return a;
+  }
+  return pick(a, b);
+}
+
+function localIntegerBounds(node: UnknownRecord): NumericBoundsConstraint {
+  const localTypes = localTypeConstraint(node).allowed;
+  if (!localTypes.has("integer") && !localTypes.has("number")) {
+    return FALSE_NUMERIC_BOUNDS;
+  }
+
+  let minimum: number | null = null;
+  let maximum: number | null = null;
+
+  if (typeof node.minimum === "number" && Number.isFinite(node.minimum)) {
+    minimum = node.exclusiveMinimum === true ? Math.floor(node.minimum) + 1 : node.minimum;
+  }
+  if (typeof node.exclusiveMinimum === "number" && Number.isFinite(node.exclusiveMinimum)) {
+    minimum = tightenBound(minimum, Math.floor(node.exclusiveMinimum) + 1, Math.max);
+  }
+  if (typeof node.maximum === "number" && Number.isFinite(node.maximum)) {
+    maximum = node.exclusiveMaximum === true ? Math.ceil(node.maximum) - 1 : node.maximum;
+  }
+  if (typeof node.exclusiveMaximum === "number" && Number.isFinite(node.exclusiveMaximum)) {
+    maximum = tightenBound(maximum, Math.ceil(node.exclusiveMaximum) - 1, Math.min);
+  }
+
+  return { kind: "bounds", minimum, maximum };
+}
+
+function combineIntegerBoundsAllOf(
+  a: NumericBoundsConstraint,
+  b: NumericBoundsConstraint,
+): NumericBoundsConstraint {
+  if (a.kind === "false" || b.kind === "false") {
+    return FALSE_NUMERIC_BOUNDS;
+  }
+  return {
+    kind: "bounds",
+    minimum: tightenBound(a.minimum, b.minimum, Math.max),
+    maximum: tightenBound(a.maximum, b.maximum, Math.min),
+  };
+}
+
+export function isEmptyIntegerRange(minimum: number | null, maximum: number | null): boolean {
+  return (
+    minimum !== null &&
+    maximum !== null &&
+    (maximum < minimum || Math.ceil(minimum) > Math.floor(maximum))
+  );
+}
+
+function combineIntegerBoundsUnion(
+  values: readonly NumericBoundsConstraint[],
+): NumericBoundsConstraint {
+  if (values.length === 0) {
+    return UNCONSTRAINED_NUMERIC_BOUNDS;
+  }
+  let hasSatisfiable = false;
+  let minimum: number | null = null;
+  let maximum: number | null = null;
+  let unboundedMin = false;
+  let unboundedMax = false;
+
+  for (const item of values) {
+    if (item.kind === "false" || isEmptyIntegerRange(item.minimum, item.maximum)) {
+      continue;
+    }
+    hasSatisfiable = true;
+    if (item.minimum === null) {
+      unboundedMin = true;
+    } else if (minimum === null || item.minimum < minimum) {
+      minimum = item.minimum;
+    }
+    if (item.maximum === null) {
+      unboundedMax = true;
+    } else if (maximum === null || item.maximum > maximum) {
+      maximum = item.maximum;
+    }
+  }
+
+  if (!hasSatisfiable) {
+    return FALSE_NUMERIC_BOUNDS;
+  }
+  return {
+    kind: "bounds",
+    minimum: unboundedMin ? null : minimum,
+    maximum: unboundedMax ? null : maximum,
+  };
+}
+
+export function computeIntegerBounds(
+  schema: unknown,
+  resolve: ResolverFn,
+  from?: string,
+): NumericBoundsConstraint {
+  return walkSchemaLattice<NumericBoundsConstraint>(schema, resolve, from, {
+    falseValue: FALSE_NUMERIC_BOUNDS,
+    unknownValue: UNCONSTRAINED_NUMERIC_BOUNDS,
+    isAbsorbing: (value) => value.kind === "false",
+    local: localIntegerBounds,
+    combineAllOf: combineIntegerBoundsAllOf,
+    combineUnion: combineIntegerBoundsUnion,
+  });
+}
+
+export function isSchemaDeprecated(schema: unknown, resolve: ResolverFn, from?: string): boolean {
+  const seen = new Set<unknown>();
+
+  const hasDeprecatedAllOf = (node: UnknownRecord, currentFrom: string | undefined): boolean => {
+    if (!Array.isArray(node.allOf)) {
+      return false;
+    }
+    for (const branch of node.allOf) {
+      if (visit(branch, currentFrom)) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  const visit = (node: unknown, currentFrom: string | undefined): boolean => {
+    if (!isRecord(node) || seen.has(node)) {
+      return false;
+    }
+    seen.add(node);
+
+    if (typeof node.deprecated === "boolean") {
+      return node.deprecated;
+    }
+
+    if (typeof node.$ref === "string") {
+      const resolved = safeResolveSchema(resolve, node, currentFrom);
+      if (resolved) {
+        let refDecided = false;
+        for (const hop of getRefIntermediateHops(node, resolved, { reverse: false })) {
+          if (typeof hop.node.deprecated === "boolean") {
+            if (hop.node.deprecated) {
+              return true;
+            }
+            refDecided = true;
+            break;
+          }
+          if (hasDeprecatedAllOf(hop.node, hop.location?.source?.absoluteRef)) {
+            return true;
+          }
+        }
+        if (!refDecided && visit(resolved.node, resolved.location?.source?.absoluteRef)) {
+          return true;
+        }
+      }
+    }
+
+    return hasDeprecatedAllOf(node, currentFrom);
+  };
+
+  return visit(schema, from);
+}
+
+export function isTrackedPropertyDeprecated(prop: TrackedProperty, resolve: ResolverFn): boolean {
+  return prop.fragments.some((frag) => isSchemaDeprecated(frag.node, resolve, frag.from));
 }

@@ -180,7 +180,7 @@ Host: api.photon.codes
       "createdAt": "2026-11-26T10:00:00Z"
     }
   ],
-  "nextPageToken": null
+  "nextPageToken": "eyJjIjoiMjAyNi0xMS0yNiJ9"
 }
 ```
 
