@@ -73,6 +73,7 @@ export interface ResolvedPathItem {
   readonly pathItemLocation: RedoclyLocation;
   readonly pathFromRef: boolean;
   readonly localKeys: ReadonlySet<string>;
+  fieldLocation(field: string): RedoclyLocation;
   operationLocation(method: string): RedoclyLocation;
   isOperationFromRef(method: string): boolean;
   operationReportLocation(method: string): RedoclyLocation;
@@ -89,11 +90,12 @@ export function resolvePathItemWithLocation(
     pathItemLocation: RedoclyLocation,
     pathFromRef: boolean,
     localKeys: ReadonlySet<string>,
-    operationLocations: ReadonlyMap<string, RedoclyLocation>,
+    fieldLocations: ReadonlyMap<string, RedoclyLocation>,
   ): ResolvedPathItem => {
     const isOperationFromRef = (method: string): boolean => pathFromRef && !localKeys.has(method);
-    const operationLocation = (method: string): RedoclyLocation =>
-      (operationLocations.get(method) ?? pathItemLocation).child([method]);
+    const fieldLocation = (field: string): RedoclyLocation =>
+      (fieldLocations.get(field) ?? pathItemLocation).child([field]);
+    const operationLocation = (method: string): RedoclyLocation => fieldLocation(method);
     const operationReportLocation = (method: string): RedoclyLocation =>
       isOperationFromRef(method) ? pathUsageLocation.key() : operationLocation(method).key();
 
@@ -104,6 +106,7 @@ export function resolvePathItemWithLocation(
       pathItemLocation,
       pathFromRef,
       localKeys,
+      fieldLocation,
       operationLocation,
       isOperationFromRef,
       operationReportLocation,
@@ -127,13 +130,13 @@ export function resolvePathItemWithLocation(
     }
     const localOnly: UnknownRecord = {};
     const localKeys = new Set<string>();
-    const operationLocations = new Map<string, RedoclyLocation>();
+    const fieldLocations = new Map<string, RedoclyLocation>();
     for (const [key, value] of localEntries) {
       localOnly[key] = value;
       localKeys.add(key);
-      operationLocations.set(key, pathUsageLocation);
+      fieldLocations.set(key, pathUsageLocation);
     }
-    return buildEntry(localOnly, pathUsageLocation, false, localKeys, operationLocations);
+    return buildEntry(localOnly, pathUsageLocation, false, localKeys, fieldLocations);
   }
 
   const targetLocation = resolved.location ?? pathUsageLocation;
@@ -144,7 +147,7 @@ export function resolvePathItemWithLocation(
   }
 
   const merged: UnknownRecord = { ...resolved.node };
-  const operationLocations = new Map<string, RedoclyLocation>();
+  const fieldLocations = new Map<string, RedoclyLocation>();
   for (const hop of intermediateHops) {
     const hopLocation = hop.location ?? targetLocation;
     for (const [key, value] of Object.entries(hop.node)) {
@@ -152,7 +155,7 @@ export function resolvePathItemWithLocation(
         continue;
       }
       merged[key] = value;
-      operationLocations.set(key, hopLocation);
+      fieldLocations.set(key, hopLocation);
     }
   }
 
@@ -160,9 +163,85 @@ export function resolvePathItemWithLocation(
   for (const [key, value] of localEntries) {
     merged[key] = value;
     localKeys.add(key);
-    operationLocations.set(key, pathUsageLocation);
+    fieldLocations.set(key, pathUsageLocation);
   }
-  return buildEntry(merged, targetLocation, true, localKeys, operationLocations);
+  return buildEntry(merged, targetLocation, true, localKeys, fieldLocations);
+}
+
+export interface ResolvedOperationParameter {
+  readonly name: string;
+  readonly in: string;
+  readonly deprecated: boolean;
+  readonly node: UnknownRecord;
+  readonly source: "path" | "operation";
+  readonly usageLocation: RedoclyLocation;
+  readonly resolvedLocation: RedoclyLocation;
+  readonly resolvedFromRef: boolean;
+  readonly reportLocation: RedoclyLocation;
+}
+
+function parameterDedupeKey(paramIn: string, name: string): string {
+  return paramIn === "header" ? `${paramIn}:${name.toLowerCase()}` : `${paramIn}:${name}`;
+}
+
+export function resolveOperationParameters(
+  pathEntry: ResolvedPathItem,
+  method: string,
+  resolve: ResolverFn,
+): ResolvedOperationParameter[] {
+  const pathItem = pathEntry.pathItem;
+  const op = pathItem?.[method];
+  if (!isRecord(pathItem) || !isRecord(op)) {
+    return [];
+  }
+
+  const effectiveByKey = new Map<string, ResolvedOperationParameter>();
+  const collectFrom = (
+    rawParams: unknown,
+    listLocation: RedoclyLocation,
+    source: "path" | "operation",
+    makeReportLocation: (usageLocation: RedoclyLocation) => RedoclyLocation,
+  ): void => {
+    if (!Array.isArray(rawParams)) {
+      return;
+    }
+    for (const [index, rawParam] of rawParams.entries()) {
+      const usageLocation = listLocation.child([index]);
+      const resolved = resolveRecordWithLocation(resolve, rawParam, usageLocation);
+      if (
+        !resolved ||
+        typeof resolved.node.name !== "string" ||
+        typeof resolved.node.in !== "string"
+      ) {
+        continue;
+      }
+      const key = parameterDedupeKey(resolved.node.in, resolved.node.name);
+      effectiveByKey.set(key, {
+        name: resolved.node.name,
+        in: resolved.node.in,
+        deprecated: resolved.node.deprecated === true,
+        node: resolved.node,
+        source,
+        usageLocation,
+        resolvedLocation: resolved.location,
+        resolvedFromRef: resolved.resolvedFromRef,
+        reportLocation: makeReportLocation(usageLocation),
+      });
+    }
+  };
+
+  collectFrom(pathItem.parameters, pathEntry.fieldLocation("parameters"), "path", () =>
+    pathEntry.operationReportLocation(method),
+  );
+  collectFrom(
+    op.parameters,
+    pathEntry.operationLocation(method).child(["parameters"]),
+    "operation",
+    (usageLocation) =>
+      pathEntry.isOperationFromRef(method) ? pathEntry.pathUsageLocation.key() : usageLocation,
+  );
+
+  return [...effectiveByKey.values()];
 }
 
 export function iterateRootPathItems(

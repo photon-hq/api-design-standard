@@ -10,6 +10,7 @@ import {
   computeHoistedCollectionCandidates,
   endsWithPathParam,
   findCrudVerbInPathSegment,
+  findMutatingTerminalActionSegment,
   isValidKebabCasePathSegment,
   looksLikePluralSubCollectionSegment,
   normalizePathTemplate,
@@ -350,6 +351,82 @@ describe("ADS-0005 unit helpers", () => {
     expect(suggestResourceIdParam("entries")).toBe("entryId");
     expect(suggestResourceIdParam("addresses")).toBe("addressId");
     expect(suggestResourceIdParam("batches")).toBe("batchId");
+  });
+
+  it("identifies unmistakable state-mutating terminal action segments with zero CRUD-verb overlap", () => {
+    const disallowedVerbs = [
+      "revoke",
+      "cancel",
+      "rotate",
+      "retry",
+      "resend",
+      "archive",
+      "restore",
+      "enable",
+      "disable",
+      "transfer-ownership",
+      "pay",
+      "purchase",
+      "approve",
+      "reject",
+      "confirm",
+      "submit",
+      "trigger",
+      "publish",
+      "unpublish",
+      "suspend",
+      "unsuspend",
+      "activate",
+      "deactivate",
+      "refund",
+      "void",
+      "reset",
+      "purge",
+      "invalidate",
+      "disconnect",
+      "unlink",
+      "install",
+      "uninstall",
+      "deploy",
+      "rollback",
+      "pause",
+      "resume",
+      "verify",
+    ];
+
+    for (const verb of disallowedVerbs) {
+      expect(findCrudVerbInPathSegment(verb), `no CRUD overlap for ${verb}`).toBeNull();
+      expect(findMutatingTerminalActionSegment(`/v1/items/{itemId}/${verb}`), verb).toBe(verb);
+      expect(
+        findMutatingTerminalActionSegment(`/v1/items/{itemId}/${verb.toUpperCase()}/`),
+        verb,
+      ).toBe(verb);
+      expect(findMutatingTerminalActionSegment(`/v1/items/{itemId}:${verb}`), verb).toBe(verb);
+    }
+
+    for (const allowedPath of [
+      "/",
+      "/v1/items/{itemId}",
+      "/v1/items/{revoke}",
+      "/v1/operations/{operationId}/redirect",
+      "/v1/oauth/callback",
+      "/v1/files/{fileId}/download",
+      "/v1/reports/export",
+      "/v1/templates/{templateId}/preview",
+      "/v1/projects/search",
+      "/v1/projects/query",
+      "/v1/projects/count",
+      "/v1/health/status",
+      "/v1/invoices/{invoiceId}/pdf",
+      "/v1/invoices/{invoiceId}/receipt",
+      "/v1/projects/{projectId}/refunds",
+      "/v1/projects/{projectId}/purchases",
+      "/v1/projects/{projectId}/deploy/status",
+      "/v1/projects/{projectId}/delete",
+      "/.well-known",
+    ]) {
+      expect(findMutatingTerminalActionSegment(allowedPath), allowedPath).toBeNull();
+    }
   });
 });
 
@@ -2747,5 +2824,408 @@ describe("ADS-0005 Redocly CLI end-to-end linting", () => {
     ).toBe(true);
     expect(statusMessages.some((m) => m.includes("/search"))).toBe(false);
     expect(methodMessages.some((m) => m.includes('"/v1/chained-items/{itemId}"'))).toBe(true);
+  });
+
+  it("rejects non-deprecated Idempotency-Key headers on GET and HEAD across direct, path-level, and $ref declarations", async () => {
+    const headerParam = (name: string, extra: Record<string, unknown> = {}) => ({
+      name,
+      in: "header",
+      schema: { type: "string" },
+      ...extra,
+    });
+    const ok200 = { "200": jsonResponse({ type: "object" }) };
+
+    const doc = baseOpenApi({
+      paths: {
+        // Direct inline Idempotency-Key on GET and lowercase on HEAD -> both reported
+        "/v1/projects/{projectId}/direct-idempotency": {
+          parameters: [pathParam("projectId")],
+          get: {
+            operationId: "getDirectIdempotency",
+            summary: "GET with inline Idempotency-Key",
+            parameters: [headerParam("Idempotency-Key")],
+            responses: ok200,
+          },
+          head: {
+            operationId: "headDirectIdempotency",
+            summary: "HEAD with lowercase idempotency-key",
+            parameters: [headerParam("idempotency-key")],
+            responses: { "200": { description: "OK" } },
+          },
+          post: {
+            operationId: "postDirectIdempotency",
+            summary: "POST with Idempotency-Key is allowed",
+            parameters: [headerParam("Idempotency-Key")],
+            responses: { "201": jsonResponse({ type: "object" }, "Created") },
+          },
+        },
+        // Path-level Idempotency-Key inherited by GET and HEAD (POST allowed)
+        "/v1/projects/{projectId}/path-level-idempotency": {
+          parameters: [pathParam("projectId"), headerParam("IDEMPOTENCY-KEY")],
+          get: {
+            operationId: "getPathLevelIdempotency",
+            summary: "GET inheriting path-level Idempotency-Key",
+            responses: ok200,
+          },
+          head: {
+            operationId: "headPathLevelIdempotency",
+            summary: "HEAD inheriting path-level Idempotency-Key",
+            responses: { "200": { description: "OK" } },
+          },
+          post: {
+            operationId: "postPathLevelIdempotency",
+            summary: "POST inheriting path-level Idempotency-Key",
+            responses: { "201": jsonResponse({ type: "object" }, "Created") },
+          },
+        },
+        // $ref Parameter on GET and POST -> GET reported at usage site, POST allowed
+        "/v1/projects/{projectId}/ref-idempotency": {
+          parameters: [pathParam("projectId")],
+          get: {
+            operationId: "getRefIdempotency",
+            summary: "GET referencing component Idempotency-Key",
+            parameters: [{ $ref: "#/components/parameters/SharedIdempotencyKey" }],
+            responses: ok200,
+          },
+          post: {
+            operationId: "postRefIdempotency",
+            summary: "POST referencing same component Idempotency-Key",
+            parameters: [{ $ref: "#/components/parameters/SharedIdempotencyKey" }],
+            responses: { "201": jsonResponse({ type: "object" }, "Created") },
+          },
+        },
+        // $ref Path Item with path-level $ref Idempotency-Key -> GET reported at path usage
+        "/v1/projects/{projectId}/ref-path-item-idempotency": {
+          $ref: "#/components/pathItems/SharedIdempotentPathItem",
+        },
+        // Path-level Idempotency-Key overridden to deprecated: true on GET (case-insensitive),
+        // while HEAD still inherits the active path-level header -> only HEAD reported
+        "/v1/projects/{projectId}/override-deprecated": {
+          parameters: [pathParam("projectId"), headerParam("Idempotency-Key")],
+          get: {
+            operationId: "getOverrideDeprecated",
+            summary: "GET deprecates inherited Idempotency-Key",
+            parameters: [headerParam("idempotency-key", { deprecated: true })],
+            responses: ok200,
+          },
+          head: {
+            operationId: "headWithoutOverride",
+            summary: "HEAD still inherits active Idempotency-Key",
+            responses: { "200": { description: "OK" } },
+          },
+        },
+        // Path-level deprecated Idempotency-Key overridden to non-deprecated on GET -> reported
+        "/v1/projects/{projectId}/override-active": {
+          parameters: [
+            pathParam("projectId"),
+            headerParam("Idempotency-Key", { deprecated: true }),
+          ],
+          get: {
+            operationId: "getOverrideActive",
+            summary: "GET re-enables Idempotency-Key",
+            parameters: [headerParam("Idempotency-Key", { deprecated: false })],
+            responses: ok200,
+          },
+        },
+        // Allowed cases: inline deprecated, $ref deprecated, OAS 3.1 sibling deprecated, query param, other header
+        "/v1/projects/{projectId}/safe-headers": {
+          parameters: [pathParam("projectId")],
+          get: {
+            operationId: "getSafeHeaders",
+            summary: "GET with deprecated Idempotency-Key and non-header params",
+            parameters: [
+              headerParam("Idempotency-Key", { deprecated: true }),
+              headerParam("X-Request-Id"),
+              { name: "Idempotency-Key", in: "query", schema: { type: "string" } },
+            ],
+            responses: ok200,
+          },
+        },
+        // Allowed: $ref to deprecated component Parameter Object (even with unsupported
+        // deprecated: false sibling on Reference Object).
+        // Disallowed: $ref to active component Parameter Object with unsupported deprecated: true
+        // sibling on Reference Object must still be reported per OpenAPI 3.1.
+        "/v1/projects/{projectId}/ref-deprecated-idempotency": {
+          parameters: [pathParam("projectId")],
+          get: {
+            operationId: "getRefDeprecatedIdempotency",
+            summary: "GET with deprecated component parameter",
+            parameters: [
+              { $ref: "#/components/parameters/DeprecatedIdempotencyKey", deprecated: false },
+            ],
+            responses: ok200,
+          },
+          head: {
+            operationId: "headUnsupportedRefSiblingDeprecated",
+            summary: "HEAD with unsupported deprecated: true sibling on active $ref",
+            parameters: [
+              { $ref: "#/components/parameters/SharedIdempotencyKey", deprecated: true },
+            ],
+            responses: { "200": { description: "OK" } },
+          },
+        },
+      },
+      components: {
+        parameters: {
+          SharedIdempotencyKey: headerParam("Idempotency-Key"),
+          DeprecatedIdempotencyKey: headerParam("Idempotency-Key", { deprecated: true }),
+        },
+        pathItems: {
+          SharedIdempotentPathItem: {
+            parameters: [
+              pathParam("projectId"),
+              { $ref: "#/components/parameters/SharedIdempotencyKey" },
+            ],
+            get: {
+              operationId: "getFromRefPathItem",
+              summary: "GET from $ref Path Item",
+              responses: ok200,
+            },
+          },
+        },
+      },
+    });
+
+    const { exitCode, report } = await lintOpenApi(doc);
+    expect(exitCode).toBe(1);
+    const errors = ads0005ProblemsFor(report, "ads-0005-standard-http-methods");
+    const messages = errors.map((e) => e.message);
+
+    expect(errors).toHaveLength(9);
+    expect(
+      messages.some(
+        (m) =>
+          m.includes('GET "/v1/projects/{projectId}/direct-idempotency"') &&
+          m.includes('"Idempotency-Key"'),
+      ),
+    ).toBe(true);
+    expect(
+      messages.some(
+        (m) =>
+          m.includes('HEAD "/v1/projects/{projectId}/direct-idempotency"') &&
+          m.includes('"idempotency-key"'),
+      ),
+    ).toBe(true);
+    expect(
+      messages.some(
+        (m) =>
+          m.includes('GET "/v1/projects/{projectId}/path-level-idempotency"') &&
+          m.includes('"IDEMPOTENCY-KEY"'),
+      ),
+    ).toBe(true);
+    expect(
+      messages.some(
+        (m) =>
+          m.includes('HEAD "/v1/projects/{projectId}/path-level-idempotency"') &&
+          m.includes('"IDEMPOTENCY-KEY"'),
+      ),
+    ).toBe(true);
+    const refError = errors.find((e) =>
+      e.message.includes('GET "/v1/projects/{projectId}/ref-idempotency"'),
+    );
+    expect(refError).toBeDefined();
+    expect(refError?.location?.[0]?.pointer).toContain("/get/parameters/0");
+    expect(
+      messages.some((m) => m.includes('GET "/v1/projects/{projectId}/ref-path-item-idempotency"')),
+    ).toBe(true);
+    expect(
+      messages.some((m) => m.includes('HEAD "/v1/projects/{projectId}/override-deprecated"')),
+    ).toBe(true);
+    expect(
+      messages.some((m) => m.includes('GET "/v1/projects/{projectId}/override-deprecated"')),
+    ).toBe(false);
+    expect(messages.some((m) => m.includes('GET "/v1/projects/{projectId}/override-active"'))).toBe(
+      true,
+    );
+    expect(
+      messages.some((m) =>
+        m.includes('HEAD "/v1/projects/{projectId}/ref-deprecated-idempotency"'),
+      ),
+    ).toBe(true);
+    expect(
+      messages.some((m) => m.includes('GET "/v1/projects/{projectId}/ref-deprecated-idempotency"')),
+    ).toBe(false);
+    expect(messages.some((m) => m.startsWith("POST "))).toBe(false);
+    expect(messages.some((m) => m.includes("safe-headers"))).toBe(false);
+  });
+
+  it("rejects state-mutating terminal action verbs on GET and HEAD while allowing POST, safe read paths, and ignore rules", async () => {
+    const ok200 = { "200": jsonResponse({ type: "object" }) };
+    const head200 = { "200": { description: "OK" } };
+    const mutatingPaths: Record<string, unknown> = {};
+
+    for (const verb of ["revoke", "cancel", "pay", "purchase", "rotate", "transfer-ownership"]) {
+      mutatingPaths[`/v1/projects/{projectId}/resources/{resourceId}/${verb}`] = {
+        parameters: [pathParam("projectId"), pathParam("resourceId")],
+        get: { operationId: `get_${verb}`, summary: `Bad GET ${verb}`, responses: ok200 },
+        head: { operationId: `head_${verb}`, summary: `Bad HEAD ${verb}`, responses: head200 },
+        post: { operationId: `post_${verb}`, summary: `Good POST ${verb}`, responses: ok200 },
+      };
+    }
+
+    const allowedGetPaths: Record<string, unknown> = {};
+    for (const safeSeg of [
+      "redirect",
+      "callback",
+      "download",
+      "export",
+      "preview",
+      "search",
+      "query",
+      "count",
+      "status",
+      "pdf",
+      "receipt",
+      "refunds",
+    ]) {
+      allowedGetPaths[`/v1/projects/{projectId}/resources/{resourceId}/${safeSeg}`] = {
+        parameters: [pathParam("projectId"), pathParam("resourceId")],
+        get: { operationId: `get_${safeSeg}`, summary: `Allowed GET ${safeSeg}`, responses: ok200 },
+        head: {
+          operationId: `head_${safeSeg}`,
+          summary: `Allowed HEAD ${safeSeg}`,
+          responses: head200,
+        },
+      };
+    }
+
+    const doc = baseOpenApi({
+      paths: {
+        ...mutatingPaths,
+        ...allowedGetPaths,
+        "/v1/projects/{projectId}/resources/{resourceId}": {
+          parameters: [pathParam("projectId"), pathParam("resourceId")],
+          get: { operationId: "getResourceItem", summary: "Item GET", responses: ok200 },
+          head: { operationId: "headResourceItem", summary: "Item HEAD", responses: head200 },
+        },
+        "/v1/projects/{projectId}/deploy/status": {
+          parameters: [pathParam("projectId")],
+          get: {
+            operationId: "getDeployStatus",
+            summary: "Non-terminal mutating segment is allowed",
+            responses: ok200,
+          },
+        },
+        // Mixed-case terminal mutating verb and custom method suffix on GET
+        "/v1/projects/{projectId}/resources/{resourceId}/Verify": {
+          parameters: [pathParam("projectId"), pathParam("resourceId")],
+          get: { operationId: "getVerifyUpper", summary: "Uppercase Verify", responses: ok200 },
+        },
+        "/v1/projects/{projectId}/resources/{resourceId}:approve": {
+          parameters: [pathParam("projectId"), pathParam("resourceId")],
+          get: { operationId: "getCustomApprove", summary: "Custom :approve", responses: ok200 },
+        },
+        // CRUD verb /delete on GET must only be flagged once (by CRUD verb check, not double-reported)
+        "/v1/projects/{projectId}/resources/{resourceId}/delete": {
+          parameters: [pathParam("projectId"), pathParam("resourceId")],
+          get: { operationId: "getDelete", summary: "CRUD verb delete", responses: ok200 },
+        },
+        // Path Item $ref on mutating terminal path
+        "/v1/projects/{projectId}/resources/{resourceId}/refund": {
+          $ref: "#/components/pathItems/SharedRefundPath",
+        },
+      },
+      components: {
+        pathItems: {
+          SharedRefundPath: {
+            parameters: [pathParam("projectId"), pathParam("resourceId")],
+            get: { operationId: "getSharedRefund", summary: "Ref GET refund", responses: ok200 },
+          },
+        },
+      },
+    });
+
+    const { exitCode, report } = await lintOpenApi(doc);
+    expect(exitCode).toBe(1);
+    const errors = ads0005ProblemsFor(report, "ads-0005-standard-http-methods");
+    const messages = errors.map((e) => e.message);
+
+    // 6 mutating verbs * 2 (GET+HEAD) + Verify + :approve + /delete (CRUD once) + $ref /refund = 16
+    expect(errors).toHaveLength(16);
+    for (const verb of ["revoke", "cancel", "pay", "purchase", "rotate", "transfer-ownership"]) {
+      expect(
+        messages.some((m) =>
+          m.includes(`GET "/v1/projects/{projectId}/resources/{resourceId}/${verb}"`),
+        ),
+      ).toBe(true);
+      expect(
+        messages.some((m) =>
+          m.includes(`HEAD "/v1/projects/{projectId}/resources/{resourceId}/${verb}"`),
+        ),
+      ).toBe(true);
+      expect(messages.some((m) => m.startsWith("POST ") && m.includes(`/${verb}"`))).toBe(false);
+    }
+    expect(messages.some((m) => m.includes("/Verify") && m.includes('"verify"'))).toBe(true);
+    expect(messages.some((m) => m.includes(":approve") && m.includes('"approve"'))).toBe(true);
+    expect(messages.some((m) => m.includes("/refund") && m.includes('"refund"'))).toBe(true);
+    expect(errors.filter((e) => e.message.includes("/delete"))).toHaveLength(1);
+    for (const safeSeg of [
+      "redirect",
+      "callback",
+      "download",
+      "export",
+      "preview",
+      "search",
+      "query",
+      "count",
+      "status",
+      "pdf",
+      "receipt",
+      "refunds",
+    ]) {
+      expect(
+        messages.some((m) => m.includes(`/${safeSeg}"`)),
+        safeSeg,
+      ).toBe(false);
+    }
+
+    // Verify declarative ignore config suppresses safe-method checks by path+method and path-only
+    const ignoreConfigPath = await writeRedoclyConfig({
+      "photon-ads/ads-0005-standard-http-methods": {
+        severity: "error",
+        ignore: [
+          {
+            path: "/v1/projects/{projectId}/legacy-revoke/revoke",
+            method: "get",
+            reason: "Legacy GET revoke pending migration to POST",
+          },
+          {
+            path: "/v1/projects/{projectId}/legacy-idempotent",
+            reason: "Legacy path with Idempotency-Key on GET and HEAD",
+          },
+        ],
+      },
+    });
+    const ignoreDoc = baseOpenApi({
+      paths: {
+        "/v1/projects/{projectId}/legacy-revoke/revoke": {
+          parameters: [pathParam("projectId")],
+          get: { operationId: "getLegacyRevoke", summary: "Ignored GET revoke", responses: ok200 },
+          head: {
+            operationId: "headLegacyRevoke",
+            summary: "Non-ignored HEAD revoke",
+            responses: head200,
+          },
+        },
+        "/v1/projects/{projectId}/legacy-idempotent": {
+          parameters: [
+            pathParam("projectId"),
+            { name: "Idempotency-Key", in: "header", schema: { type: "string" } },
+          ],
+          get: { operationId: "getLegacyIdemp", summary: "Path-ignored GET", responses: ok200 },
+          head: {
+            operationId: "headLegacyIdemp",
+            summary: "Path-ignored HEAD",
+            responses: head200,
+          },
+        },
+      },
+    });
+    const ignoreRes = await lintOpenApi(ignoreDoc, ignoreConfigPath);
+    const ignoreErrors = ads0005ProblemsFor(ignoreRes.report, "ads-0005-standard-http-methods");
+    expect(ignoreErrors).toHaveLength(1);
+    expect(ignoreErrors[0]?.message).toContain(
+      'HEAD "/v1/projects/{projectId}/legacy-revoke/revoke"',
+    );
   });
 });
