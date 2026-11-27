@@ -4,13 +4,13 @@ sidebarTitle: "ADS-0005 · Standard Resource Methods"
 description: "Standard HTTP methods, read symmetry for addressable resources, canonical success status codes, representation consistency, and URL path naming across Photon public HTTP APIs."
 ads: "0005"
 status: "Approved"
-updated: "2026-11-26"
+updated: "2026-11-27"
 ---
 
 # ADS-0005: Standard Resource Methods and Lifecycle
 
 - **Status**: Approved
-- **Updated**: 2026-11-26
+- **Updated**: 2026-11-27
 
 Consistent HTTP methods, read symmetry, status codes, and URL structure let callers, generated SDKs, dashboards, CLIs, and automated agents navigate every Photon resource lifecycle without endpoint-specific special cases. This standard is part of Photon API Design Standards and uses the keywords **MUST**, **MUST NOT**, **SHOULD**, and **MAY** as described in RFC 2119.
 
@@ -53,11 +53,21 @@ Photon public HTTP APIs **MUST** map standard resource lifecycle operations to s
 
 #### Safe and side-effect-free `GET` and `HEAD` semantics
 
-- `GET` (and `HEAD`) operations **MUST** be safe and idempotent per [RFC 9110 Section 9.2.1](https://www.rfc-editor.org/rfc/rfc9110#section-9.2.1): they **MUST NOT** create, modify, or delete resources, overwrite or invalidate in-flight operations or authorization attempts, mint, rotate, or revoke credentials, or trigger external side effects. Only passive observability (such as access logging, metrics, or cache warming) is permitted.
+- `GET` (and `HEAD`) operations **MUST** be safe and idempotent per [RFC 9110 Section 9.2.1](https://www.rfc-editor.org/rfc/rfc9110#section-9.2.1): they **MUST NOT** create, modify, or delete resources, overwrite or invalidate in-flight operations or authorization attempts, mint, rotate, or revoke credentials, or trigger external side effects. Only passive observability (such as access logging, metrics, or cache warming) is permitted, except under the narrow protocol-mandated browser callback exception below.
 - External callers depend on this guarantee: browser prefetching, enterprise URL security scanners, link previews, double-clicks, SDK automatic retries, and automated agents treat `GET` as read-only and safe to replay without confirmation. If a `GET` handler mutates state or overwrites an active authorization attempt, a single background scan or retried click silently breaks the caller's live workflow.
 - `GET` (and `HEAD`) operations **MUST NOT** declare an `Idempotency-Key` header parameter (existing parameters marked `deprecated: true` are permitted only during migration). Requiring an idempotency key signals a state-changing request that belongs on `POST`, `PUT`, `PATCH`, or `DELETE`.
 - `GET` (and `HEAD`) operations **MUST NOT** expose unmistakable state-mutating action verbs (such as `/revoke`, `/cancel`, `/rotate`, `/retry`, `/resend`, `/archive`, `/restore`, `/enable`, `/disable`, `/transfer-ownership`, `/pay`, `/purchase`, `/approve`, `/reject`, `/confirm`, `/submit`, `/trigger`, `/publish`, `/unpublish`, `/suspend`, `/unsuspend`, `/activate`, `/deactivate`, `/refund`, `/void`, `/reset`, `/purge`, `/invalidate`, `/disconnect`, `/unlink`, `/install`, `/uninstall`, `/deploy`, `/rollback`, `/pause`, `/resume`, or `/verify`) as their terminal path segment. State-changing actions belong on `POST`.
-- Read-only helper and relay routes (such as `/redirect`, `/callback`, `/download`, `/export`, `/preview`, `/search`, `/query`, `/count`, `/status`, `/pdf`, or `/receipt`) remain allowed on `GET`, provided their handler obeys the safe, side-effect-free requirement above.
+- Read-only helper and outbound relay routes (such as `/redirect`, `/download`, `/export`, `/preview`, `/search`, `/query`, `/count`, `/status`, `/pdf`, or `/receipt`) remain allowed on `GET`, provided their handler obeys the safe, side-effect-free requirement above.
+
+#### Protocol-mandated browser callbacks (`GET .../callback`)
+
+External browser-redirect protocols—such as [OAuth 2.0 Authorization Code Grant (RFC 6749 Section 4.1.2)](https://www.rfc-editor.org/rfc/rfc6749#section-4.1.2), OpenID Connect, SSO, and third-party integration install flows—require the external provider to return the user's browser via an HTTP `GET` redirect carrying authorization parameters. Because the provider dictates the HTTP method, an inbound browser callback endpoint (including a `302` callback hop chained directly from that provider return before continuing the provider's browser flow) **MAY** complete that single bound authorization or installation handoff (such as exchanging an authorization code, establishing a browser session, or binding the authorized installation) **only** when **all** of the following invariants hold:
+
+1. **Protocol-mandated browser flow**: The route exists solely to receive an external browser redirect that cannot deliver `POST`. Outbound handoffs initiated by a caller (such as `GET .../redirect`) and general API operations **MUST NOT** use this exception.
+2. **Short-lived, single-use, initiator-bound correlation**: Before performing any state transition, the handler **MUST** verify a short-lived, single-use opaque correlation token (such as an OAuth `state` or authorization `attempt` identifier) bound to the initiating user's authenticated session or PKCE/CSRF cookie, so unauthenticated link scanners, prefetches, or other principals cannot trigger or hijack it.
+3. **Convergent replay and concurrency handling**: Replaying or concurrently delivering the same callback (such as from a double-click or browser reload) **MUST NOT** create, rotate, or overwrite any in-flight attempt or resource; the handler **MUST** converge to the already-settled redirect outcome or cleanly reject the spent token.
+4. **Redirect-only, non-cacheable response**: The endpoint **MUST** respond only with an HTTP redirect (such as `302 Found`) carrying `Cache-Control: no-store` (and **SHOULD** set `Referrer-Policy: no-referrer`), and **MUST NOT** act as a JSON API endpoint returning `200` data payloads.
+5. **Callback route naming**: The route path **SHOULD** use `/callback` (or `/callback/<provider>` / `/callback/{provider}` when segmented by external provider) rather than a state-mutating action verb such as `/resume` or `/complete`.
 
 ### 2. Read symmetry for addressable resources
 
@@ -245,9 +255,9 @@ paths:
                 $ref: "#/components/schemas/ApiKey"
 ```
 
-### Safe browser redirect handoffs
+### Safe browser redirect handoffs and protocol-mandated callbacks
 
-**Good** — create the external authorization attempt during the preceding `POST`, and have the relay `GET` read-only reuse the active unconsumed attempt to return `302 Found`. Repeated `GET` requests from browser prefetching, enterprise URL scanners, or double-clicks redirect to the same active attempt without invalidating the in-flight workflow:
+**Good** — outbound relay (`GET .../redirect`): create the external authorization attempt during the preceding `POST`, and have the relay `GET` read-only reuse the active unconsumed attempt to return `302 Found`. Repeated `GET` requests from browser prefetching, enterprise URL scanners, or double-clicks redirect to the same active attempt without invalidating the in-flight workflow:
 
 ```http
 POST /v1/projects/prj_01h455vb4pex5vsknk084sn02q/integrations HTTP/1.1
@@ -269,7 +279,21 @@ Location: https://provider.example.com/oauth/authorize?state=st_01h455vb4pex5vsk
 Cache-Control: no-store
 ```
 
-**Bad** — creating or rotating a fresh authorization attempt and overwriting the operation's active state on every `GET /v1/operations/{operationId}/redirect`, or exposing state-mutating actions or `Idempotency-Key` headers on `GET`:
+**Good** — protocol-mandated inbound browser callback (`GET .../callback`): when the external provider redirects the browser back after OAuth or integration approval, the callback verifies the short-lived, single-use correlation token against the initiating session, converges on concurrent or replayed hits without creating or replacing attempts, and responds only with a non-cacheable `302 Found`:
+
+```http
+GET /v1/integrations/callback?attempt=att_01h455vb4pex5vsknk084sn02u HTTP/1.1
+Host: api.photon.codes
+```
+
+```http
+HTTP/1.1 302 Found
+Location: https://provider.example.com/setup/continue
+Cache-Control: no-store
+Referrer-Policy: no-referrer
+```
+
+**Bad** — creating or rotating a fresh authorization attempt and overwriting the operation's active state on every `GET /v1/operations/{operationId}/redirect`, exposing state-mutating verbs (such as `/revoke` or `/resume`) or `Idempotency-Key` headers on `GET`, or using a JSON `GET` endpoint to complete a state transition:
 
 ```yaml
 paths:
@@ -284,6 +308,12 @@ paths:
       responses:
         "302":
           description: Redirects to a newly minted attempt, invalidating earlier links
+  /v1/integrations/resume:
+    get:
+      summary: Uses a state-mutating verb instead of /callback on GET
+      responses:
+        "302":
+          description: Redirects after mutating state
   /v1/projects/{projectId}/api-keys/{apiKeyId}/revoke:
     get:
       summary: Uses GET instead of POST for a state-mutating action
@@ -380,3 +410,4 @@ The `@photon-hq/api-design-standards` Redocly plugin (`photon-ads`) enforces ADS
 
 - **2026-11-26**: Approved and published as `ADS-0005`.
 - **2026-11-26**: Codified RFC 9110 safe, side-effect-free semantics for `GET` and `HEAD` in §1, added browser redirect handoff guidance, and prohibited `Idempotency-Key` header parameters and unmistakable state-mutating terminal action verbs on `GET` and `HEAD`.
+- **2026-11-27**: Clarified the narrow exception for protocol-mandated inbound browser callbacks (`GET .../callback` per RFC 6749 OAuth, SSO, and third-party integration redirects) with single-use initiator-bound correlation, convergent replay, and non-cacheable `302` redirect guardrails, while keeping outbound `/redirect` relays and regular `GET` operations strictly side-effect-free.
