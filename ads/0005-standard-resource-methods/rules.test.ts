@@ -3235,4 +3235,54 @@ describe("ADS-0005 Redocly CLI end-to-end linting", () => {
       'HEAD "/v1/projects/{projectId}/legacy-revoke/revoke"',
     );
   });
+
+  it("allows protocol-mandated GET callback 302 routes while rejecting GET /resume", async () => {
+    const redirect302 = {
+      "302": {
+        description: "Redirect back to provider or caller",
+        headers: {
+          Location: { schema: { type: "string", format: "uri" } },
+          "Cache-Control": { schema: { type: "string" } },
+        },
+      },
+    };
+    const doc = baseOpenApi({
+      paths: {
+        "/v1/integrations/callback": {
+          get: {
+            operationId: "integrationCallback",
+            summary: "Protocol-mandated browser callback",
+            responses: redirect302,
+          },
+        },
+        "/v1/integrations/callback/{provider}": {
+          parameters: [pathParam("provider")],
+          get: {
+            operationId: "providerIntegrationCallback",
+            summary: "Provider-segmented browser callback",
+            responses: redirect302,
+          },
+        },
+        "/v1/integrations/resume": {
+          get: {
+            operationId: "resumeIntegration",
+            summary: "Disallowed mutating action verb on GET",
+            responses: redirect302,
+          },
+        },
+      },
+    });
+
+    const { exitCode, report } = await lintOpenApi(doc);
+    expect(exitCode).toBe(1);
+    const allAds0005Errors = [
+      ...ads0005ProblemsFor(report, "ads-0005-addressable-resource-read"),
+      ...ads0005ProblemsFor(report, "ads-0005-standard-http-methods"),
+      ...ads0005ProblemsFor(report, "ads-0005-standard-status-codes"),
+      ...ads0005ProblemsFor(report, "ads-0005-url-path-naming"),
+    ];
+    expect(allAds0005Errors).toHaveLength(1);
+    expect(allAds0005Errors[0]?.ruleId).toBe("photon-ads/ads-0005-standard-http-methods");
+    expect(allAds0005Errors[0]?.message).toContain('GET "/v1/integrations/resume"');
+  });
 });

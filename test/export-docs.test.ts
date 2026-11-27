@@ -276,7 +276,7 @@ describe("docs-reference export", () => {
       "Standard HTTP methods, read symmetry for addressable resources, canonical success status codes, representation consistency, and URL path naming across Photon public HTTP APIs.",
     );
     expect(ads0005?.status).toBe("Approved");
-    expect(ads0005?.updated).toBe("2026-11-26");
+    expect(ads0005?.updated).toBe("2026-11-27");
     expect(ads0005?.rules).toEqual([
       {
         id: "photon-ads/ads-0005-addressable-resource-read",
@@ -310,6 +310,10 @@ describe("docs-reference export", () => {
     expect(ads0005?.body).toContain("## Examples");
     expect(ads0005?.body).toContain("## Changelog");
     expect(ads0005?.body).toContain("Approved and published as `ADS-0005`.");
+    expect(ads0005?.body).toContain(
+      "#### Protocol-mandated browser callbacks (`GET .../callback`)",
+    );
+    expect(ads0005?.body).toContain("RFC 6749 Section 4.1.2");
     expect(ads0005?.body).toContain('"nextPageToken": "eyJjIjoiMjAyNi0xMS0yNiJ9"');
     expect(ads0005?.body).not.toContain('"nextPageToken": null');
     expect(ads0005?.body).not.toMatch(/^##\s+(?:Deterministic\s+)?Lint\s+Rules\b/im);
