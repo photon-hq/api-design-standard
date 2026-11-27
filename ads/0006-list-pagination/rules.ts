@@ -20,6 +20,7 @@ import {
   isRecord,
   isTrackedPropertyDeprecated,
   type JsonSchemaType,
+  locationKey,
   propertyTypeConstraint,
   type ResolverFn,
   selectPropertyReportLocation,
@@ -30,7 +31,10 @@ import {
 import {
   collectFlattenedObjectVariants,
   collectFragmentsObjectVariants,
+  defaultFlattenedVariantSignature,
   type FlattenedObjectVariant,
+  type FlattenedVariantOptions,
+  schemaNodeIdentity,
 } from "../../src/schema-variants.js";
 import type {
   AdsStandardMetadata,
@@ -183,6 +187,41 @@ function collectActiveQueryParams(
   return params;
 }
 
+function paginationVariantSignature(variant: FlattenedObjectVariant, resolve: ResolverFn): string {
+  const details = [...variant.properties.keys()].sort().map((key) => {
+    const prop = variant.properties.get(key);
+    if (!prop) {
+      return [key] as const;
+    }
+    const deprecated = isTrackedPropertyDeprecated(prop, resolve) ? 1 : 0;
+    const minLen =
+      key === "nextPageToken"
+        ? (() => {
+            const constraint = computeFragmentsMinLength(prop.fragments, resolve);
+            return constraint.kind === "false" ? "false" : String(constraint.minLength);
+          })()
+        : undefined;
+    const objectFrags = propertyTypeConstraint(prop, resolve).allowed.has("object")
+      ? prop.fragments
+          .map((frag) =>
+            frag.location ? locationKey(frag.location) : schemaNodeIdentity(frag.node),
+          )
+          .sort()
+      : undefined;
+    return [key, deprecated, minLen, objectFrags] as const;
+  });
+
+  return JSON.stringify([
+    defaultFlattenedVariantSignature(variant, resolve),
+    [...variant.schemaNames].sort(),
+    details,
+  ]);
+}
+
+const PAGINATION_VARIANT_OPTIONS: FlattenedVariantOptions = {
+  variantSignature: paginationVariantSignature,
+};
+
 function collectGetJsonResponses(
   entry: ResolvedPathItem,
   getOp: UnknownRecord,
@@ -202,6 +241,7 @@ function collectGetJsonResponses(
       response.schema,
       resolve,
       response.schemaLocation,
+      PAGINATION_VARIANT_OPTIONS,
     );
     const reportBaseLocation =
       opFromRef || response.responseFromRef
@@ -442,7 +482,11 @@ function checkNestedPaginationWrapper(
     return;
   }
 
-  const nested = collectFragmentsObjectVariants(prop.fragments, resolve);
+  const nested = collectFragmentsObjectVariants(
+    prop.fragments,
+    resolve,
+    PAGINATION_VARIANT_OPTIONS,
+  );
   for (const nestedVariant of nested.variants) {
     if (!nestedVariant.isObjectLike) {
       continue;

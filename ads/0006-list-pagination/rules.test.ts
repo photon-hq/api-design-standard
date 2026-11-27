@@ -1182,4 +1182,182 @@ describe("ADS-0006 Redocly CLI end-to-end linting", () => {
     expect(problems[0]?.ruleId).toBe("photon-ads/ads-0006-standard-pagination-params");
     expect(problems[0]?.message).toContain('GET "/v1/still-flagged"');
   });
+
+  it("preserves distinct anyOf branches differing in minLength, deprecation, or nested wrappers regardless of branch order", async () => {
+    const validTokenBranch = {
+      type: "object",
+      properties: {
+        nextPageToken: { type: "string", minLength: 1 },
+      },
+    };
+    const emptyTokenBranch = {
+      type: "object",
+      properties: {
+        nextPageToken: { type: "string", minLength: 0 },
+      },
+    };
+    const deprecatedCursorBranch = {
+      type: "object",
+      properties: {
+        nextCursor: { type: "string", deprecated: true },
+      },
+    };
+    const activeCursorBranch = {
+      type: "object",
+      properties: {
+        nextCursor: { type: "string" },
+      },
+    };
+    const benignMetaBranch = {
+      type: "object",
+      properties: {
+        meta: {
+          type: "object",
+          properties: {
+            requestId: { type: "string" },
+          },
+        },
+      },
+    };
+    const nestedWrapperMetaBranch = {
+      type: "object",
+      properties: {
+        meta: {
+          type: "object",
+          properties: {
+            nextCursor: { type: "string" },
+          },
+        },
+      },
+    };
+
+    const makeUnionResponse = (branches: unknown[]) => ({
+      description: "OK",
+      content: {
+        "application/json": {
+          schema: {
+            type: "object",
+            required: ["items"],
+            properties: {
+              items: { type: "array", items: { type: "string" } },
+            },
+            anyOf: branches,
+          },
+        },
+      },
+    });
+
+    const doc = baseOpenApi({
+      paths: {
+        "/v1/minlen-valid-first": {
+          get: {
+            operationId: "listMinLenValidFirst",
+            parameters: [pageSizeParam(), pageTokenParam()],
+            responses: { "200": makeUnionResponse([validTokenBranch, emptyTokenBranch]) },
+          },
+        },
+        "/v1/minlen-invalid-first": {
+          get: {
+            operationId: "listMinLenInvalidFirst",
+            parameters: [pageSizeParam(), pageTokenParam()],
+            responses: { "200": makeUnionResponse([emptyTokenBranch, validTokenBranch]) },
+          },
+        },
+        "/v1/deprecated-first": {
+          get: {
+            operationId: "listDeprecatedFirst",
+            responses: { "200": makeUnionResponse([deprecatedCursorBranch, activeCursorBranch]) },
+          },
+        },
+        "/v1/active-first": {
+          get: {
+            operationId: "listActiveFirst",
+            responses: { "200": makeUnionResponse([activeCursorBranch, deprecatedCursorBranch]) },
+          },
+        },
+        "/v1/wrapper-benign-first": {
+          get: {
+            operationId: "listWrapperBenignFirst",
+            responses: {
+              "200": makeUnionResponse([benignMetaBranch, nestedWrapperMetaBranch]),
+            },
+          },
+        },
+        "/v1/wrapper-bad-first": {
+          get: {
+            operationId: "listWrapperBadFirst",
+            responses: {
+              "200": makeUnionResponse([nestedWrapperMetaBranch, benignMetaBranch]),
+            },
+          },
+        },
+        "/v1/nested-deprecated-first": {
+          get: {
+            operationId: "listNestedDeprecatedFirst",
+            responses: {
+              "200": listResponse({
+                items: { type: "array", items: { type: "string" } },
+                meta: {
+                  anyOf: [deprecatedCursorBranch, activeCursorBranch],
+                },
+              }),
+            },
+          },
+        },
+        "/v1/nested-active-first": {
+          get: {
+            operationId: "listNestedActiveFirst",
+            responses: {
+              "200": listResponse({
+                items: { type: "array", items: { type: "string" } },
+                meta: {
+                  anyOf: [activeCursorBranch, deprecatedCursorBranch],
+                },
+              }),
+            },
+          },
+        },
+      },
+    });
+
+    const { report } = await lintOpenApi(doc);
+    const shapeErrors = ads0006ProblemsFor(report, "ads-0006-pagination-response-shape");
+
+    for (const path of ["/v1/minlen-valid-first", "/v1/minlen-invalid-first"]) {
+      expect(
+        shapeErrors.some(
+          (p) => p.message.includes(`GET "${path}"`) && p.message.includes('"minLength" >= 1'),
+        ),
+        `expected minLength error on ${path}`,
+      ).toBe(true);
+    }
+    for (const path of ["/v1/deprecated-first", "/v1/active-first"]) {
+      expect(
+        shapeErrors.some(
+          (p) =>
+            p.message.includes(`GET "${path}"`) &&
+            p.message.includes('non-standard pagination response property "nextCursor"'),
+        ),
+        `expected banned nextCursor error on ${path}`,
+      ).toBe(true);
+    }
+    for (const path of [
+      "/v1/wrapper-benign-first",
+      "/v1/wrapper-bad-first",
+      "/v1/nested-deprecated-first",
+      "/v1/nested-active-first",
+    ]) {
+      expect(
+        shapeErrors.some(
+          (p) =>
+            p.message.includes(`GET "${path}"`) &&
+            p.message.includes(
+              'nests pagination field "nextCursor" inside top-level object property "meta"',
+            ),
+        ),
+        `expected nested wrapper error on ${path}`,
+      ).toBe(true);
+    }
+    expect(shapeErrors).toHaveLength(8);
+  });
 });

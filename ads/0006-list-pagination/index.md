@@ -61,7 +61,7 @@ Paginated `GET` collection endpoints **MUST** use forward opaque token paginatio
 ### 4. Opaque tokens and `400 INVALID_PAGE_TOKEN` error contract
 
 - `pageToken` and `nextPageToken` are opaque strings (`type: string`, `minLength: 1`, optional, non-nullable). Clients **MUST NOT** parse, decode, construct, modify, or persist tokens long-term across sessions.
-- Servers **SHOULD** bind page tokens to the active filter parameters, sort parameters, and resource scope, and **SHOULD** protect token integrity and confidentiality (for example using HMAC signatures or authenticated encryption) so internal storage keys and query cursors are neither exposed nor forgeable.
+- Servers **SHOULD** bind page tokens to the active filter parameters, sort parameters, and resource scope, and **SHOULD** protect both token integrity and confidentiality—for example using authenticated encryption or opaque server-side handles—so internal storage keys and query cursors are neither exposed nor forgeable (an HMAC signature alone protects integrity, not confidentiality).
 - Malformed, expired, tampered, or filter/sort-mismatched `pageToken` values **MUST** return `400 Bad Request` with `Content-Type: application/problem+json` (RFC 9457 Problem Details) and error code `INVALID_PAGE_TOKEN`.
 
 ### 5. Deterministic ordering, consistency, and exact counts
