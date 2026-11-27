@@ -1,4 +1,4 @@
-import { execFileSync, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
@@ -111,11 +111,6 @@ function adsProblems(report: RedoclyJsonReport): RedoclyJsonProblem[] {
 
 beforeAll(async () => {
   tempDir = await mkdtemp(join(tmpdir(), "photon-ads-0001-"));
-  // Always compile from current source so standalone `pnpm test` never exercises stale dist/.
-  execFileSync(resolve(REPO_ROOT, "node_modules/.bin/tsc"), ["-p", "tsconfig.build.json"], {
-    cwd: REPO_ROOT,
-    stdio: "inherit",
-  });
 });
 
 afterAll(async () => {

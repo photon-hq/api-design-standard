@@ -3,15 +3,22 @@ import {
   extractOperationJsonResponseSchemas,
   hasHeaderCaseInsensitive,
   inspectResponseContent,
+  resolveOperationParameters,
   resolvePathItemWithLocation,
 } from "./openapi-utils.js";
 import {
+  computeFragmentsMinLength,
+  computeIntegerBounds,
+  computeMinLength,
   computeTypeConstraint,
   extractComponentSchemaName,
   intersectTypeSets,
+  isNonNullIntegerConstraint,
   isNonNullObjectConstraint,
   isNonNullStringConstraint,
+  isSchemaDeprecated,
   isStrictlyNullConstraint,
+  isTrackedPropertyDeprecated,
   jsonTypeOfValue,
   mergeTrackedProperty,
   type ResolverFn,
@@ -370,5 +377,256 @@ describe("shared schema and OpenAPI utilities", () => {
     expect(resolved.isOperationFromRef("patch")).toBe(true);
     expect(resolved.operationLocation("put").source?.absoluteRef).toBe("b.yaml");
     expect(resolved.operationLocation("patch").source?.absoluteRef).toBe("a.yaml");
+  });
+
+  it("merges path-level and operation-level parameters with $ref resolution, ignoring unsupported Reference Object siblings", () => {
+    const idempotencyTarget = {
+      name: "Idempotency-Key",
+      in: "header",
+      schema: { type: "string" },
+    };
+    const deprecatedTarget = {
+      name: "Idempotency-Key",
+      in: "header",
+      deprecated: true,
+      schema: { type: "string" },
+    };
+    const chainedAlias = {
+      $ref: "#/components/parameters/IdempotencyKey",
+      deprecated: true,
+    };
+    const resolve = makeResolver({
+      "#/components/parameters/IdempotencyKey": {
+        node: idempotencyTarget,
+        pointer: "#/components/parameters/IdempotencyKey",
+      },
+      "#/components/parameters/DeprecatedIdempotencyKey": {
+        node: deprecatedTarget,
+        pointer: "#/components/parameters/DeprecatedIdempotencyKey",
+      },
+      "#/components/parameters/IdempotencyAlias": {
+        node: idempotencyTarget,
+        pointer: "#/components/parameters/IdempotencyKey",
+        chain: [
+          { node: chainedAlias, pointer: "#/components/parameters/IdempotencyAlias" },
+          { node: idempotencyTarget, pointer: "#/components/parameters/IdempotencyKey" },
+        ],
+      },
+    });
+
+    // Path-level Idempotency-Key overridden by a full operation-level Parameter Object on GET
+    // (case-insensitive header match), inherited on HEAD, while Reference Object siblings like
+    // deprecated: true/false on $ref or intermediate hops are ignored per OpenAPI 3.1.
+    const rawPathItem = {
+      parameters: [
+        { $ref: "#/components/parameters/IdempotencyKey" },
+        { name: "Filter", in: "query", schema: { type: "string" } },
+      ],
+      get: {
+        operationId: "listItems",
+        parameters: [
+          { name: "idempotency-key", in: "header", deprecated: true, schema: { type: "string" } },
+          { name: "filter", in: "query", schema: { type: "string" } },
+        ],
+      },
+      head: {
+        operationId: "headItems",
+      },
+      post: {
+        operationId: "postWithUnsupportedRefSibling",
+        parameters: [{ $ref: "#/components/parameters/IdempotencyAlias", deprecated: true }],
+      },
+      put: {
+        operationId: "putWithUnsupportedFalseSibling",
+        parameters: [
+          { $ref: "#/components/parameters/DeprecatedIdempotencyKey", deprecated: false },
+        ],
+      },
+    };
+    const pathEntry = resolvePathItemWithLocation(
+      resolve,
+      "/v1/items",
+      rawPathItem,
+      makeLocation("#/paths/~1v1~1items"),
+    );
+
+    const getParams = resolveOperationParameters(pathEntry, "get", resolve);
+    expect(getParams).toHaveLength(3);
+    const getHeader = getParams.find((p) => p.in === "header");
+    expect(getHeader?.name).toBe("idempotency-key");
+    expect(getHeader?.deprecated).toBe(true);
+    expect(getHeader?.source).toBe("operation");
+    expect(getHeader?.reportLocation.pointer).toBe("#/paths/~1v1~1items/get/parameters/0");
+    expect(getParams.filter((p) => p.in === "query").map((p) => p.name)).toEqual([
+      "Filter",
+      "filter",
+    ]);
+
+    const headParams = resolveOperationParameters(pathEntry, "head", resolve);
+    expect(headParams).toHaveLength(2);
+    const headHeader = headParams.find((p) => p.in === "header");
+    expect(headHeader?.name).toBe("Idempotency-Key");
+    expect(headHeader?.deprecated).toBe(false);
+    expect(headHeader?.source).toBe("path");
+    expect(headHeader?.resolvedFromRef).toBe(true);
+    expect(headHeader?.reportLocation.pointer).toBe("#/paths/~1v1~1items/head");
+
+    const postHeader = resolveOperationParameters(pathEntry, "post", resolve).find(
+      (p) => p.in === "header",
+    );
+    expect(postHeader?.name).toBe("Idempotency-Key");
+    expect(postHeader?.deprecated).toBe(false);
+    expect(postHeader?.resolvedFromRef).toBe(true);
+
+    const putHeader = resolveOperationParameters(pathEntry, "put", resolve).find(
+      (p) => p.in === "header",
+    );
+    expect(putHeader?.name).toBe("Idempotency-Key");
+    expect(putHeader?.deprecated).toBe(true);
+    expect(putHeader?.resolvedFromRef).toBe(true);
+  });
+
+  it("computes integer bounds, string minLength, and deprecation across $ref, allOf, and unions", () => {
+    const posInt = { type: "integer", minimum: 1 };
+    const nonEmpty = { type: "string", minLength: 1 };
+    const nullSchema = { type: "null" };
+    const deprecatedTarget = { type: "string", deprecated: true };
+    const hopOverride = { $ref: "#/components/schemas/DeprecatedTarget", deprecated: false };
+    const resolve = makeResolver({
+      "#/components/schemas/PosInt": { node: posInt, pointer: "#/components/schemas/PosInt" },
+      "#/components/schemas/NonEmpty": { node: nonEmpty, pointer: "#/components/schemas/NonEmpty" },
+      "#/components/schemas/NullSchema": {
+        node: nullSchema,
+        pointer: "#/components/schemas/NullSchema",
+      },
+      "#/components/schemas/DeprecatedTarget": {
+        node: deprecatedTarget,
+        pointer: "#/components/schemas/DeprecatedTarget",
+      },
+      "#/components/schemas/HopOverride": {
+        node: deprecatedTarget,
+        pointer: "#/components/schemas/DeprecatedTarget",
+        chain: [
+          { node: { $ref: "#/components/schemas/HopOverride" }, pointer: "#/root" },
+          { node: hopOverride, pointer: "#/components/schemas/HopOverride" },
+          { node: deprecatedTarget, pointer: "#/components/schemas/DeprecatedTarget" },
+        ],
+      },
+    });
+
+    expect(isNonNullIntegerConstraint(computeTypeConstraint({ type: "integer" }, resolve))).toBe(
+      true,
+    );
+    expect(
+      isNonNullIntegerConstraint(computeTypeConstraint({ type: ["integer", "null"] }, resolve)),
+    ).toBe(false);
+
+    expect(
+      computeIntegerBounds(
+        { allOf: [{ $ref: "#/components/schemas/PosInt" }, { maximum: 100 }] },
+        resolve,
+      ),
+    ).toEqual({ kind: "bounds", minimum: 1, maximum: 100 });
+    expect(
+      computeIntegerBounds(
+        { type: "integer", exclusiveMinimum: 0, exclusiveMaximum: 101 },
+        resolve,
+      ),
+    ).toEqual({ kind: "bounds", minimum: 1, maximum: 100 });
+    expect(
+      computeIntegerBounds(
+        { type: "integer", minimum: 0, exclusiveMinimum: true, maximum: 50 },
+        resolve,
+      ),
+    ).toEqual({ kind: "bounds", minimum: 1, maximum: 50 });
+    expect(
+      computeIntegerBounds(
+        {
+          oneOf: [
+            { type: "integer", minimum: 1, maximum: 50 },
+            { $ref: "#/components/schemas/NullSchema" },
+          ],
+        },
+        resolve,
+      ),
+    ).toEqual({ kind: "bounds", minimum: 1, maximum: 50 });
+    expect(
+      computeIntegerBounds(
+        {
+          oneOf: [
+            { type: "integer", minimum: 1, maximum: 50 },
+            { type: "integer", maximum: 100 },
+          ],
+        },
+        resolve,
+      ),
+    ).toEqual({ kind: "bounds", minimum: null, maximum: 100 });
+    expect(
+      computeIntegerBounds(
+        {
+          oneOf: [
+            { type: "integer", minimum: 100, maximum: 50 },
+            { type: "integer", minimum: 200, maximum: 150 },
+          ],
+        },
+        resolve,
+      ),
+    ).toEqual({ kind: "false" });
+    expect(
+      computeIntegerBounds(
+        {
+          oneOf: [
+            { type: "integer", minimum: 100, maximum: 50 },
+            { type: "integer", minimum: 1, maximum: 50 },
+          ],
+        },
+        resolve,
+      ),
+    ).toEqual({ kind: "bounds", minimum: 1, maximum: 50 });
+
+    expect(computeMinLength({ $ref: "#/components/schemas/NonEmpty" }, resolve)).toEqual({
+      kind: "value",
+      minLength: 1,
+    });
+    expect(
+      computeMinLength(
+        {
+          oneOf: [{ type: "string", minLength: 2 }, { $ref: "#/components/schemas/NullSchema" }],
+        },
+        resolve,
+      ),
+    ).toEqual({ kind: "value", minLength: 2 });
+    expect(
+      computeFragmentsMinLength(
+        [{ node: { type: "string" } }, { node: { minLength: 3 } }],
+        resolve,
+      ),
+    ).toEqual({ kind: "value", minLength: 3 });
+
+    expect(isSchemaDeprecated({ $ref: "#/components/schemas/DeprecatedTarget" }, resolve)).toBe(
+      true,
+    );
+    expect(
+      isSchemaDeprecated(
+        { $ref: "#/components/schemas/DeprecatedTarget", deprecated: false },
+        resolve,
+      ),
+    ).toBe(false);
+    expect(isSchemaDeprecated({ $ref: "#/components/schemas/HopOverride" }, resolve)).toBe(false);
+    expect(
+      isSchemaDeprecated(
+        { allOf: [{ type: "string" }, { $ref: "#/components/schemas/DeprecatedTarget" }] },
+        resolve,
+      ),
+    ).toBe(true);
+    expect(
+      isTrackedPropertyDeprecated(
+        {
+          name: "nextCursor",
+          fragments: [{ node: { type: "string" } }, { node: { deprecated: true } }],
+        },
+        resolve,
+      ),
+    ).toBe(true);
   });
 });

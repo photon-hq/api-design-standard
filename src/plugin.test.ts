@@ -15,14 +15,15 @@ import photonAdsPlugin, {
 describe("photon-ads Redocly plugin exports", () => {
   it("exports plugin metadata, catalog helpers, ignore types, and Redocly plugin factory", () => {
     expect(PLUGIN_ID).toBe("photon-ads");
-    expect(ADS_STANDARDS).toHaveLength(5);
-    expect(ADS_RULES).toHaveLength(21);
+    expect(ADS_STANDARDS).toHaveLength(6);
+    expect(ADS_RULES).toHaveLength(24);
 
     expect(getStandardByNumber("0001")?.folder).toBe("0001-resource-identifiers");
     expect(getStandardByNumber("0002")?.folder).toBe("0002-top-level-json-response");
     expect(getStandardByNumber("0003")?.folder).toBe("0003-idempotency-key");
     expect(getStandardByNumber("0004")?.folder).toBe("0004-long-running-operations");
     expect(getStandardByNumber("0005")?.folder).toBe("0005-standard-resource-methods");
+    expect(getStandardByNumber("0006")?.folder).toBe("0006-list-pagination");
     expect(getStandardByNumber("9999")).toBeUndefined();
 
     expect(getRuleById("photon-ads/ads-0001-resource-primary-id")?.severity).toBe("error");
@@ -37,6 +38,9 @@ describe("photon-ads Redocly plugin exports", () => {
     expect(getRuleById("photon-ads/ads-0005-standard-http-methods")?.severity).toBe("error");
     expect(getRuleById("photon-ads/ads-0005-standard-status-codes")?.severity).toBe("error");
     expect(getRuleById("photon-ads/ads-0005-url-path-naming")?.severity).toBe("error");
+    expect(getRuleById("photon-ads/ads-0006-standard-pagination-params")?.severity).toBe("error");
+    expect(getRuleById("photon-ads/ads-0006-page-size-bounds")?.severity).toBe("error");
+    expect(getRuleById("photon-ads/ads-0006-pagination-response-shape")?.severity).toBe("error");
     expect(getRuleById("photon-ads/does-not-exist")).toBeUndefined();
 
     const recommended = getRecommendedRulesConfig();
@@ -62,6 +66,9 @@ describe("photon-ads Redocly plugin exports", () => {
       "photon-ads/ads-0005-standard-http-methods": "error",
       "photon-ads/ads-0005-standard-status-codes": "error",
       "photon-ads/ads-0005-url-path-naming": "error",
+      "photon-ads/ads-0006-standard-pagination-params": "error",
+      "photon-ads/ads-0006-page-size-bounds": "error",
+      "photon-ads/ads-0006-pagination-response-shape": "error",
     });
 
     const ignoreEntry: AdsIgnoreEntry = {
@@ -104,6 +111,9 @@ describe("photon-ads Redocly plugin exports", () => {
       "ads-0005-standard-http-methods",
       "ads-0005-standard-status-codes",
       "ads-0005-url-path-naming",
+      "ads-0006-page-size-bounds",
+      "ads-0006-pagination-response-shape",
+      "ads-0006-standard-pagination-params",
     ]);
   });
 });

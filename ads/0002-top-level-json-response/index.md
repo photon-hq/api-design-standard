@@ -42,7 +42,7 @@ When a `POST` endpoint creates a resource and returns a one-time sensitive value
 
 Top-level JSON objects are **NOT** restricted to single resources. The following shapes are explicitly allowed:
 
-- **Collections**: Top-level objects wrapping a list array, with or without pagination fields (for example `{ "items": [ ... ], "nextCursor": null }`).
+- **Collections**: Top-level objects wrapping a list array, with or without pagination fields (for example `{ "items": [ ... ], "nextPageToken": "eyJjIjoiMjAyNi0xMS0yNiJ9" }`, with `nextPageToken` omitted on the final page per `ADS-0006`).
 - **Free-form key-value maps**: Open dictionary objects with dynamic keys (for example label or attribute maps).
 - **Scalar utility responses**: Objects returning scalar summaries, counts, or links (for example `{ "count": 42 }` or `{ "url": "https://example.com/..." }`).
 - **Multi-entity composite responses**: Objects returning two or more peer entities (for example `{ "operation": { ... }, "resource": { ... } }`).

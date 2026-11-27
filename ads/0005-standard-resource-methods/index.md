@@ -28,7 +28,7 @@ Related concerns are governed by separate standards:
 - Resource identifier fields (`id`, `<resource>Id`) and URL path parameter naming (`{<resource>Id}`) are defined in `ADS-0001`.
 - Flat top-level JSON response objects and one-time creation secrets are defined in `ADS-0002`.
 - Asynchronous long-running operations (`202 Accepted`, `Operation` schema, polling, and cancellation) are defined in `ADS-0004`.
-- Pagination, filtering, and sorting query parameters and request idempotency headers (`Idempotency-Key`) are outside the scope of this standard.
+- Pagination, filtering, and sorting query parameters and write-operation idempotency semantics (`Idempotency-Key` on mutating methods) are outside the scope of this standard.
 
 ## Normative Rules
 
@@ -46,10 +46,18 @@ Photon public HTTP APIs **MUST** map standard resource lifecycle operations to s
 | Delete resource | `/v1/.../<collection>/{<resource>Id}` or `/v1/.../<singleton>` | `DELETE` | Remove or soft-delete a single resource |
 | Custom action | `/v1/.../<collection>/{<resource>Id}/<action>` | `POST` | Trigger a domain state transition that does not fit CRUD (for example `revoke`, `cancel`, `rotate`, `retry`, `archive`, `restore`) |
 
-- Static URL path segments **MUST NOT** embed CRUD verbs (`create`, `get`, `list`, `update`, `delete`, `remove`, `fetch`, `edit`, or `add`) either as standalone segments (such as `/v1/projects/create`) or as prefixes (such as `/v1/projects/get-project`, `/v1/getUser`, `/v1/list-projects`, or `/v1/api-keys/delete-key`). Legitimate domain actions such as `revoke`, `cancel`, `rotate`, `retry`, `resend`, `archive`, `restore`, `verify`, `enable`, `disable`, `transfer-ownership`, `preview`, `search`, `query`, and `batch` remain allowed.
+- Static URL path segments **MUST NOT** embed CRUD verbs (`create`, `get`, `list`, `update`, `delete`, `remove`, `fetch`, `edit`, or `add`) either as standalone segments (such as `/v1/projects/create`) or as prefixes (such as `/v1/projects/get-project`, `/v1/getUser`, `/v1/list-projects`, or `/v1/api-keys/delete-key`). Legitimate state-mutating domain actions such as `revoke`, `cancel`, `rotate`, `retry`, `resend`, `archive`, `restore`, `verify`, `enable`, `disable`, `transfer-ownership`, and `batch` remain allowed on `POST`, while read-only endpoints such as `preview`, `search`, and `query` **MAY** use `GET` or `POST`.
 - A single endpoint path **MUST NOT** declare both `PUT` and `PATCH`. Choose `PATCH` for partial updates or `PUT` for full replacement and idempotent upsert—never both on the same path.
 - `GET` operations **MUST NOT** declare a request body (`requestBody`). Complex queries that exceed query-string limits **SHOULD** use a dedicated `POST` search or query endpoint.
 - Collection-level `DELETE` operations (paths not ending in a resource identifier parameter `{<resource>Id}`) **MUST NOT** declare a request body. Single-resource deletes identify the target in the URL path, singleton deletes require no body, and bulk deletions **SHOULD** use a dedicated `POST` batch endpoint.
+
+#### Safe and side-effect-free `GET` and `HEAD` semantics
+
+- `GET` (and `HEAD`) operations **MUST** be safe and idempotent per [RFC 9110 Section 9.2.1](https://www.rfc-editor.org/rfc/rfc9110#section-9.2.1): they **MUST NOT** create, modify, or delete resources, overwrite or invalidate in-flight operations or authorization attempts, mint, rotate, or revoke credentials, or trigger external side effects. Only passive observability (such as access logging, metrics, or cache warming) is permitted.
+- External callers depend on this guarantee: browser prefetching, enterprise URL security scanners, link previews, double-clicks, SDK automatic retries, and automated agents treat `GET` as read-only and safe to replay without confirmation. If a `GET` handler mutates state or overwrites an active authorization attempt, a single background scan or retried click silently breaks the caller's live workflow.
+- `GET` (and `HEAD`) operations **MUST NOT** declare an `Idempotency-Key` header parameter (existing parameters marked `deprecated: true` are permitted only during migration). Requiring an idempotency key signals a state-changing request that belongs on `POST`, `PUT`, `PATCH`, or `DELETE`.
+- `GET` (and `HEAD`) operations **MUST NOT** expose unmistakable state-mutating action verbs (such as `/revoke`, `/cancel`, `/rotate`, `/retry`, `/resend`, `/archive`, `/restore`, `/enable`, `/disable`, `/transfer-ownership`, `/pay`, `/purchase`, `/approve`, `/reject`, `/confirm`, `/submit`, `/trigger`, `/publish`, `/unpublish`, `/suspend`, `/unsuspend`, `/activate`, `/deactivate`, `/refund`, `/void`, `/reset`, `/purge`, `/invalidate`, `/disconnect`, `/unlink`, `/install`, `/uninstall`, `/deploy`, `/rollback`, `/pause`, `/resume`, or `/verify`) as their terminal path segment. State-changing actions belong on `POST`.
+- Read-only helper and relay routes (such as `/redirect`, `/callback`, `/download`, `/export`, `/preview`, `/search`, `/query`, `/count`, `/status`, `/pdf`, or `/receipt`) remain allowed on `GET`, provided their handler obeys the safe, side-effect-free requirement above.
 
 ### 2. Read symmetry for addressable resources
 
@@ -172,7 +180,7 @@ Host: api.photon.codes
       "createdAt": "2026-11-26T10:00:00Z"
     }
   ],
-  "nextPageToken": null
+  "nextPageToken": "eyJjIjoiMjAyNi0xMS0yNiJ9"
 }
 ```
 
@@ -235,6 +243,53 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ApiKey"
+```
+
+### Safe browser redirect handoffs
+
+**Good** — create the external authorization attempt during the preceding `POST`, and have the relay `GET` read-only reuse the active unconsumed attempt to return `302 Found`. Repeated `GET` requests from browser prefetching, enterprise URL scanners, or double-clicks redirect to the same active attempt without invalidating the in-flight workflow:
+
+```http
+POST /v1/projects/prj_01h455vb4pex5vsknk084sn02q/integrations HTTP/1.1
+Host: api.photon.codes
+Idempotency-Key: 9b2d8a64-3f7e-4c1e-8d0a-123456789abc
+Content-Type: application/json
+```
+
+The `POST` response returns `202 Accepted` with an `Operation` whose `nextAction.url` points to the read-only relay route. Following that link performs no state mutation:
+
+```http
+GET /v1/operations/op_01h455vb4pex5vsknk084sn02r/redirect HTTP/1.1
+Host: api.photon.codes
+```
+
+```http
+HTTP/1.1 302 Found
+Location: https://provider.example.com/oauth/authorize?state=st_01h455vb4pex5vsknk084sn02t
+Cache-Control: no-store
+```
+
+**Bad** — creating or rotating a fresh authorization attempt and overwriting the operation's active state on every `GET /v1/operations/{operationId}/redirect`, or exposing state-mutating actions or `Idempotency-Key` headers on `GET`:
+
+```yaml
+paths:
+  /v1/operations/{operationId}/redirect:
+    get:
+      summary: Mutates or replaces the active authorization attempt on every GET
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          schema:
+            type: string
+      responses:
+        "302":
+          description: Redirects to a newly minted attempt, invalidating earlier links
+  /v1/projects/{projectId}/api-keys/{apiKeyId}/revoke:
+    get:
+      summary: Uses GET instead of POST for a state-mutating action
+      responses:
+        "200":
+          description: Revoked API key
 ```
 
 ### Non-conformant patterns
@@ -317,10 +372,11 @@ The `@photon-hq/api-design-standards` Redocly plugin (`photon-ads`) enforces ADS
 | Rule ID | Default Severity | What it enforces |
 | --- | --- | --- |
 | `photon-ads/ads-0005-addressable-resource-read` | `error` | Requires a corresponding single-resource `GET` (direct or schema-compatible hoisted canonical route) for every item route declaring `PATCH`, `PUT`, `DELETE`, or a custom action `POST .../{param}/<action>`, requires `GET` on every singleton declaring `PATCH`, `PUT`, or bodyless `DELETE`, and requires a direct or schema-compatible hoisted item `GET` for every addressable collection `GET` whose items declare a canonical scalar `id`. |
-| `photon-ads/ads-0005-standard-http-methods` | `error` | Rejects CRUD verbs in static URL path segments (`create`, `get`, `list`, `update`, `delete`, `remove`, `fetch`, `edit`, `add` and their kebab/snake/camel prefixes), rejects declaring both `PUT` and `PATCH` on the same path, rejects `GET` with `requestBody`, and rejects collection-level `DELETE` (paths not ending in `{param}`) with `requestBody`. |
+| `photon-ads/ads-0005-standard-http-methods` | `error` | Rejects CRUD verbs in static URL path segments (`create`, `get`, `list`, `update`, `delete`, `remove`, `fetch`, `edit`, `add` and their kebab/snake/camel prefixes), rejects declaring both `PUT` and `PATCH` on the same path, rejects `GET` with `requestBody`, rejects collection-level `DELETE` (paths not ending in `{param}`) with `requestBody`, rejects non-deprecated `Idempotency-Key` header parameters on `GET` and `HEAD`, and rejects unmistakable state-mutating action verbs as the terminal static path segment on `GET` and `HEAD`. |
 | `photon-ads/ads-0005-standard-status-codes` | `error` | Rejects `201` and `202` on `GET`; requires `201` or `202` on collection creation `POST` endpoints (paths not ending in `{param}` that also declare `GET` or a `{param}` child path); rejects `204` and bodyless `200` on `PATCH`; and rejects `201` and `204` with a response `content` body on `DELETE`. |
 | `photon-ads/ads-0005-url-path-naming` | `error` | Requires every static URL path segment (excluding `{param}` placeholders, leading version prefixes `v[0-9]+`, and `.well-known`) to use lowercase `kebab-case`. |
 
 ## Changelog
 
 - **2026-11-26**: Approved and published as `ADS-0005`.
+- **2026-11-26**: Codified RFC 9110 safe, side-effect-free semantics for `GET` and `HEAD` in §1, added browser redirect handoff guidance, and prohibited `Idempotency-Key` header parameters and unmistakable state-mutating terminal action verbs on `GET` and `HEAD`.

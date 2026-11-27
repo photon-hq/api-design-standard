@@ -1,4 +1,4 @@
-import { execFileSync, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -127,10 +127,6 @@ const PROBLEM_SCHEMAS = {
 
 beforeAll(async () => {
   tempDir = await mkdtemp(join(tmpdir(), "photon-ads-0003-"));
-  execFileSync(resolve(REPO_ROOT, "node_modules/.bin/tsc"), ["-p", "tsconfig.build.json"], {
-    cwd: REPO_ROOT,
-    stdio: "inherit",
-  });
 });
 
 afterAll(async () => {

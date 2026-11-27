@@ -16,6 +16,9 @@ paths:
       operationId: listOrganizationProjects
       summary: List organization projects
       description: Lists projects belonging to an organization, paired with hoisted canonical GET /v1/projects/{projectId}.
+      parameters:
+        - $ref: "#/components/parameters/PageSize"
+        - $ref: "#/components/parameters/PageToken"
       responses:
         "200":
           description: Collection of organization projects.
@@ -23,6 +26,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ProjectListResponse"
+        "400":
+          description: Invalid pagination parameters or page token.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
         "404":
           description: Organization not found.
           content:
@@ -236,6 +245,9 @@ paths:
       operationId: listWebhooks
       summary: List project webhooks
       description: Lists webhook endpoints configured for a project.
+      parameters:
+        - $ref: "#/components/parameters/PageSize"
+        - $ref: "#/components/parameters/PageToken"
       responses:
         "200":
           description: Collection of project webhooks.
@@ -243,6 +255,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/WebhookListResponse"
+        "400":
+          description: Invalid pagination parameters or page token.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
         "404":
           description: Project not found.
           content:
@@ -422,6 +440,9 @@ paths:
       operationId: listProjectOperations
       summary: List project operations
       description: Lists asynchronous operations belonging to a project.
+      parameters:
+        - $ref: "#/components/parameters/PageSize"
+        - $ref: "#/components/parameters/PageToken"
       responses:
         "200":
           description: Collection of project operations.
@@ -429,6 +450,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/OperationListResponse"
+        "400":
+          description: Invalid pagination parameters or page token.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
         "404":
           description: Project not found.
           content:
@@ -540,6 +567,21 @@ components:
       description: Unique identifier of the webhook.
       schema:
         type: string
+    PageSize:
+      name: pageSize
+      in: query
+      description: Maximum number of items to return per page. Defaults to 20.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+    PageToken:
+      name: pageToken
+      in: query
+      description: Opaque continuation token returned by a previous page.
+      schema:
+        type: string
+        minLength: 1
   schemas:
     BaseResource:
       type: object
@@ -615,9 +657,9 @@ components:
           items:
             $ref: "#/components/schemas/Project"
         nextPageToken:
-          type:
-            - string
-            - "null"
+          type: string
+          minLength: 1
+          description: Opaque continuation token for the next page. Omitted on the final page.
     CreateProjectRequest:
       type: object
       required:
@@ -659,9 +701,9 @@ components:
           items:
             $ref: "#/components/schemas/Webhook"
         nextPageToken:
-          type:
-            - string
-            - "null"
+          type: string
+          minLength: 1
+          description: Opaque continuation token for the next page. Omitted on the final page.
     CreateWebhookRequest:
       type: object
       required:
@@ -920,6 +962,6 @@ components:
           items:
             $ref: "#/components/schemas/PlanChangeOperation"
         nextPageToken:
-          type:
-            - string
-            - "null"
+          type: string
+          minLength: 1
+          description: Opaque continuation token for the next page. Omitted on the final page.
