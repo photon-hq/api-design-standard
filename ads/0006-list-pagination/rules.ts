@@ -324,7 +324,11 @@ function collectGetJsonResponses(
       {
         variantSignature,
         onTruncatedVariant: (variant, res) => {
-          if (!sawTruncatedNextPageToken && hasNonDeprecatedNextPageToken(variant, res)) {
+          if (
+            !sawTruncatedNextPageToken &&
+            variant.typeConstraint.allowed.has("object") &&
+            hasNonDeprecatedNextPageToken(variant, res)
+          ) {
             sawTruncatedNextPageToken = true;
           }
         },
