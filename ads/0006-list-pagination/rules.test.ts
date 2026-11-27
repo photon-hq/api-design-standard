@@ -1387,6 +1387,20 @@ describe("ADS-0006 Redocly CLI end-to-end linting", () => {
       ],
     }));
 
+    const namedUnpaginatedSchemas = Object.fromEntries(
+      Array.from({ length: 270 }, (_, index) => [
+        `EventPayload${index}`,
+        {
+          type: "object",
+          required: ["id"],
+          properties: {
+            id: { type: "string" },
+            [`field${index}`]: { type: "string" },
+          },
+        },
+      ]),
+    );
+
     const doc = baseOpenApi({
       paths: {
         "/v1/polymorphic-valid": {
@@ -1414,6 +1428,60 @@ describe("ADS-0006 Redocly CLI end-to-end linting", () => {
                           required: ["items"],
                           properties: {
                             kind: { const: "b" },
+                            items: { type: "array", items: { type: "string" } },
+                            nextPageToken: { type: "string", minLength: 2 },
+                          },
+                        },
+                      ],
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+        "/v1/unpaginated-large-named-union": {
+          get: {
+            operationId: "getLargeUnpaginatedUnion",
+            responses: {
+              "200": {
+                description:
+                  "Unpaginated GET with 270 distinct named schemas must not trigger variant-cap errors",
+                content: {
+                  "application/json": {
+                    schema: {
+                      oneOf: Object.keys(namedUnpaginatedSchemas).map((name) => ({
+                        $ref: `#/components/schemas/${name}`,
+                      })),
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+        "/v1/required-token-anyof-before-allof": {
+          get: {
+            operationId: "listRequiredTokenAnyOfBeforeAllOf",
+            parameters: [pageSizeParam(), pageTokenParam()],
+            responses: {
+              "200": {
+                description:
+                  "Second anyOf branch requires nextPageToken before allOf declares the property",
+                content: {
+                  "application/json": {
+                    schema: {
+                      allOf: [
+                        {
+                          anyOf: [
+                            { type: "object" },
+                            { type: "object", required: ["nextPageToken"] },
+                          ],
+                        },
+                        {
+                          type: "object",
+                          required: ["items"],
+                          properties: {
                             items: { type: "array", items: { type: "string" } },
                             nextPageToken: { type: "string", minLength: 1 },
                           },
@@ -1517,9 +1585,26 @@ describe("ADS-0006 Redocly CLI end-to-end linting", () => {
         "/v1/pagination-variant-cap-overflow": {
           get: {
             operationId: "listPaginationVariantCapOverflow",
+            parameters: [pageSizeParam(), pageTokenParam()],
             responses: {
               "200": {
                 description: "512 distinct pagination combinations exceed 256-variant cap",
+                content: {
+                  "application/json": {
+                    schema: { allOf: paginationOverflowAllOf },
+                  },
+                },
+              },
+            },
+          },
+        },
+        "/v1/unpaginated-banned-variant-cap-overflow": {
+          get: {
+            operationId: "listUnpaginatedBannedVariantCapOverflow",
+            responses: {
+              "200": {
+                description:
+                  "Unpaginated GET with 512 banned-property combinations flags shape cap only, not symmetry",
                 content: {
                   "application/json": {
                     schema: { allOf: paginationOverflowAllOf },
@@ -1544,6 +1629,9 @@ describe("ADS-0006 Redocly CLI end-to-end linting", () => {
           },
         },
       },
+      components: {
+        schemas: namedUnpaginatedSchemas,
+      },
     });
 
     const { report } = await lintOpenApi(doc);
@@ -1553,6 +1641,18 @@ describe("ADS-0006 Redocly CLI end-to-end linting", () => {
     expect(
       ads0006Problems(report).some((p) => p.message.includes('GET "/v1/polymorphic-valid"')),
     ).toBe(false);
+    expect(
+      ads0006Problems(report).some((p) =>
+        p.message.includes('GET "/v1/unpaginated-large-named-union"'),
+      ),
+    ).toBe(false);
+    expect(
+      shapeErrors.some(
+        (p) =>
+          p.message.includes('GET "/v1/required-token-anyof-before-allof"') &&
+          p.message.includes("must be optional"),
+      ),
+    ).toBe(true);
 
     for (const path of ["/v1/open-anyof-missing-token", "/v1/unconstrained-anyof-branch"]) {
       expect(
@@ -1591,6 +1691,18 @@ describe("ADS-0006 Redocly CLI end-to-end linting", () => {
       shapeErrors.some(
         (p) =>
           p.message.includes('GET "/v1/pagination-variant-cap-overflow"') &&
+          p.message.includes("256-variant union analysis cap"),
+      ),
+    ).toBe(true);
+    expect(
+      paramErrors.some((p) =>
+        p.message.includes('GET "/v1/unpaginated-banned-variant-cap-overflow"'),
+      ),
+    ).toBe(false);
+    expect(
+      shapeErrors.some(
+        (p) =>
+          p.message.includes('GET "/v1/unpaginated-banned-variant-cap-overflow"') &&
           p.message.includes("256-variant union analysis cap"),
       ),
     ).toBe(true);

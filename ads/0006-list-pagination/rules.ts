@@ -157,6 +157,7 @@ interface GetJsonResponseVariants {
   readonly reportBaseLocation: RedoclyLocation;
   readonly variants: readonly FlattenedObjectVariant[];
   readonly truncated: boolean;
+  readonly sawTruncatedNextPageToken: boolean;
 }
 
 function forEachActiveGetOperation(
@@ -221,86 +222,88 @@ function hasReachableNestedPaginationIndicator(
   );
 }
 
-function paginationVariantSignature(variant: FlattenedObjectVariant, resolve: ResolverFn): string {
-  const canBeObject = variant.typeConstraint.allowed.has("object") ? 1 : 0;
-  const details: unknown[] = [];
-
-  for (const key of [...variant.properties.keys()].sort()) {
-    const prop = variant.properties.get(key);
-    if (!prop) {
-      continue;
-    }
-
-    if (key === "nextPageToken") {
-      const tc = propertyTypeConstraint(prop, resolve);
-      const deprecated = isTrackedPropertyDeprecated(prop, resolve) ? 1 : 0;
-      const minLen = computeFragmentsMinLength(prop.fragments, resolve);
-      details.push([
-        key,
-        variant.required.has(key) ? 1 : 0,
-        formatAllowedTypes(tc.allowed, ","),
-        deprecated,
-        minLen.kind === "false" ? "false" : String(minLen.minLength),
-      ]);
-      continue;
-    }
-
-    if (BANNED_PAGINATION_RESPONSE_PROPERTIES.has(key)) {
-      details.push([key, isTrackedPropertyDeprecated(prop, resolve) ? 1 : 0]);
-      continue;
-    }
-
-    if (propertyTypeConstraint(prop, resolve).allowed.has("object")) {
-      const deprecated = isTrackedPropertyDeprecated(prop, resolve) ? 1 : 0;
-      if (hasReachableNestedPaginationIndicator(prop, resolve)) {
-        const fragIds = prop.fragments
-          .map((frag) =>
-            frag.location ? locationKey(frag.location) : schemaNodeIdentity(frag.node),
-          )
-          .sort();
-        details.push([key, deprecated, fragIds]);
-      } else if (deprecated === 1) {
-        details.push([key, "dep-obj"]);
-      }
-    }
-  }
-
-  return JSON.stringify([canBeObject, [...variant.schemaNames].sort(), details]);
-}
-
-function nestedPaginationVariantSignature(
+function buildVariantSignature(
   variant: FlattenedObjectVariant,
-  resolve: ResolverFn,
+  extraHeader: readonly unknown[],
+  describeProperty: (key: string, prop: TrackedProperty) => unknown,
 ): string {
   const canBeObject = variant.typeConstraint.allowed.has("object") ? 1 : 0;
   const details: unknown[] = [];
 
   for (const key of [...variant.properties.keys()].sort()) {
-    if (!NESTED_PAGINATION_INDICATOR_PROPERTIES.has(key)) {
-      continue;
-    }
     const prop = variant.properties.get(key);
     if (!prop) {
       continue;
     }
-    details.push([key, isTrackedPropertyDeprecated(prop, resolve) ? 1 : 0]);
+    const entry = describeProperty(key, prop);
+    if (entry !== undefined) {
+      details.push(entry);
+    }
   }
 
-  return JSON.stringify([canBeObject, details]);
+  return JSON.stringify([canBeObject, ...extraHeader, details]);
 }
 
-const PAGINATION_VARIANT_OPTIONS: FlattenedVariantOptions = {
-  variantSignature: paginationVariantSignature,
-};
+function createPaginationVariantSignature(
+  pathTemplate: string,
+  ignoreMatcher?: RuleIgnoreMatcher,
+): (variant: FlattenedObjectVariant, resolve: ResolverFn) => string {
+  return (variant, resolve) => {
+    const tokenRequired = variant.required.has("nextPageToken") ? 1 : 0;
+    const ignored =
+      ignoreMatcher && isVariantIgnoredBySchema(variant, pathTemplate, ignoreMatcher) ? 1 : 0;
+
+    return buildVariantSignature(variant, [tokenRequired, ignored], (key, prop) => {
+      if (key === "nextPageToken") {
+        const tc = propertyTypeConstraint(prop, resolve);
+        const deprecated = isTrackedPropertyDeprecated(prop, resolve) ? 1 : 0;
+        const minLen = computeFragmentsMinLength(prop.fragments, resolve);
+        return [
+          key,
+          formatAllowedTypes(tc.allowed, ","),
+          deprecated,
+          minLen.kind === "false" ? "false" : String(minLen.minLength),
+        ];
+      }
+
+      if (BANNED_PAGINATION_RESPONSE_PROPERTIES.has(key)) {
+        return [key, isTrackedPropertyDeprecated(prop, resolve) ? 1 : 0];
+      }
+
+      if (propertyTypeConstraint(prop, resolve).allowed.has("object")) {
+        const deprecated = isTrackedPropertyDeprecated(prop, resolve) ? 1 : 0;
+        if (hasReachableNestedPaginationIndicator(prop, resolve)) {
+          const fragIds = prop.fragments
+            .map((frag) =>
+              frag.location ? locationKey(frag.location) : schemaNodeIdentity(frag.node),
+            )
+            .sort();
+          return [key, deprecated, fragIds];
+        }
+        if (deprecated === 1) {
+          return [key, "dep-obj"];
+        }
+      }
+
+      return undefined;
+    });
+  };
+}
 
 const NESTED_PAGINATION_VARIANT_OPTIONS: FlattenedVariantOptions = {
-  variantSignature: nestedPaginationVariantSignature,
+  variantSignature: (variant, resolve) =>
+    buildVariantSignature(variant, [], (key, prop) =>
+      NESTED_PAGINATION_INDICATOR_PROPERTIES.has(key)
+        ? [key, isTrackedPropertyDeprecated(prop, resolve) ? 1 : 0]
+        : undefined,
+    ),
 };
 
 function collectGetJsonResponses(
   entry: ResolvedPathItem,
   getOp: UnknownRecord,
   resolve: ResolverFn,
+  ignoreMatcher?: RuleIgnoreMatcher,
 ): GetJsonResponseVariants[] {
   const jsonResponses = extractOperationJsonResponseSchemas(
     getOp,
@@ -309,14 +312,23 @@ function collectGetJsonResponses(
     ["200", "2XX"],
   );
   const opFromRef = entry.isOperationFromRef("get");
+  const variantSignature = createPaginationVariantSignature(entry.pathTemplate, ignoreMatcher);
   const results: GetJsonResponseVariants[] = [];
 
   for (const response of jsonResponses) {
+    let sawTruncatedNextPageToken = false;
     const collected = collectFlattenedObjectVariants(
       response.schema,
       resolve,
       response.schemaLocation,
-      PAGINATION_VARIANT_OPTIONS,
+      {
+        variantSignature,
+        onTruncatedVariant: (variant, res) => {
+          if (!sawTruncatedNextPageToken && hasNonDeprecatedNextPageToken(variant, res)) {
+            sawTruncatedNextPageToken = true;
+          }
+        },
+      },
     );
     const reportBaseLocation =
       opFromRef || response.responseFromRef
@@ -329,6 +341,7 @@ function collectGetJsonResponses(
         variant.typeConstraint.allowed.has("object"),
       ),
       truncated: collected.truncated,
+      sawTruncatedNextPageToken,
     });
   }
 
@@ -611,17 +624,11 @@ const standardPaginationParamsRule: RedoclyOas3Rule = createRootRule(
       const hasPageSize = queryParams.has("pageSize");
       const hasPageToken = queryParams.has("pageToken");
       const jsonResponses = collectGetJsonResponses(entry, getOp, ctx.resolve);
-      for (const item of jsonResponses) {
-        if (item.truncated) {
-          report(
-            `variant-cap-exceeded:${pathTemplate}`,
-            item.reportBaseLocation,
-            `GET "${pathTemplate}" response schema exceeds the ${MAX_OBJECT_VARIANTS}-variant union analysis cap and could not be fully verified for pagination symmetry (ADS-0006).`,
-          );
-        }
-      }
       const anyNextPageToken = jsonResponses.some((item) =>
         item.variants.some((variant) => hasNonDeprecatedNextPageToken(variant, ctx.resolve)),
+      );
+      const anyTruncatedNextPageToken = jsonResponses.some(
+        (item) => item.sawTruncatedNextPageToken,
       );
       const allResponsesHaveNextPageToken =
         jsonResponses.length > 0 &&
@@ -631,8 +638,18 @@ const standardPaginationParamsRule: RedoclyOas3Rule = createRootRule(
             item.variants.every((variant) => hasNonDeprecatedNextPageToken(variant, ctx.resolve)),
         );
 
-      if (!hasPageSize && !hasPageToken && !anyNextPageToken) {
+      if (!hasPageSize && !hasPageToken && !anyNextPageToken && !anyTruncatedNextPageToken) {
         return;
+      }
+
+      for (const item of jsonResponses) {
+        if (item.truncated) {
+          report(
+            `variant-cap-exceeded:${pathTemplate}`,
+            item.reportBaseLocation,
+            `GET "${pathTemplate}" response schema exceeds the ${MAX_OBJECT_VARIANTS}-variant union analysis cap and could not be fully verified for pagination symmetry (ADS-0006).`,
+          );
+        }
       }
 
       const missing: string[] = [];
@@ -693,7 +710,7 @@ const paginationResponseShapeRule: RedoclyOas3Rule = createRootRule(
   ({ root, ctx, ignoreMatcher, reportOnce: report }) => {
     forEachActiveGetOperation(root, ctx, ignoreMatcher, (entry, getOp) => {
       const { pathTemplate } = entry;
-      const jsonResponses = collectGetJsonResponses(entry, getOp, ctx.resolve);
+      const jsonResponses = collectGetJsonResponses(entry, getOp, ctx.resolve, ignoreMatcher);
 
       for (const item of jsonResponses) {
         if (
