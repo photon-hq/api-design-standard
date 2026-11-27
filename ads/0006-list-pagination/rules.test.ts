@@ -1360,4 +1360,247 @@ describe("ADS-0006 Redocly CLI end-to-end linting", () => {
     }
     expect(shapeErrors).toHaveLength(8);
   });
+
+  it("rejects open anyOf variants omitting nextPageToken, collapses unrelated binary unions, and surfaces genuine variant-cap truncation", async () => {
+    const unrelatedBinaryAnyOfs = Array.from({ length: 9 }, (_, index) => ({
+      anyOf: [
+        { type: "object", properties: { [`a${index}`]: { type: "string" } } },
+        { type: "object", properties: { [`b${index}`]: { type: "string" } } },
+      ],
+    }));
+
+    const distinctPaginationProps = [
+      "nextCursor",
+      "prevCursor",
+      "hasMore",
+      "hasNextPage",
+      "nextPage",
+      "prevPageToken",
+      "previousPageToken",
+      "next_cursor",
+      "has_more",
+    ];
+    const paginationOverflowAllOf = distinctPaginationProps.map((prop) => ({
+      anyOf: [
+        { type: "object", properties: { [`ok_${prop}`]: { type: "string" } } },
+        { type: "object", properties: { [prop]: { type: "string" } } },
+      ],
+    }));
+
+    const doc = baseOpenApi({
+      paths: {
+        "/v1/polymorphic-valid": {
+          get: {
+            operationId: "listPolymorphicValid",
+            parameters: [pageSizeParam(), pageTokenParam()],
+            responses: {
+              "200": {
+                description: "All object variants declare valid optional nextPageToken",
+                content: {
+                  "application/json": {
+                    schema: {
+                      oneOf: [
+                        {
+                          type: "object",
+                          required: ["items"],
+                          properties: {
+                            kind: { const: "a" },
+                            items: { type: "array", items: { type: "string" } },
+                            nextPageToken: { type: "string", minLength: 1 },
+                          },
+                        },
+                        {
+                          type: "object",
+                          required: ["items"],
+                          properties: {
+                            kind: { const: "b" },
+                            items: { type: "array", items: { type: "string" } },
+                            nextPageToken: { type: "string", minLength: 1 },
+                          },
+                        },
+                      ],
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+        "/v1/open-anyof-missing-token": {
+          get: {
+            operationId: "listOpenAnyOfMissingToken",
+            parameters: [pageSizeParam(), pageTokenParam()],
+            responses: {
+              "200": {
+                description: "Second object variant omits nextPageToken and stays open",
+                content: {
+                  "application/json": {
+                    schema: {
+                      anyOf: [
+                        {
+                          type: "object",
+                          required: ["items"],
+                          properties: {
+                            items: { type: "array", items: { type: "string" } },
+                            nextPageToken: { type: "string", minLength: 1 },
+                          },
+                        },
+                        {
+                          type: "object",
+                          required: ["items"],
+                          properties: {
+                            items: { type: "array", items: { type: "string" } },
+                          },
+                        },
+                      ],
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+        "/v1/unconstrained-anyof-branch": {
+          get: {
+            operationId: "listUnconstrainedAnyOfBranch",
+            parameters: [pageSizeParam(), pageTokenParam()],
+            responses: {
+              "200": {
+                description: "Unconstrained empty schema branch can accept empty nextPageToken",
+                content: {
+                  "application/json": {
+                    schema: {
+                      anyOf: [
+                        {
+                          type: "object",
+                          required: ["items"],
+                          properties: {
+                            items: { type: "array", items: { type: "string" } },
+                            nextPageToken: { type: "string", minLength: 1 },
+                          },
+                        },
+                        {},
+                      ],
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+        "/v1/unrelated-union-with-next-cursor": {
+          get: {
+            operationId: "listUnrelatedUnionWithNextCursor",
+            responses: {
+              "200": {
+                description:
+                  "9 unrelated binary anyOf groups must not hide a nextCursor branch behind truncation",
+                content: {
+                  "application/json": {
+                    schema: {
+                      allOf: [
+                        {
+                          anyOf: [
+                            { type: "object", properties: { ok: { type: "string" } } },
+                            { type: "object", properties: { nextCursor: { type: "string" } } },
+                          ],
+                        },
+                        ...unrelatedBinaryAnyOfs,
+                      ],
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+        "/v1/pagination-variant-cap-overflow": {
+          get: {
+            operationId: "listPaginationVariantCapOverflow",
+            responses: {
+              "200": {
+                description: "512 distinct pagination combinations exceed 256-variant cap",
+                content: {
+                  "application/json": {
+                    schema: { allOf: paginationOverflowAllOf },
+                  },
+                },
+              },
+            },
+          },
+        },
+        "/v1/nested-variant-cap-overflow": {
+          get: {
+            operationId: "listNestedVariantCapOverflow",
+            responses: {
+              "200": listResponse({
+                items: { type: "array", items: { type: "string" } },
+                meta: {
+                  type: "object",
+                  allOf: paginationOverflowAllOf,
+                },
+              }),
+            },
+          },
+        },
+      },
+    });
+
+    const { report } = await lintOpenApi(doc);
+    const paramErrors = ads0006ProblemsFor(report, "ads-0006-standard-pagination-params");
+    const shapeErrors = ads0006ProblemsFor(report, "ads-0006-pagination-response-shape");
+
+    expect(
+      ads0006Problems(report).some((p) => p.message.includes('GET "/v1/polymorphic-valid"')),
+    ).toBe(false);
+
+    for (const path of ["/v1/open-anyof-missing-token", "/v1/unconstrained-anyof-branch"]) {
+      expect(
+        paramErrors.some(
+          (p) =>
+            p.message.includes(`GET "${path}"`) &&
+            p.message.includes("on every object response variant"),
+        ),
+        `expected partial-variant symmetry error on ${path}`,
+      ).toBe(true);
+    }
+
+    expect(
+      shapeErrors.some(
+        (p) =>
+          p.message.includes('GET "/v1/unrelated-union-with-next-cursor"') &&
+          p.message.includes('non-standard pagination response property "nextCursor"'),
+      ),
+    ).toBe(true);
+    expect(
+      ads0006Problems(report).some(
+        (p) =>
+          p.message.includes('GET "/v1/unrelated-union-with-next-cursor"') &&
+          p.message.includes("variant union analysis cap"),
+      ),
+    ).toBe(false);
+
+    expect(
+      paramErrors.some(
+        (p) =>
+          p.message.includes('GET "/v1/pagination-variant-cap-overflow"') &&
+          p.message.includes("256-variant union analysis cap"),
+      ),
+    ).toBe(true);
+    expect(
+      shapeErrors.some(
+        (p) =>
+          p.message.includes('GET "/v1/pagination-variant-cap-overflow"') &&
+          p.message.includes("256-variant union analysis cap"),
+      ),
+    ).toBe(true);
+    expect(
+      shapeErrors.some(
+        (p) =>
+          p.message.includes('GET "/v1/nested-variant-cap-overflow"') &&
+          p.message.includes('property "meta"') &&
+          p.message.includes("256-variant union analysis cap"),
+      ),
+    ).toBe(true);
+  });
 });
