@@ -277,6 +277,8 @@ export interface FlattenedObjectVariant {
   readonly openAdditionalProperties: boolean;
   readonly hasSchemaAdditionalProperties: boolean;
   readonly additionalPropertiesSchemas: readonly SchemaFragment[];
+  readonly explicitlyForbidsAdditionalProperties: boolean;
+  readonly forbidsUnevaluatedProperties: boolean;
   readonly forbidsAdditionalProperties: boolean;
   readonly properties: ReadonlyMap<string, TrackedProperty>;
   readonly required: ReadonlySet<string>;
@@ -291,6 +293,8 @@ export const EMPTY_SEED_VARIANT: FlattenedObjectVariant = {
   openAdditionalProperties: false,
   hasSchemaAdditionalProperties: false,
   additionalPropertiesSchemas: [],
+  explicitlyForbidsAdditionalProperties: false,
+  forbidsUnevaluatedProperties: false,
   forbidsAdditionalProperties: false,
   properties: new Map(),
   required: new Set(),
@@ -357,21 +361,21 @@ export function buildFlattenedVariantSignature(
   });
   const reqKeys = [...variant.required].sort();
   const discKeys = [...variant.discriminatorProperties].sort();
-  const addPropIds = preserveObjects
-    ? variant.additionalPropertiesSchemas
-        .map((frag) => (frag.location ? locationKey(frag.location) : schemaNodeIdentity(frag.node)))
-        .sort()
-    : [];
+  const addPropIds = variant.additionalPropertiesSchemas
+    .map((frag) => (frag.location ? locationKey(frag.location) : schemaNodeIdentity(frag.node)))
+    .sort();
   return JSON.stringify([
     types,
     variant.isObjectLike ? 1 : 0,
     variant.openAdditionalProperties ? 1 : 0,
     variant.hasSchemaAdditionalProperties ? 1 : 0,
+    variant.explicitlyForbidsAdditionalProperties ? 1 : 0,
+    variant.forbidsUnevaluatedProperties ? 1 : 0,
     variant.forbidsAdditionalProperties ? 1 : 0,
     propEntries,
     reqKeys,
     discKeys,
-    ...(preserveObjects ? [addPropIds] : []),
+    addPropIds,
   ]);
 }
 
@@ -431,15 +435,24 @@ export function mergeFlattenedVariants(
               (frag) => !base.additionalPropertiesSchemas.some((b) => b.node === frag.node),
             ),
           ];
+  const openAdditionalProperties =
+    base.openAdditionalProperties || addition.openAdditionalProperties;
+  const explicitlyForbidsAdditionalProperties =
+    base.explicitlyForbidsAdditionalProperties || addition.explicitlyForbidsAdditionalProperties;
+  const forbidsUnevaluatedProperties =
+    base.forbidsUnevaluatedProperties || addition.forbidsUnevaluatedProperties;
   const merged: FlattenedObjectVariant = {
     typeConstraint,
     isObjectLike,
-    openAdditionalProperties: base.openAdditionalProperties || addition.openAdditionalProperties,
+    openAdditionalProperties,
     hasSchemaAdditionalProperties:
       base.hasSchemaAdditionalProperties || addition.hasSchemaAdditionalProperties,
     additionalPropertiesSchemas,
+    explicitlyForbidsAdditionalProperties,
+    forbidsUnevaluatedProperties,
     forbidsAdditionalProperties:
-      base.forbidsAdditionalProperties || addition.forbidsAdditionalProperties,
+      explicitlyForbidsAdditionalProperties ||
+      (forbidsUnevaluatedProperties && !openAdditionalProperties),
     properties,
     required,
     discriminatorProperties,
@@ -552,8 +565,11 @@ function extractLocalFlattenedVariant(
     : [];
   const openAdditionalProperties =
     node.additionalProperties === true || hasSchemaAdditionalProperties;
+  const explicitlyForbidsAdditionalProperties = node.additionalProperties === false;
+  const forbidsUnevaluatedProperties = node.unevaluatedProperties === false;
   const forbidsAdditionalProperties =
-    node.additionalProperties === false || node.unevaluatedProperties === false;
+    explicitlyForbidsAdditionalProperties ||
+    (forbidsUnevaluatedProperties && !openAdditionalProperties);
   const hasObjectShape =
     properties.size > 0 ||
     node.additionalProperties !== undefined ||
@@ -570,6 +586,8 @@ function extractLocalFlattenedVariant(
     openAdditionalProperties,
     hasSchemaAdditionalProperties,
     additionalPropertiesSchemas,
+    explicitlyForbidsAdditionalProperties,
+    forbidsUnevaluatedProperties,
     forbidsAdditionalProperties,
     properties,
     required,

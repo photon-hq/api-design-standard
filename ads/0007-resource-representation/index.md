@@ -50,7 +50,7 @@ Long-running operations (defined in `ADS-0004`) **MUST** be modeled as a canonic
 
 - Each service's `Operation` canonical schema **MUST** satisfy the universal `ADS-0004` contract (`id`, `type`, `status`, `createdAt`, `updatedAt`, `completedAt`, `response`, and `error`, plus optional `cancellable`, `nextAction`, and `metadata` with all `ADS-0004` status-specific invariants), while specializing `type`, `response`, `nextAction`, and `metadata` strictly to the operation types that service owns.
 - Scoping the canonical `Operation` resource per service keeps generated SDK unions small, prevents unrelated services from coupling their release cycles, and gives each service's `GET .../operations/{operationId}` endpoint a clean canonical schema `C`.
-- Asynchronous mutations returning `202 Accepted` return the owning service's canonical `Operation` resource rather than the target domain resource.
+- Tracked long-running asynchronous mutations returning `202 Accepted` per `ADS-0004` return the owning service's canonical `Operation` resource rather than the target domain resource. Lifecycle-bearing resources returning `202 Accepted` with `Location` pointing to the resource itself and fire-and-forget `202 Accepted` endpoints remain governed by `ADS-0004` and `ADS-0005`.
 
 ### 3. Cross-Method Response Consistency
 
@@ -60,7 +60,7 @@ Every synchronous `2xx` JSON response returning a single resource — `GET 200`,
 - Responses **MUST NOT** omit required properties declared on `C`, rename canonical fields, or attach ad-hoc fields absent from `C`.
 - The following narrow exceptions apply:
   - **One-time creation secrets (`ADS-0002` §3)**: A synchronous creation response (`POST 200`/`201` or `PUT 201`) **MAY** return a one-time sensitive credential (such as `secret`, `signingSecret`, `clientSecret`, `token`, or `accessToken`) as a flat sibling top-level field alongside all canonical fields of `C`. Subsequent `GET`, `PATCH`, and `DELETE` responses omit the one-time secret while keeping every canonical field identical. Creation responses **MUST NOT** wrap the resource and secret in a split two-key envelope (`{ "apiKey": { ... }, "secret": "..." }`), per `ADS-0002` §3.
-  - **Asynchronous operations (`ADS-0004`)**: `202 Accepted` responses (and synchronous idempotent replays that return an `ADS-0004` `Operation` resource) return the owning service's `Operation` schema rather than `C`.
+  - **Asynchronous operations (`ADS-0004`)**: Tracked long-running `202 Accepted` responses (and synchronous idempotent replays on endpoints declaring `202` that return an `ADS-0004` `Operation` resource) return the owning service's `Operation` schema rather than `C`.
   - **Bodyless responses**: `204 No Content` responses (such as `DELETE 204`) return no body.
 - Custom action endpoints (`POST .../{resourceId}/<action>`) and query/utility endpoints (such as `/search`, `/query`, `/preview`, `/validate`, `/batch`, `/count`, or `/status`) are governed by their own action or query contracts and are not required to return `C` unless the action updates and returns the resource itself.
 
@@ -107,7 +107,7 @@ Attach the derived form to any slice or mutation schema derived from `C`:
 
 ```yaml
 x-photon-resource:
-  role: "slice" | "create" | "patch" | "replace"
+  role: "create" # one of: "slice", "create", "patch", "replace"
   canonical: "#/components/schemas/<CanonicalSchemaName>"
   nonResourceInputs: # optional; allowed ONLY when role is "create"
     - "templateId"
@@ -217,6 +217,47 @@ components:
           type:
             - string
             - "null"
+
+    ApiKey:
+      x-photon-resource:
+        type: projects.api-key
+      type: object
+      required:
+        - id
+        - name
+        - createdAt
+      properties:
+        id:
+          type: string
+          readOnly: true
+        name:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+          readOnly: true
+
+    CreatedApiKey:
+      allOf:
+        - $ref: "#/components/schemas/ApiKey"
+        - type: object
+          required:
+            - secret
+          properties:
+            secret:
+              type: string
+              readOnly: true
+paths:
+  /v1/projects/{projectId}/api-keys:
+    post:
+      summary: Create an API key
+      responses:
+        "201":
+          description: Created API key with flat one-time secret
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreatedApiKey"
 ```
 
 ### Per-service `Operation` canonical resource

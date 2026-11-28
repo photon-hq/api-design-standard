@@ -325,19 +325,41 @@ export function extractOperationJsonResponseSchemas(
   const firstMatchingOnly = options?.firstMatchingOnly ?? true;
   const responses = operation.responses;
   const declaredExplicitClasses = new Set<string>();
+  const requestedExplicitByClass = new Map<string, string[]>();
   for (const statusCode of statusCodes) {
-    if (!STATUS_RANGE_RE.test(statusCode) && responses[statusCode] !== undefined) {
+    if (!STATUS_RANGE_RE.test(statusCode)) {
       const statusClass = statusCode[0];
       if (statusClass) {
-        declaredExplicitClasses.add(statusClass);
+        const list = requestedExplicitByClass.get(statusClass);
+        if (list) {
+          list.push(statusCode);
+        } else {
+          requestedExplicitByClass.set(statusClass, [statusCode]);
+        }
+        if (responses[statusCode] !== undefined) {
+          declaredExplicitClasses.add(statusClass);
+        }
       }
     }
   }
   const results: ResponseJsonSchemaEntry[] = [];
   for (const statusCode of statusCodes) {
     const rangeMatch = STATUS_RANGE_RE.exec(statusCode);
-    if (rangeMatch?.[1] && declaredExplicitClasses.has(rangeMatch[1])) {
-      continue;
+    if (rangeMatch?.[1]) {
+      if (firstMatchingOnly) {
+        if (declaredExplicitClasses.has(rangeMatch[1])) {
+          continue;
+        }
+      } else {
+        const requestedInClass = requestedExplicitByClass.get(rangeMatch[1]);
+        if (
+          requestedInClass &&
+          requestedInClass.length > 0 &&
+          requestedInClass.every((code) => responses[code] !== undefined)
+        ) {
+          continue;
+        }
+      }
     }
     const entries = extractResponseJsonSchemas(
       responses[statusCode],

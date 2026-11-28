@@ -1,9 +1,12 @@
 import { describe, expect, it } from "vitest";
 import {
+  COMPAT_VARIANT_OPTIONS,
   checkPatchObjectVariantConstraints,
   checkResponseCompatibleWithCanonical,
   checkVariantAgainstCanonicalVariants,
+  collectNestedOpenPatchObjectPaths,
   compareFragmentsAgainstTargets,
+  extractCollectionInfo,
   isTypeSubset,
   SERVER_MANAGED_CREATE_KEYS,
   SERVER_MANAGED_MUTATION_KEYS,
@@ -232,10 +235,10 @@ describe("shared resource compatibility helpers", () => {
     expect(
       checkResponseCompatibleWithCanonical(flatSecret, loc, apiKeySchema, loc, resolve, {
         allowCreationSecret: true,
-        allowCreationReceiptEnvelope: false,
       }).mismatches,
     ).toEqual([]);
 
+    // Split two-key receipt envelopes are forbidden per ADS-0002 §3 / ADS-0007 §3
     const receiptEnvelope = {
       type: "object",
       required: ["apiKey", "secret"],
@@ -247,34 +250,8 @@ describe("shared resource compatibility helpers", () => {
     expect(
       checkResponseCompatibleWithCanonical(receiptEnvelope, loc, apiKeySchema, loc, resolve, {
         allowCreationSecret: true,
-        allowCreationReceiptEnvelope: true,
-      }).mismatches,
-    ).toEqual([]);
-
-    const driftedReceipt = {
-      type: "object",
-      required: ["apiKey", "secret"],
-      properties: {
-        apiKey: {
-          type: "object",
-          required: ["id"],
-          properties: { id: { type: "integer" } },
-        },
-        secret: { type: "string" },
-      },
-    };
-    const driftedResult = checkResponseCompatibleWithCanonical(
-      driftedReceipt,
-      loc,
-      apiKeySchema,
-      loc,
-      resolve,
-      {
-        allowCreationSecret: true,
-        allowCreationReceiptEnvelope: true,
-      },
-    );
-    expect(driftedResult.mismatches.length).toBeGreaterThan(0);
+      }).mismatches.length,
+    ).toBeGreaterThan(0);
 
     // Optionalizing canonical required properties must be rejected
     const optionalizedResp = {
@@ -290,7 +267,7 @@ describe("shared resource compatibility helpers", () => {
       apiKeySchema,
       loc,
       resolve,
-      { allowCreationSecret: false, allowCreationReceiptEnvelope: false },
+      { allowCreationSecret: false },
     );
     expect(optResult.mismatches.some((m) => m.reason.includes("optional"))).toBe(true);
 
@@ -309,7 +286,6 @@ describe("shared resource compatibility helpers", () => {
     expect(
       checkResponseCompatibleWithCanonical(narrowerResp, loc, allOptionalCanon, loc, resolve, {
         allowCreationSecret: false,
-        allowCreationReceiptEnvelope: false,
       }).mismatches,
     ).toEqual([]);
 
@@ -332,8 +308,244 @@ describe("shared resource compatibility helpers", () => {
       stringMapCanon,
       loc,
       resolve,
-      { allowCreationSecret: false, allowCreationReceiptEnvelope: false },
+      { allowCreationSecret: false },
     ).mismatches;
     expect(mapMismatches.some((m) => m.path === "labels.*")).toBe(true);
+
+    // Free-form { type: "object" } and explicit additionalProperties: true fail against typed dictionary and closed canonical
+    const freeformSource = {
+      type: "object",
+      properties: { labels: { type: "object" } },
+    };
+    expect(
+      checkResponseCompatibleWithCanonical(freeformSource, loc, stringMapCanon, loc, resolve, {
+        allowCreationSecret: false,
+      }).mismatches.some((m) => m.path === "labels.*"),
+    ).toBe(true);
+
+    const closedCanon = {
+      type: "object",
+      properties: {
+        meta: {
+          type: "object",
+          additionalProperties: false,
+          properties: { tag: { type: "string" } },
+        },
+      },
+    };
+    const openExtraSource = {
+      type: "object",
+      properties: {
+        meta: {
+          type: "object",
+          additionalProperties: true,
+          properties: { tag: { type: "string" } },
+        },
+      },
+    };
+    expect(
+      checkResponseCompatibleWithCanonical(openExtraSource, loc, closedCanon, loc, resolve, {
+        allowCreationSecret: false,
+      }).mismatches.some((m) => m.path === "meta.*"),
+    ).toBe(true);
+
+    // Canonical union with an unconstrained object alternative accepts arbitrary nested properties
+    const unionWithOpenCanon = {
+      type: "object",
+      properties: {
+        details: {
+          anyOf: [{ type: "object" }, { type: "object", properties: { name: { type: "string" } } }],
+        },
+      },
+    };
+    const intDetailsSource = {
+      type: "object",
+      properties: {
+        details: { type: "object", properties: { name: { type: "integer" } } },
+      },
+    };
+    expect(
+      checkResponseCompatibleWithCanonical(
+        intDetailsSource,
+        loc,
+        unionWithOpenCanon,
+        loc,
+        resolve,
+        { allowCreationSecret: false },
+      ).mismatches,
+    ).toEqual([]);
+
+    // Full response cannot combine types from one canonical union branch with required keys from another
+    const twoBranchCanon = {
+      anyOf: [
+        {
+          type: "object",
+          required: ["id", "value", "region"],
+          properties: {
+            id: { type: "string" },
+            value: { type: "string" },
+            region: { type: "string" },
+            zone: { type: "string" },
+          },
+        },
+        {
+          type: "object",
+          required: ["id", "value", "zone"],
+          properties: {
+            id: { type: "string" },
+            value: { type: "integer" },
+            region: { type: "string" },
+            zone: { type: "string" },
+          },
+        },
+      ],
+    };
+    const mixedBranchResp = {
+      type: "object",
+      required: ["id", "value", "zone"],
+      properties: {
+        id: { type: "string" },
+        value: { type: "string" },
+        zone: { type: "string" },
+      },
+    };
+    expect(
+      checkResponseCompatibleWithCanonical(mixedBranchResp, loc, twoBranchCanon, loc, resolve, {
+        allowCreationSecret: false,
+      }).mismatches.length,
+    ).toBeGreaterThan(0);
+  });
+
+  it("handles nested collection deduplication, untyped properties, items: false, array branch cap, and nested open PATCH objects", () => {
+    const resolve = makeResolver({});
+    const loc = makeLocation("#/test");
+
+    // extractCollectionInfo retains distinct nested object item variants when COMPAT_VARIANT_OPTIONS is passed
+    const colVariant = collectFlattenedObjectVariants(
+      {
+        type: "object",
+        required: ["items"],
+        properties: {
+          items: {
+            type: "array",
+            items: {
+              anyOf: [
+                {
+                  type: "object",
+                  properties: {
+                    name: { type: "string" },
+                    payload: { type: "object", properties: { value: { type: "integer" } } },
+                  },
+                },
+                {
+                  type: "object",
+                  properties: {
+                    name: { type: "string" },
+                    payload: { type: "object", properties: { value: { type: "string" } } },
+                  },
+                },
+              ],
+            },
+          },
+        },
+      },
+      resolve,
+      loc,
+      COMPAT_VARIANT_OPTIONS,
+    ).variants[0];
+    expect(colVariant).toBeDefined();
+    if (colVariant) {
+      const info = extractCollectionInfo(colVariant, resolve, {
+        requireScalarId: false,
+        allowNonObjectMetadata: false,
+        variantOptions: COMPAT_VARIANT_OPTIONS,
+      });
+      expect(info?.itemVariants).toHaveLength(2);
+    }
+
+    // properties without explicit type: object must not narrow source to object-only
+    expect(
+      compareFragmentsAgainstTargets(
+        [{ node: { properties: { enabled: { type: "boolean" } } } }],
+        [[{ node: { type: "object", properties: { enabled: { type: "boolean" } } } }]],
+        resolve,
+        { path: "settings" },
+      ),
+    ).not.toBeNull();
+
+    // items: false prohibits elements; string or unconstrained arrays fail while items: false passes
+    expect(
+      compareFragmentsAgainstTargets(
+        [{ node: { type: "array", items: { type: "string" } } }],
+        [[{ node: { type: "array", items: false } }]],
+        resolve,
+        { path: "tags" },
+      ),
+    ).not.toBeNull();
+    expect(
+      compareFragmentsAgainstTargets(
+        [{ node: { type: "array" } }],
+        [[{ node: { type: "array", items: false } }]],
+        resolve,
+        { path: "tags" },
+      ),
+    ).not.toBeNull();
+    expect(
+      compareFragmentsAgainstTargets(
+        [{ node: { type: "array", items: false } }],
+        [[{ node: { type: "array", items: false } }]],
+        resolve,
+        { path: "tags" },
+      ),
+    ).toBeNull();
+
+    // Array item union exceeding 256 branches reports incomplete analysis instead of silently passing
+    const largeAnyOf = Array.from({ length: 260 }, (_, idx) => ({
+      type: "array",
+      items: { type: idx < 256 ? "string" : "integer" },
+    }));
+    const truncMismatch = compareFragmentsAgainstTargets(
+      [{ node: { anyOf: largeAnyOf } }],
+      [[{ node: { type: "array", items: { type: "string" } } }]],
+      resolve,
+      { path: "bigList" },
+    );
+    expect(truncMismatch?.reason).toContain("cap");
+
+    // Untyped open PATCH object with zero properties is flagged, and nested fixed-schema objects are checked
+    const openZeroProp = collectFlattenedObjectVariants({ type: "object" }, resolve).variants[0];
+    expect(openZeroProp).toBeDefined();
+    if (openZeroProp) {
+      expect(checkPatchObjectVariantConstraints(openZeroProp)).toEqual([
+        { kind: "additional-properties" },
+      ]);
+    }
+    const nestedPatch = collectFlattenedObjectVariants(
+      {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          notifications: {
+            type: "object",
+            properties: { emailEnabled: { type: "boolean" } },
+          },
+          labels: {
+            type: "object",
+            additionalProperties: { type: "string" },
+          },
+          tags: {
+            type: "array",
+            items: { type: "object", properties: { name: { type: "string" } } },
+          },
+        },
+      },
+      resolve,
+      loc,
+      COMPAT_VARIANT_OPTIONS,
+    ).variants[0];
+    expect(nestedPatch).toBeDefined();
+    if (nestedPatch) {
+      expect(collectNestedOpenPatchObjectPaths(nestedPatch, resolve)).toEqual(["notifications"]);
+    }
   });
 });

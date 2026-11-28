@@ -919,12 +919,21 @@ function hasBooleanSchemaAnnotation(
 ): boolean {
   const seen = new Set<unknown>();
 
-  const hasInAllOf = (node: UnknownRecord, currentFrom: string | undefined): boolean => {
-    if (!Array.isArray(node.allOf)) {
-      return false;
+  const hasInCombinators = (node: UnknownRecord, currentFrom: string | undefined): boolean => {
+    if (Array.isArray(node.allOf)) {
+      for (const branch of node.allOf) {
+        if (visit(branch, currentFrom)) {
+          return true;
+        }
+      }
     }
-    for (const branch of node.allOf) {
-      if (visit(branch, currentFrom)) {
+    for (const unionKey of ["anyOf", "oneOf"] as const) {
+      const branches = node[unionKey];
+      if (
+        Array.isArray(branches) &&
+        branches.length > 0 &&
+        branches.every((branch) => visit(branch, currentFrom))
+      ) {
         return true;
       }
     }
@@ -936,36 +945,39 @@ function hasBooleanSchemaAnnotation(
       return false;
     }
     seen.add(node);
+    try {
+      const direct = node[key];
+      if (typeof direct === "boolean") {
+        return direct;
+      }
 
-    const direct = node[key];
-    if (typeof direct === "boolean") {
-      return direct;
-    }
-
-    if (typeof node.$ref === "string") {
-      const resolved = safeResolveSchema(resolve, node, currentFrom);
-      if (resolved) {
-        let refDecided = false;
-        for (const hop of getRefIntermediateHops(node, resolved, { reverse: false })) {
-          const hopValue = hop.node[key];
-          if (typeof hopValue === "boolean") {
-            if (hopValue) {
+      if (typeof node.$ref === "string") {
+        const resolved = safeResolveSchema(resolve, node, currentFrom);
+        if (resolved) {
+          let refDecided = false;
+          for (const hop of getRefIntermediateHops(node, resolved, { reverse: false })) {
+            const hopValue = hop.node[key];
+            if (typeof hopValue === "boolean") {
+              if (hopValue) {
+                return true;
+              }
+              refDecided = true;
+              break;
+            }
+            if (hasInCombinators(hop.node, hop.location?.source?.absoluteRef)) {
               return true;
             }
-            refDecided = true;
-            break;
           }
-          if (hasInAllOf(hop.node, hop.location?.source?.absoluteRef)) {
+          if (!refDecided && visit(resolved.node, resolved.location?.source?.absoluteRef)) {
             return true;
           }
         }
-        if (!refDecided && visit(resolved.node, resolved.location?.source?.absoluteRef)) {
-          return true;
-        }
       }
-    }
 
-    return hasInAllOf(node, currentFrom);
+      return hasInCombinators(node, currentFrom);
+    } finally {
+      seen.delete(node);
+    }
   };
 
   return visit(schema, from);

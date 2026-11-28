@@ -11,11 +11,12 @@ import {
   type AddressableCollectionInfo,
   type ArrayItemBranch,
   areSchemasCompatibleForHoistedGet,
+  COMPAT_VARIANT_OPTIONS,
   checkPatchObjectVariantConstraints,
   collectActiveObjectVariants,
   collectIndexedPaths,
+  collectNestedOpenPatchObjectPaths,
   computeHoistedCollectionCandidates,
-  effectiveFragmentsTypeSet,
   endsWithPathParam,
   extractAddressableCollection,
   extractSingleComponentRef,
@@ -41,10 +42,10 @@ import {
 } from "../../src/resource-compat.js";
 import {
   ALL_JSON_TYPE_SET,
+  computeTypeConstraint,
   formatTypeSummary,
   isRecord,
   isStrictlyNullConstraint,
-  isTrackedPropertyDeprecated,
   MAX_OBJECT_VARIANTS,
   type ResolverFn,
   selectPropertyReportLocation,
@@ -789,9 +790,9 @@ export const ads0005PatchMergeSemantics: RedoclyOas3Rule = createRootRule(
         continue;
       }
 
-      // 2a. Reject fieldMask / updateMask query parameters on PATCH
+      // 2a. Reject fieldMask / updateMask query parameters on PATCH (no deprecation exemption)
       for (const param of resolveOperationParameters(pathEntry, "patch", ctx.resolve)) {
-        if (param.in === "query" && !param.deprecated && isBannedPatchMaskName(param.name)) {
+        if (param.in === "query" && isBannedPatchMaskName(param.name)) {
           report(
             `patch-query-mask:${param.name.toLowerCase()}`,
             param.reportLocation,
@@ -804,6 +805,8 @@ export const ads0005PatchMergeSemantics: RedoclyOas3Rule = createRootRule(
       const patchLoc = pathEntry.operationLocation("patch");
       const opFromRef = pathEntry.isOperationFromRef("patch");
       const mediaEntries = extractRequestBodyMediaSchemas(patchOp, patchLoc, ctx.resolve);
+      let hasCompatibleJsonBody = false;
+      let reportedJsonPatchMedia = false;
 
       for (const mediaEntry of mediaEntries) {
         const useOpLocation = opFromRef || mediaEntry.requestBodyFromRef;
@@ -826,11 +829,15 @@ export const ads0005PatchMergeSemantics: RedoclyOas3Rule = createRootRule(
           topLevelRef &&
           ignoreMatcher.isIgnored({ path: pathTemplate, method: "patch", schema: topLevelRef.name })
         ) {
+          if (mediaEntry.isJson && !JSON_PATCH_MEDIA_TYPE_RE.test(mediaEntry.mediaType)) {
+            hasCompatibleJsonBody = true;
+          }
           continue;
         }
 
         // 1a. Reject RFC 6902 application/json-patch+json media type
         if (JSON_PATCH_MEDIA_TYPE_RE.test(mediaEntry.mediaType)) {
+          reportedJsonPatchMedia = true;
           report(
             `patch-json-patch-media-type:${mediaEntry.mediaType.toLowerCase()}`,
             mediaReportLoc,
@@ -842,21 +849,21 @@ export const ads0005PatchMergeSemantics: RedoclyOas3Rule = createRootRule(
         if (!mediaEntry.isJson || mediaEntry.schema === undefined) {
           continue;
         }
+        hasCompatibleJsonBody = true;
 
-        // 1b. Reject non-object top-level JSON schemas (RFC 6902 patch arrays and scalars/null)
-        const topTypes = effectiveFragmentsTypeSet(
-          [
-            {
-              node: mediaEntry.schema,
-              ...(mediaEntry.schemaLocation.source?.absoluteRef !== undefined
-                ? { from: mediaEntry.schemaLocation.source.absoluteRef }
-                : {}),
-              location: mediaEntry.schemaLocation,
-            },
-          ],
+        // 1b. Reject unrestricted and non-object top-level JSON schemas (arrays, scalars, null, {} / true)
+        const topTypes = computeTypeConstraint(
+          mediaEntry.schema,
           ctx.resolve,
-        );
-        if (topTypes.size < ALL_JSON_TYPE_SET.size) {
+          mediaEntry.schemaLocation.source?.absoluteRef,
+        ).allowed;
+        if (topTypes.size === ALL_JSON_TYPE_SET.size) {
+          report(
+            `patch-top-level-unrestricted:${mediaEntry.mediaType}`,
+            schemaReportLoc,
+            `PATCH "${pathTemplate}" (${mediaEntry.mediaType}) request schema does not restrict the top-level payload to a JSON object. Declare "type: object" for JSON Merge Patch bodies (ADS-0005).`,
+          );
+        } else {
           if (topTypes.has("array")) {
             report(
               `patch-top-level-array:${mediaEntry.mediaType}`,
@@ -882,15 +889,13 @@ export const ads0005PatchMergeSemantics: RedoclyOas3Rule = createRootRule(
           ctx.resolve,
           ignoreMatcher,
           topLevelRef?.name,
+          COMPAT_VARIANT_OPTIONS,
         );
 
         for (const variant of collected.variants) {
-          // 2b. Reject fieldMask / updateMask top-level body properties
+          // 2b. Reject fieldMask / updateMask top-level body properties (no deprecation exemption)
           for (const [propName, prop] of variant.properties.entries()) {
-            if (
-              !isTrackedPropertyDeprecated(prop, ctx.resolve) &&
-              isBannedPatchMaskName(propName)
-            ) {
+            if (isBannedPatchMaskName(propName)) {
               const propLoc = selectPropertyReportLocation(
                 prop,
                 mediaEntry.schemaLocation,
@@ -917,9 +922,25 @@ export const ads0005PatchMergeSemantics: RedoclyOas3Rule = createRootRule(
               report(
                 `patch-open-additional-properties:${mediaEntry.mediaType}`,
                 schemaReportLoc,
-                `PATCH "${pathTemplate}" (${mediaEntry.mediaType}) request schema declares properties without forbidding unknown fields. Set "additionalProperties: false" (or "unevaluatedProperties: false" on composed schemas) so unknown properties are rejected (ADS-0005).`,
+                `PATCH "${pathTemplate}" (${mediaEntry.mediaType}) request schema does not forbid unknown fields. Set "additionalProperties: false" (or "unevaluatedProperties: false" on composed schemas) so unknown properties are rejected (ADS-0005).`,
               );
             }
+          }
+
+          // 4b. Check closure recursively on fixed-schema nested objects merged under RFC 7396
+          for (const nestedPath of collectNestedOpenPatchObjectPaths(variant, ctx.resolve)) {
+            const topKey = nestedPath.split(".")[0] ?? "";
+            const prop = topKey ? variant.properties.get(topKey) : undefined;
+            const nestedLoc = selectPropertyReportLocation(
+              prop,
+              mediaEntry.schemaLocation,
+              schemaReportLoc,
+            );
+            report(
+              `patch-nested-open-additional-properties:${mediaEntry.mediaType}:${nestedPath}`,
+              nestedLoc,
+              `PATCH "${pathTemplate}" (${mediaEntry.mediaType}) nested object "${nestedPath}" does not forbid unknown fields. Set "additionalProperties: false" (or "unevaluatedProperties: false" on composed schemas) on recursively merged objects (ADS-0005).`,
+            );
           }
         }
 
@@ -930,6 +951,14 @@ export const ads0005PatchMergeSemantics: RedoclyOas3Rule = createRootRule(
             `PATCH "${pathTemplate}" (${mediaEntry.mediaType}) request schema exceeds the ${MAX_OBJECT_VARIANTS}-variant union analysis cap and could not be fully verified for RFC 7396 JSON Merge Patch semantics (ADS-0005).`,
           );
         }
+      }
+
+      if (!hasCompatibleJsonBody && !reportedJsonPatchMedia) {
+        report(
+          "patch-missing-json-body",
+          pathEntry.operationReportLocation("patch"),
+          `PATCH "${pathTemplate}" must declare a JSON request body ("application/json") using JSON Merge Patch semantics (ADS-0005).`,
+        );
       }
     }
   },

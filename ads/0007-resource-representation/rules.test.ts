@@ -220,7 +220,7 @@ describe("ADS-0007 Redocly rules", () => {
     expect(ads0007Problems(report)).toEqual([]);
   });
 
-  it("validates hoisted canonical GET, flat and receipt-envelope creation secrets, slices, and per-service Operation canonical resources", async () => {
+  it("validates hoisted canonical GET, flat creation secrets, slices, and per-service Operation canonical resources", async () => {
     const doc = baseOpenApi({
       paths: {
         // Hoisted canonical GET + scoped collection with strict slice + POST 201
@@ -294,40 +294,6 @@ describe("ADS-0007 Redocly rules", () => {
           get: {
             operationId: "getApiKey",
             summary: "Get API key",
-            responses: { "200": jsonResponse({ $ref: "#/components/schemas/ApiKey" }) },
-          },
-        },
-        // Creation receipt envelope ({ apiKey, secret }) whose embedded resource matches canonical
-        "/v1/projects/{projectId}/signing-keys": {
-          parameters: [pathParam("projectId")],
-          post: {
-            operationId: "createSigningKeyReceipt",
-            summary: "Create signing key returning receipt envelope matching canonical",
-            requestBody: jsonRequestBody({
-              type: "object",
-              required: ["name"],
-              properties: { name: { type: "string" } },
-            }),
-            responses: {
-              "201": jsonResponse(
-                {
-                  type: "object",
-                  required: ["signingKey", "secret"],
-                  properties: {
-                    signingKey: { $ref: "#/components/schemas/ApiKey" },
-                    secret: { type: "string" },
-                  },
-                },
-                "Created",
-              ),
-            },
-          },
-        },
-        "/v1/projects/{projectId}/signing-keys/{signingKeyId}": {
-          parameters: [pathParam("projectId"), pathParam("signingKeyId")],
-          get: {
-            operationId: "getSigningKey",
-            summary: "Get signing key",
             responses: { "200": jsonResponse({ $ref: "#/components/schemas/ApiKey" }) },
           },
         },
@@ -1028,8 +994,7 @@ describe("ADS-0007 Redocly rules", () => {
     expect(
       messages.some(
         (m) =>
-          m.includes('Component schema "BadPatch"') &&
-          m.includes("without forbidding unknown fields"),
+          m.includes('Component schema "BadPatch"') && m.includes("does not forbid unknown fields"),
       ),
     ).toBe(true);
     expect(
@@ -1145,5 +1110,358 @@ describe("ADS-0007 Redocly rules", () => {
 
     const { report } = await lintOpenApi(doc, configPath);
     expect(ads0007Problems(report)).toEqual([]);
+  });
+
+  it("enforces edge cases across 2XX responses, ignored union branches, actions, explicit pointers, hoisted 202 inputs, reserved keys, and schema-only annotation walking", async () => {
+    const configPath = await writeRedoclyConfig({
+      "photon-ads/ads-0007-response-representation-consistency": {
+        severity: "error",
+        ignore: [{ schema: "LegacyProject", reason: "Legacy response union branch" }],
+      },
+      "photon-ads/ads-0007-collection-slice-subset": "error",
+      "photon-ads/ads-0007-mutation-input-symmetry": "error",
+      "photon-ads/ads-0007-resource-annotation-valid": "error",
+      "photon-ads/ads-0007-derived-schema-compatibility": "error",
+    });
+
+    const doc = baseOpenApi({
+      paths: {
+        // 1. Collection POST with only 2XX response must be checked
+        "/v1/projects/{projectId}/widgets": {
+          parameters: [pathParam("projectId")],
+          post: {
+            operationId: "createWidget2xx",
+            summary: "POST returning mismatched 2XX",
+            requestBody: jsonRequestBody({
+              type: "object",
+              properties: { name: { type: "string" } },
+            }),
+            responses: {
+              "2XX": jsonResponse({
+                type: "object",
+                required: ["id", "bogus"],
+                properties: { id: { type: "string" }, bogus: { type: "string" } },
+              }),
+            },
+          },
+        },
+        "/v1/projects/{projectId}/widgets/{widgetId}": {
+          parameters: [pathParam("projectId"), pathParam("widgetId")],
+          get: {
+            operationId: "getWidget",
+            summary: "Canonical widget GET",
+            responses: {
+              "200": jsonResponse({
+                type: "object",
+                required: ["id", "name"],
+                properties: { id: { type: "string" }, name: { type: "string" } },
+              }),
+            },
+          },
+          // 2. PUT with explicit 201 and 2XX must check 2XX (covering 200) too
+          put: {
+            operationId: "putWidget201And2xx",
+            summary: "PUT with valid 201 and invalid 2XX",
+            requestBody: jsonRequestBody({
+              type: "object",
+              properties: { name: { type: "string" } },
+            }),
+            responses: {
+              "201": jsonResponse({
+                type: "object",
+                required: ["id", "name"],
+                properties: { id: { type: "string" }, name: { type: "string" } },
+              }),
+              "2XX": jsonResponse({
+                type: "object",
+                required: ["id", "name"],
+                properties: { id: { type: "string" }, name: { type: "integer" } },
+              }),
+            },
+          },
+        },
+        // 3. Ignored union branch in PATCH 200 must not trigger error when non-ignored branch matches
+        "/v1/projects/{projectId}": {
+          parameters: [pathParam("projectId")],
+          get: {
+            operationId: "getProject",
+            summary: "Canonical Project GET",
+            responses: { "200": jsonResponse({ $ref: "#/components/schemas/Project" }) },
+          },
+          patch: {
+            operationId: "patchProjectWithIgnoredBranch",
+            summary: "PATCH returning oneOf[LegacyProject, Project]",
+            requestBody: jsonRequestBody({
+              type: "object",
+              additionalProperties: false,
+              properties: { name: { type: "string" } },
+            }),
+            responses: {
+              "200": jsonResponse({
+                oneOf: [
+                  { $ref: "#/components/schemas/LegacyProject" },
+                  { $ref: "#/components/schemas/Project" },
+                ],
+              }),
+            },
+          },
+        },
+        // 4. Custom action returning drifted parent resource is checked; receipt-only action is exempt
+        "/v1/projects/{projectId}/archive": {
+          parameters: [pathParam("projectId")],
+          post: {
+            operationId: "archiveProjectDrifted",
+            summary: "Action returning drifted Project",
+            responses: {
+              "200": jsonResponse({
+                type: "object",
+                required: ["id", "name"],
+                properties: { id: { type: "string" }, name: { type: "integer" } },
+              }),
+            },
+          },
+        },
+        "/v1/projects/{projectId}/ping": {
+          parameters: [pathParam("projectId")],
+          post: {
+            operationId: "pingProjectReceipt",
+            summary: "Receipt-only action",
+            responses: {
+              "200": jsonResponse({
+                type: "object",
+                required: ["ok"],
+                properties: { ok: { type: "boolean" } },
+              }),
+            },
+          },
+        },
+        // 5. Ordinary 5-field resource (no 202, no completedAt/response/error) must NOT be exempted as Operation
+        "/v1/devices/{deviceId}": {
+          parameters: [pathParam("deviceId")],
+          get: {
+            operationId: "getDevice",
+            summary: "Device GET without updatedAt",
+            responses: {
+              "200": jsonResponse({
+                type: "object",
+                required: ["id", "type", "status", "createdAt"],
+                properties: {
+                  id: { type: "string" },
+                  type: { type: "string" },
+                  status: { type: "string" },
+                  createdAt: { type: "string" },
+                },
+              }),
+            },
+          },
+          patch: {
+            operationId: "patchDeviceAddsUpdatedAt",
+            summary:
+              "PATCH adding undeclared updatedAt on response and reserved updatedAt on request",
+            requestBody: jsonRequestBody({
+              type: "object",
+              additionalProperties: false,
+              properties: { status: { type: "string" }, updatedAt: { type: "string" } },
+            }),
+            responses: {
+              "200": jsonResponse({
+                type: "object",
+                required: ["id", "type", "status", "createdAt", "updatedAt"],
+                properties: {
+                  id: { type: "string" },
+                  type: { type: "string" },
+                  status: { type: "string" },
+                  createdAt: { type: "string" },
+                  updatedAt: { type: "string" },
+                },
+              }),
+            },
+          },
+        },
+        // 6. Hoisted PATCH returning only 202 must still check mutation input symmetry
+        "/v1/organizations/{organizationId}/projects/{projectId}": {
+          parameters: [pathParam("organizationId"), pathParam("projectId")],
+          patch: {
+            operationId: "patchHoistedProjectAsync",
+            summary: "Hoisted async PATCH returning 202 only",
+            requestBody: jsonRequestBody({
+              type: "object",
+              additionalProperties: false,
+              properties: { name: { type: "integer" } },
+            }),
+            responses: {
+              "202": jsonResponse({
+                type: "object",
+                required: ["id"],
+                properties: { id: { type: "string" } },
+              }),
+            },
+          },
+        },
+        // 7. Explicit x-photon-resource.canonical excludes other overlapping hoisted GETs
+        "/v1/teams/{teamId}/items": {
+          parameters: [pathParam("teamId")],
+          get: {
+            operationId: "listTeamItems",
+            summary: "List team items pointing explicitly to TeamItem",
+            responses: {
+              "200": jsonResponse({
+                type: "object",
+                required: ["items"],
+                properties: {
+                  items: { type: "array", items: { $ref: "#/components/schemas/TeamItemSlice" } },
+                },
+              }),
+            },
+          },
+          post: {
+            operationId: "createTeamItemWithGlobalOnlyField",
+            summary: "POST returning globalOnly field not on TeamItem",
+            requestBody: jsonRequestBody({
+              type: "object",
+              properties: { name: { type: "string" } },
+            }),
+            responses: {
+              "201": jsonResponse({
+                type: "object",
+                required: ["id", "name", "globalOnly"],
+                properties: {
+                  id: { type: "string" },
+                  name: { type: "string" },
+                  globalOnly: { type: "string" },
+                },
+              }),
+            },
+          },
+        },
+        "/v1/teams/{teamId}/items/{itemId}": {
+          parameters: [pathParam("teamId"), pathParam("itemId")],
+          get: {
+            operationId: "getTeamItem",
+            summary: "TeamItem canonical GET",
+            responses: { "200": jsonResponse({ $ref: "#/components/schemas/TeamItem" }) },
+          },
+        },
+        "/v1/items/{itemId}": {
+          parameters: [pathParam("itemId")],
+          get: {
+            operationId: "getGlobalItem",
+            summary: "GlobalItem canonical GET",
+            responses: { "200": jsonResponse({ $ref: "#/components/schemas/GlobalItem" }) },
+          },
+        },
+      },
+      components: {
+        schemas: {
+          Project: {
+            "x-photon-resource": { type: "projects.project" },
+            type: "object",
+            required: ["id", "name"],
+            properties: {
+              id: { type: "string", readOnly: true },
+              name: { type: "string" },
+              // default payload containing x-photon-resource must NOT be treated as a schema annotation
+              metadata: {
+                type: "object",
+                default: { "x-photon-resource": "just-example-data" },
+              },
+              // property literally named "example" carrying an invalid annotation MUST be validated
+              example: {
+                type: "object",
+                "x-photon-resource": { type: "BAD_EXAMPLE_PROP" },
+              },
+            },
+          },
+          LegacyProject: {
+            type: "object",
+            required: ["legacyOnly"],
+            properties: { legacyOnly: { type: "string" } },
+          },
+          TeamItem: {
+            "x-photon-resource": { type: "teams.item" },
+            type: "object",
+            required: ["id", "name"],
+            properties: { id: { type: "string" }, name: { type: "string" } },
+          },
+          GlobalItem: {
+            "x-photon-resource": { type: "global.item" },
+            type: "object",
+            required: ["id", "name", "globalOnly"],
+            properties: {
+              id: { type: "string" },
+              name: { type: "string" },
+              globalOnly: { type: "string" },
+            },
+          },
+          TeamItemSlice: {
+            "x-photon-resource": { role: "slice", canonical: "#/components/schemas/TeamItem" },
+            type: "object",
+            required: ["id", "name"],
+            properties: { id: { type: "string" }, name: { type: "string" } },
+          },
+          // 8. nonResourceInputs must NOT exempt server-managed createdAt
+          CreateTeamItemBadNri: {
+            "x-photon-resource": {
+              role: "create",
+              canonical: "#/components/schemas/TeamItem",
+              nonResourceInputs: ["createdAt"],
+            },
+            type: "object",
+            properties: {
+              name: { type: "string" },
+              createdAt: { type: "string" },
+            },
+          },
+        },
+      },
+    });
+
+    const { report } = await lintOpenApi(doc, configPath);
+    const respMsgs = ads0007ProblemsFor(report, "ads-0007-response-representation-consistency").map(
+      (e) => e.message,
+    );
+    const mutMsgs = ads0007ProblemsFor(report, "ads-0007-mutation-input-symmetry").map(
+      (e) => e.message,
+    );
+    const annotMsgs = ads0007ProblemsFor(report, "ads-0007-resource-annotation-valid").map(
+      (e) => e.message,
+    );
+    const derivMsgs = ads0007ProblemsFor(report, "ads-0007-derived-schema-compatibility").map(
+      (e) => e.message,
+    );
+
+    expect(respMsgs.some((m) => m.includes("/widgets") && m.includes('property "bogus"'))).toBe(
+      true,
+    );
+    expect(respMsgs.some((m) => m.includes("PUT") && m.includes("(2XX"))).toBe(true);
+    expect(respMsgs.some((m) => m.includes("legacyOnly"))).toBe(false);
+    expect(respMsgs.some((m) => m.includes("/archive") && m.includes('property "name"'))).toBe(
+      true,
+    );
+    expect(respMsgs.some((m) => m.includes("/ping"))).toBe(false);
+    expect(respMsgs.some((m) => m.includes("/devices") && m.includes('property "updatedAt"'))).toBe(
+      true,
+    );
+    expect(respMsgs.some((m) => m.includes("/teams") && m.includes('property "globalOnly"'))).toBe(
+      true,
+    );
+
+    expect(mutMsgs.some((m) => m.includes("/devices") && m.includes('property "updatedAt"'))).toBe(
+      true,
+    );
+    expect(
+      mutMsgs.some((m) => m.includes("/organizations/{organizationId}/projects/{projectId}")),
+    ).toBe(true);
+
+    expect(annotMsgs.some((m) => m.includes("default"))).toBe(false);
+    expect(annotMsgs.some((m) => m.includes("/properties/example"))).toBe(true);
+    expect(
+      annotMsgs.some((m) => m.includes("CreateTeamItemBadNri") && m.includes("createdAt")),
+    ).toBe(true);
+    expect(
+      derivMsgs.some(
+        (m) => m.includes("CreateTeamItemBadNri") && m.includes('property "createdAt"'),
+      ),
+    ).toBe(true);
   });
 });

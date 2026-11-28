@@ -487,6 +487,18 @@ describe("ADS-0005 Redocly CLI end-to-end linting", () => {
           patch: {
             operationId: "updateProject",
             summary: "Update project",
+            requestBody: {
+              required: true,
+              content: {
+                "application/json": {
+                  schema: {
+                    type: "object",
+                    additionalProperties: false,
+                    properties: { name: { type: "string" } },
+                  },
+                },
+              },
+            },
             responses: {
               "200": jsonResponse({ $ref: "#/components/schemas/Project" }),
               "404": { description: "Not found" },
@@ -538,6 +550,18 @@ describe("ADS-0005 Redocly CLI end-to-end linting", () => {
           patch: {
             operationId: "updateOrgMember",
             summary: "Update org member",
+            requestBody: {
+              required: true,
+              content: {
+                "application/json": {
+                  schema: {
+                    type: "object",
+                    additionalProperties: false,
+                    properties: { role: { type: "string" } },
+                  },
+                },
+              },
+            },
             responses: {
               "200": jsonResponse({ $ref: "#/components/schemas/Member" }),
               "404": { description: "Not found" },
@@ -716,6 +740,18 @@ describe("ADS-0005 Redocly CLI end-to-end linting", () => {
           patch: {
             operationId: "updateAgentProfile",
             summary: "Update agent profile",
+            requestBody: {
+              required: true,
+              content: {
+                "application/json": {
+                  schema: {
+                    type: "object",
+                    additionalProperties: false,
+                    properties: { displayName: { type: "string" } },
+                  },
+                },
+              },
+            },
             responses: {
               "200": jsonResponse({ $ref: "#/components/schemas/AgentProfile" }),
               "404": { description: "Not found" },
@@ -1552,6 +1588,16 @@ describe("ADS-0005 Redocly CLI end-to-end linting", () => {
           },
         ],
       },
+      "photon-ads/ads-0005-patch-merge-semantics": {
+        severity: "error",
+        ignore: [
+          {
+            path: "/v1/projects/{projectId}/legacy-profile",
+            method: "patch",
+            reason: "Legacy bodyless patch",
+          },
+        ],
+      },
     });
 
     const doc = baseOpenApi({
@@ -1635,6 +1681,18 @@ describe("ADS-0005 Redocly CLI end-to-end linting", () => {
           patch: {
             operationId: "patchLegacyDual",
             summary: "PATCH beside ignored PUT",
+            requestBody: {
+              required: true,
+              content: {
+                "application/json": {
+                  schema: {
+                    type: "object",
+                    additionalProperties: false,
+                    properties: { name: { type: "string" } },
+                  },
+                },
+              },
+            },
             responses: { "200": jsonResponse({ type: "object" }) },
           },
         },
@@ -3554,6 +3612,69 @@ describe("ADS-0005 Redocly CLI end-to-end linting", () => {
             responses: { "200": okProject },
           },
         },
+        "/v1/projects/{projectId}/unrestricted-patch": {
+          parameters: [pathParam("projectId")],
+          get: { operationId: "getUnrestricted", summary: "Get", responses: { "200": okProject } },
+          patch: {
+            operationId: "patchUnrestricted",
+            summary: "Unrestricted {} schema and deprecated required mask",
+            parameters: [
+              {
+                name: "updateMask",
+                in: "query",
+                required: true,
+                deprecated: true,
+                schema: { type: "string" },
+              },
+            ],
+            requestBody: {
+              required: true,
+              content: { "application/json": { schema: {} } },
+            },
+            responses: { "200": okProject },
+          },
+        },
+        "/v1/projects/{projectId}/text-only-patch": {
+          parameters: [pathParam("projectId")],
+          get: { operationId: "getTextOnly", summary: "Get", responses: { "200": okProject } },
+          patch: {
+            operationId: "patchTextOnly",
+            summary: "Non-JSON text/plain PATCH body",
+            requestBody: {
+              required: true,
+              content: { "text/plain": { schema: { type: "string" } } },
+            },
+            responses: { "200": okProject },
+          },
+        },
+        "/v1/projects/{projectId}/nested-open-patch": {
+          parameters: [pathParam("projectId")],
+          get: { operationId: "getNestedOpen", summary: "Get", responses: { "200": okProject } },
+          patch: {
+            operationId: "patchNestedOpen",
+            summary:
+              "Closed root with open recursively merged nested object and false-closed unevaluatedProperties",
+            requestBody: {
+              required: true,
+              content: {
+                "application/json": {
+                  schema: {
+                    type: "object",
+                    additionalProperties: true,
+                    unevaluatedProperties: false,
+                    properties: {
+                      notifications: {
+                        type: "object",
+                        properties: { emailEnabled: { type: "boolean" } },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+            responses: { "200": okProject },
+          },
+        },
       },
     });
 
@@ -3564,6 +3685,11 @@ describe("ADS-0005 Redocly CLI end-to-end linting", () => {
 
     expect(messages.some((m) => m.includes('query parameter "updateMask"'))).toBe(true);
     expect(
+      messages.some(
+        (m) => m.includes("/unrestricted-patch") && m.includes('query parameter "updateMask"'),
+      ),
+    ).toBe(true);
+    expect(
       messages.some((m) => m.includes('uses "application/json-patch+json" (RFC 6902 JSON Patch)')),
     ).toBe(true);
     expect(
@@ -3572,7 +3698,7 @@ describe("ADS-0005 Redocly CLI end-to-end linting", () => {
     expect(
       messages.some((m) => m.includes('declares required top-level properties ("name")')),
     ).toBe(true);
-    expect(messages.some((m) => m.includes("without forbidding unknown fields"))).toBe(true);
+    expect(messages.some((m) => m.includes("does not forbid unknown fields"))).toBe(true);
     expect(messages.some((m) => m.includes("accepts a top-level JSON array"))).toBe(true);
     expect(
       messages.some((m) =>
@@ -3584,6 +3710,30 @@ describe("ADS-0005 Redocly CLI end-to-end linting", () => {
         m.includes(
           '/union-scalar-patch" (application/json) allows non-object top-level type "null"',
         ),
+      ),
+    ).toBe(true);
+    expect(
+      messages.some(
+        (m) =>
+          m.includes("/unrestricted-patch") &&
+          m.includes("does not restrict the top-level payload to a JSON object"),
+      ),
+    ).toBe(true);
+    expect(
+      messages.some(
+        (m) => m.includes("/text-only-patch") && m.includes("must declare a JSON request body"),
+      ),
+    ).toBe(true);
+    expect(
+      messages.some(
+        (m) => m.includes("/nested-open-patch") && m.includes('nested object "notifications"'),
+      ),
+    ).toBe(true);
+    expect(
+      messages.some(
+        (m) =>
+          m.includes("/nested-open-patch") &&
+          m.includes("request schema does not forbid unknown fields"),
       ),
     ).toBe(true);
     expect(

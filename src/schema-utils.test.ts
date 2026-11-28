@@ -706,5 +706,102 @@ describe("shared schema and OpenAPI utilities", () => {
     expect(variants).toHaveLength(1);
     expect(variants[0]?.forbidsAdditionalProperties).toBe(true);
     expect([...(variants[0]?.discriminatorProperties ?? [])]).toEqual(["kind"]);
+
+    // unevaluatedProperties: false does not close an object when additionalProperties: true already evaluates extra keys
+    const openWithUneval = collectFlattenedObjectVariants(
+      {
+        type: "object",
+        properties: { name: { type: "string" } },
+        additionalProperties: true,
+        unevaluatedProperties: false,
+      },
+      resolve,
+    ).variants;
+    expect(openWithUneval[0]?.forbidsAdditionalProperties).toBe(false);
+
+    // Dictionary anyOf branches with distinct additionalProperties value schemas remain distinct
+    const dictUnion = collectFlattenedObjectVariants(
+      {
+        anyOf: [
+          { type: "object", additionalProperties: { type: "string" } },
+          { type: "object", additionalProperties: { type: "integer" } },
+        ],
+      },
+      resolve,
+    ).variants;
+    expect(dictUnion).toHaveLength(2);
+
+    // isSchemaReadOnly detects all-readOnly anyOf/oneOf unions (including shared $ref DAGs) without false-positiving mixed unions
+    const readOnlyStrRef = { type: "string", readOnly: true };
+    const roResolve = makeResolver({
+      "#/components/schemas/RoStr": { node: readOnlyStrRef, pointer: "#/components/schemas/RoStr" },
+    });
+    expect(
+      isSchemaReadOnly(
+        {
+          anyOf: [{ $ref: "#/components/schemas/RoStr" }, { type: "integer", readOnly: true }],
+        },
+        roResolve,
+      ),
+    ).toBe(true);
+    expect(
+      isSchemaReadOnly(
+        {
+          anyOf: [{ $ref: "#/components/schemas/RoStr" }, { $ref: "#/components/schemas/RoStr" }],
+        },
+        roResolve,
+      ),
+    ).toBe(true);
+    expect(
+      isSchemaReadOnly(
+        {
+          anyOf: [{ $ref: "#/components/schemas/RoStr" }, { type: "integer" }],
+        },
+        roResolve,
+      ),
+    ).toBe(false);
+
+    // extractOperationJsonResponseSchemas in all-match mode resolves 201 and 2XX (for 200) independently
+    const putOpLoc = makeLocation("#/paths/~1v1~1items~1{itemId}/put");
+    const putAll = extractOperationJsonResponseSchemas(
+      {
+        responses: {
+          "201": {
+            content: {
+              "application/json": {
+                schema: { type: "object", properties: { a: { type: "string" } } },
+              },
+            },
+          },
+          "2XX": {
+            content: {
+              "application/json": {
+                schema: { type: "object", properties: { b: { type: "string" } } },
+              },
+            },
+          },
+        },
+      },
+      putOpLoc,
+      resolve,
+      ["200", "201", "2XX"],
+      { firstMatchingOnly: false },
+    );
+    expect(putAll.map((e) => e.statusCode)).toEqual(["201", "2XX"]);
+
+    const putBothExplicit = extractOperationJsonResponseSchemas(
+      {
+        responses: {
+          "200": { content: { "application/json": { schema: { type: "object" } } } },
+          "201": { content: { "application/json": { schema: { type: "object" } } } },
+          "2XX": { content: { "application/json": { schema: { type: "object" } } } },
+        },
+      },
+      putOpLoc,
+      resolve,
+      ["200", "201", "2XX"],
+      { firstMatchingOnly: false },
+    );
+    expect(putBothExplicit.map((e) => e.statusCode)).toEqual(["200", "201"]);
   });
 });
