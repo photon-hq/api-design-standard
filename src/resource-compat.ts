@@ -849,6 +849,7 @@ export function extractAddressableCollection(
   return extractCollectionInfo(variant, resolve, {
     requireScalarId: true,
     allowNonObjectMetadata: false,
+    variantOptions: COMPAT_VARIANT_OPTIONS,
   });
 }
 

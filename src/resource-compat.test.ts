@@ -7,6 +7,7 @@ import {
   collectArrayItemBranches,
   collectNestedOpenPatchObjectPaths,
   compareFragmentsAgainstTargets,
+  extractAddressableCollection,
   extractCollectionInfo,
   isTypeSubset,
   SERVER_MANAGED_CREATE_KEYS,
@@ -668,6 +669,31 @@ describe("shared resource compatibility helpers", () => {
         openPaths: ["meta"],
         truncated: false,
       });
+    }
+  });
+  it("keeps nested-distinct item variants when extracting addressable collections", () => {
+    const resolve = makeResolver({});
+    const item = (metaKey: string) => ({
+      type: "object",
+      required: ["id"],
+      properties: {
+        id: { type: "string" },
+        kind: { type: "string" },
+        meta: { type: "object", properties: { [metaKey]: { type: "string" } } },
+      },
+    });
+    const listVariant = collectFlattenedObjectVariants(
+      {
+        type: "object",
+        required: ["items"],
+        properties: { items: { type: "array", items: { oneOf: [item("x"), item("y")] } } },
+      },
+      resolve,
+      makeLocation("#/list"),
+    ).variants[0];
+    expect(listVariant).toBeDefined();
+    if (listVariant) {
+      expect(extractAddressableCollection(listVariant, resolve)?.itemVariants).toHaveLength(2);
     }
   });
 });
