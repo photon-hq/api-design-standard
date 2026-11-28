@@ -338,7 +338,7 @@ describe("docs-reference export", () => {
       "Forward opaque token pagination using pageSize, pageToken, and nextPageToken, strict bounds validation, end-of-list omission, deterministic ordering, and unified error contracts across Photon public HTTP APIs.",
     );
     expect(ads0006?.status).toBe("Approved");
-    expect(ads0006?.updated).toBe("2026-11-26");
+    expect(ads0006?.updated).toBe("2026-11-28");
     expect(ads0006?.rules).toEqual([
       {
         id: "photon-ads/ads-0006-standard-pagination-params",

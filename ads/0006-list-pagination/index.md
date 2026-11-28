@@ -4,13 +4,13 @@ sidebarTitle: "ADS-0006 · List Pagination"
 description: "Forward opaque token pagination using pageSize, pageToken, and nextPageToken, strict bounds validation, end-of-list omission, deterministic ordering, and unified error contracts across Photon public HTTP APIs."
 ads: "0006"
 status: "Approved"
-updated: "2026-11-26"
+updated: "2026-11-28"
 ---
 
 # ADS-0006: List Pagination
 
 - **Status**: Approved
-- **Updated**: 2026-11-26
+- **Updated**: 2026-11-28
 
 Consistent list pagination lets callers, generated SDKs, CLIs, and automated agents traverse any paginated collection with one shared iteration loop instead of endpoint-specific cursor names, wrapper objects, or termination heuristics. This standard is part of Photon API Design Standards and uses the keywords **MUST**, **MUST NOT**, **SHOULD**, and **MAY** as described in RFC 2119.
 
@@ -55,7 +55,7 @@ Paginated `GET` collection endpoints **MUST** use forward opaque token paginatio
   - Up to `200` is recommended for high-throughput event or message streams.
   - OpenAPI schemas **MUST NOT** omit `minimum` or `maximum`, accept `0` or negative values, or use unbounded pseudo-maxima (such as `MAX_SAFE_INTEGER` or values above `1000`).
 - Servers **MUST** document their default page size (for example `20` or `50`) in the `pageSize` parameter description.
-- Servers **MUST** reject out-of-range values (`0`, negative integers, or integers above `maximum`) and non-integer values with a `4xx` validation error (`400 Bad Request` RFC 9457 Problem Details) rather than silently clamping values or treating `0` as the default.
+- Servers **MUST** reject out-of-range values (`0`, negative integers, or integers above `maximum`) and non-integer values with `422 Unprocessable Content` ([RFC 9110 §15.5.21](https://www.rfc-editor.org/rfc/rfc9110#section-15.5.21); RFC 9457 Problem Details, `VALIDATION_FAILED`) rather than silently clamping values or treating `0` as the default.
 - Callers **MAY** change `pageSize` on subsequent requests while passing a `pageToken`; the updated `pageSize` applies to that request's page only. Servers **MUST NOT** bind `pageSize` into `pageToken` validation or reject a valid `pageToken` solely because `pageSize` changed between pages.
 
 ### 4. Opaque tokens and `400 INVALID_PAGE_TOKEN` error contract
@@ -80,7 +80,7 @@ Paginated `GET` collection endpoints **MUST** use forward opaque token paginatio
 
 ### Canonical paginated collection OpenAPI contract
 
-**Good** — optional `pageSize` (`1..100`, documented default), optional `pageToken` (`minLength: 1`), optional non-nullable top-level `nextPageToken` (`minLength: 1`), and `400` RFC 9457 Problem Details for `INVALID_PAGE_TOKEN`:
+**Good** — optional `pageSize` (`1..100`, documented default), optional `pageToken` (`minLength: 1`), optional non-nullable top-level `nextPageToken` (`minLength: 1`), `400` RFC 9457 Problem Details for `INVALID_PAGE_TOKEN`, and `422` RFC 9457 Problem Details for invalid query parameters such as an out-of-range `pageSize`:
 
 ```yaml
 paths:
@@ -136,7 +136,13 @@ paths:
                     minLength: 1
                     description: Opaque token for fetching the next page. Omitted on the final page.
         "400":
-          description: Invalid pagination parameter or page token.
+          description: Invalid, expired, or mismatched pageToken (INVALID_PAGE_TOKEN).
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "422":
+          description: Invalid query parameter, such as an out-of-range pageSize (VALIDATION_FAILED).
           content:
             application/problem+json:
               schema:
@@ -384,3 +390,4 @@ The `@photon-hq/api-design-standards` Redocly plugin (`photon-ads`) enforces ADS
 ## Changelog
 
 - **2026-11-26**: Approved and published as `ADS-0006`.
+- **2026-11-28**: Aligned `pageSize` validation errors in §3 with `422 Unprocessable Content` (`VALIDATION_FAILED`) while keeping `400 Bad Request` (`INVALID_PAGE_TOKEN`) for invalid page tokens in §4.
