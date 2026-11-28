@@ -248,6 +248,16 @@ components:
               type: string
               readOnly: true
 paths:
+  /v1/projects/{projectId}/api-keys/{apiKeyId}:
+    get:
+      summary: Get an API key
+      responses:
+        "200":
+          description: Canonical API key representation (never includes secret)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiKey"
   /v1/projects/{projectId}/api-keys:
     post:
       summary: Create an API key

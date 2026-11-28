@@ -1298,9 +1298,9 @@ describe("ADS-0007 Redocly rules", () => {
             },
           },
         },
-        // 7. Explicit x-photon-resource.canonical excludes other overlapping hoisted GETs
-        "/v1/teams/{teamId}/items": {
-          parameters: [pathParam("teamId")],
+        // 7. Explicit x-photon-resource.canonical selects between two hoisted GETs (no direct child GET)
+        "/v1/organizations/{organizationId}/teams/{teamId}/items": {
+          parameters: [pathParam("organizationId"), pathParam("teamId")],
           get: {
             operationId: "listTeamItems",
             summary: "List team items pointing explicitly to TeamItem",
@@ -1317,6 +1317,42 @@ describe("ADS-0007 Redocly rules", () => {
           post: {
             operationId: "createTeamItemWithGlobalOnlyField",
             summary: "POST returning globalOnly field not on TeamItem",
+            requestBody: jsonRequestBody({
+              type: "object",
+              properties: { name: { type: "string" } },
+            }),
+            responses: {
+              "201": jsonResponse({
+                type: "object",
+                required: ["id", "name", "globalOnly"],
+                properties: {
+                  id: { type: "string" },
+                  name: { type: "string" },
+                  globalOnly: { type: "string" },
+                },
+              }),
+            },
+          },
+        },
+        // 7b. Positive control: the same POST response passes when the pointer targets GlobalItem
+        "/v1/regions/{regionId}/teams/{teamId}/items": {
+          parameters: [pathParam("regionId"), pathParam("teamId")],
+          get: {
+            operationId: "listRegionTeamItems",
+            summary: "List region team items pointing explicitly to GlobalItem",
+            responses: {
+              "200": jsonResponse({
+                type: "object",
+                required: ["items"],
+                properties: {
+                  items: { type: "array", items: { $ref: "#/components/schemas/GlobalItemSlice" } },
+                },
+              }),
+            },
+          },
+          post: {
+            operationId: "createRegionTeamItemWithGlobalOnlyField",
+            summary: "POST returning globalOnly field present on GlobalItem",
             requestBody: jsonRequestBody({
               type: "object",
               properties: { name: { type: "string" } },
@@ -1399,6 +1435,12 @@ describe("ADS-0007 Redocly rules", () => {
             required: ["id", "name"],
             properties: { id: { type: "string" }, name: { type: "string" } },
           },
+          GlobalItemSlice: {
+            "x-photon-resource": { role: "slice", canonical: "#/components/schemas/GlobalItem" },
+            type: "object",
+            required: ["id", "name"],
+            properties: { id: { type: "string" }, name: { type: "string" } },
+          },
           // 8. nonResourceInputs must NOT exempt server-managed createdAt
           CreateTeamItemBadNri: {
             "x-photon-resource": {
@@ -1442,8 +1484,15 @@ describe("ADS-0007 Redocly rules", () => {
     expect(respMsgs.some((m) => m.includes("/devices") && m.includes('property "updatedAt"'))).toBe(
       true,
     );
-    expect(respMsgs.some((m) => m.includes("/teams") && m.includes('property "globalOnly"'))).toBe(
-      true,
+    expect(
+      respMsgs.some(
+        (m) =>
+          m.includes('POST "/v1/organizations/{organizationId}/teams/{teamId}/items"') &&
+          m.includes('property "globalOnly"'),
+      ),
+    ).toBe(true);
+    expect(respMsgs.some((m) => m.includes('"/v1/regions/{regionId}/teams/{teamId}/items"'))).toBe(
+      false,
     );
 
     expect(mutMsgs.some((m) => m.includes("/devices") && m.includes('property "updatedAt"'))).toBe(
@@ -1462,6 +1511,138 @@ describe("ADS-0007 Redocly rules", () => {
       derivMsgs.some(
         (m) => m.includes("CreateTeamItemBadNri") && m.includes('property "createdAt"'),
       ),
+    ).toBe(true);
+  });
+  it("checks 2XX custom actions, Operation replay exemptions, root-null patch roles, and skips path extension keys", async () => {
+    const configPath = await writeRedoclyConfig({
+      "photon-ads/ads-0007-response-representation-consistency": "error",
+      "photon-ads/ads-0007-collection-slice-subset": "error",
+      "photon-ads/ads-0007-mutation-input-symmetry": "error",
+      "photon-ads/ads-0007-resource-annotation-valid": "error",
+      "photon-ads/ads-0007-derived-schema-compatibility": "error",
+    });
+    const operationSchema = {
+      type: "object",
+      required: ["id", "type", "status", "createdAt", "updatedAt", "completedAt"],
+      properties: {
+        id: { type: "string" },
+        type: { type: "string" },
+        status: { type: "string", enum: ["queued", "running", "succeeded", "failed"] },
+        createdAt: { type: "string", format: "date-time" },
+        updatedAt: { type: "string", format: "date-time" },
+        completedAt: { type: ["string", "null"], format: "date-time" },
+        response: { type: ["object", "null"] },
+        error: { type: ["object", "null"] },
+      },
+    };
+    const gadgetProperties = {
+      id: { type: "string" },
+      type: { type: "string" },
+      status: { type: "string" },
+      createdAt: { type: "string" },
+      updatedAt: { type: "string" },
+      response: { type: ["object", "null"] },
+      error: { type: ["object", "null"] },
+      name: { type: "string" },
+    };
+    const doc = baseOpenApi({
+      paths: {
+        "/v1/gadgets/{gadgetId}": {
+          parameters: [pathParam("gadgetId")],
+          get: {
+            operationId: "getGadget",
+            summary: "Gadget canonical GET",
+            responses: { "200": jsonResponse({ $ref: "#/components/schemas/Gadget" }) },
+          },
+          patch: {
+            operationId: "patchGadget",
+            summary: "PATCH returning a drifted Gadget under 200 and an Operation under 202",
+            requestBody: jsonRequestBody({
+              type: "object",
+              additionalProperties: false,
+              properties: { name: { type: "string" } },
+            }),
+            responses: {
+              "200": jsonResponse({
+                type: "object",
+                required: ["id", "name"],
+                properties: {
+                  ...gadgetProperties,
+                  completedAt: { type: ["string", "null"] },
+                  debug: { type: "string" },
+                },
+              }),
+              "202": jsonResponse(operationSchema),
+            },
+          },
+        },
+        "/v1/gadgets/{gadgetId}/rename": {
+          parameters: [pathParam("gadgetId")],
+          post: {
+            operationId: "renameGadget",
+            summary: "Action returning a drifted Gadget under 2XX",
+            responses: {
+              "2XX": jsonResponse({
+                type: "object",
+                required: ["id", "name"],
+                properties: { id: { type: "string" }, name: { type: "integer" } },
+              }),
+            },
+          },
+        },
+        "x-internal-notes": {
+          get: {
+            responses: {
+              "200": jsonResponse({
+                type: "object",
+                "x-photon-resource": { type: "BAD_EXTENSION_PATH" },
+              }),
+            },
+          },
+        },
+      },
+      components: {
+        schemas: {
+          Gadget: {
+            "x-photon-resource": { type: "devices.gadget" },
+            type: "object",
+            required: ["id", "name"],
+            properties: gadgetProperties,
+          },
+          NullablePatchGadget: {
+            "x-photon-resource": { role: "patch", canonical: "#/components/schemas/Gadget" },
+            type: ["object", "null"],
+            additionalProperties: false,
+            properties: { name: { type: "string" } },
+          },
+        },
+      },
+    });
+
+    const { report } = await lintOpenApi(doc, configPath);
+    const respMsgs = ads0007ProblemsFor(report, "ads-0007-response-representation-consistency").map(
+      (e) => e.message,
+    );
+    const annotMsgs = ads0007ProblemsFor(report, "ads-0007-resource-annotation-valid").map(
+      (e) => e.message,
+    );
+    const derivMsgs = ads0007ProblemsFor(report, "ads-0007-derived-schema-compatibility").map(
+      (e) => e.message,
+    );
+
+    expect(
+      respMsgs.some(
+        (m) => m.startsWith('PATCH "/v1/gadgets/{gadgetId}" (200') && m.includes("does not exist"),
+      ),
+    ).toBe(true);
+    expect(
+      respMsgs.some(
+        (m) => m.includes('"/v1/gadgets/{gadgetId}/rename" (2XX') && m.includes('property "name"'),
+      ),
+    ).toBe(true);
+    expect(annotMsgs.some((m) => m.includes("BAD_EXTENSION_PATH"))).toBe(false);
+    expect(
+      derivMsgs.some((m) => m.includes("NullablePatchGadget") && m.includes("non-object type")),
     ).toBe(true);
   });
 });

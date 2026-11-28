@@ -892,6 +892,7 @@ export const ads0005PatchMergeSemantics: RedoclyOas3Rule = createRootRule(
           COMPAT_VARIANT_OPTIONS,
         );
 
+        let nestedTruncated = false;
         for (const variant of collected.variants) {
           // 2b. Reject fieldMask / updateMask top-level body properties (no deprecation exemption)
           for (const [propName, prop] of variant.properties.entries()) {
@@ -928,7 +929,11 @@ export const ads0005PatchMergeSemantics: RedoclyOas3Rule = createRootRule(
           }
 
           // 4b. Check closure recursively on fixed-schema nested objects merged under RFC 7396
-          for (const nestedPath of collectNestedOpenPatchObjectPaths(variant, ctx.resolve)) {
+          const nestedOpen = collectNestedOpenPatchObjectPaths(variant, ctx.resolve);
+          if (nestedOpen.truncated) {
+            nestedTruncated = true;
+          }
+          for (const nestedPath of nestedOpen.openPaths) {
             const topKey = nestedPath.split(".")[0] ?? "";
             const prop = topKey ? variant.properties.get(topKey) : undefined;
             const nestedLoc = selectPropertyReportLocation(
@@ -944,7 +949,7 @@ export const ads0005PatchMergeSemantics: RedoclyOas3Rule = createRootRule(
           }
         }
 
-        if (collected.truncated) {
+        if (collected.truncated || nestedTruncated) {
           report(
             `patch-variant-cap-exceeded:${mediaEntry.mediaType}`,
             schemaReportLoc,

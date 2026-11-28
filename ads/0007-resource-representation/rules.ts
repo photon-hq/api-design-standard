@@ -13,6 +13,7 @@ import {
 import {
   areComponentRefsSame,
   COMPAT_VARIANT_OPTIONS,
+  type ComponentRefIdentity,
   checkPatchObjectVariantConstraints,
   checkResponseVariantsCompatibleWithCanonical,
   checkVariantAgainstCanonicalVariants,
@@ -43,6 +44,7 @@ import {
   isRecord,
   isStrictlyNullConstraint,
   MAX_OBJECT_VARIANTS,
+  propertyTypeConstraint,
   type ResolverFn,
   selectPropertyReportLocation,
   type UnknownRecord,
@@ -162,15 +164,40 @@ interface CanonicalGetSchemaInfo {
   readonly truncated: boolean;
 }
 
-function isAds0004OperationVariant(variant: FlattenedObjectVariant): boolean {
-  return ADS_0004_UNIVERSAL_OPERATION_FIELDS.every((field) => variant.properties.has(field));
+const ADS_0004_STRING_OPERATION_FIELDS = [
+  "id",
+  "type",
+  "status",
+  "createdAt",
+  "updatedAt",
+] as const;
+
+function isAds0004OperationVariant(variant: FlattenedObjectVariant, resolve: ResolverFn): boolean {
+  if (!ADS_0004_UNIVERSAL_OPERATION_FIELDS.every((field) => variant.properties.has(field))) {
+    return false;
+  }
+  for (const field of ADS_0004_STRING_OPERATION_FIELDS) {
+    const prop = variant.properties.get(field);
+    if (!prop || !propertyTypeConstraint(prop, resolve).allowed.has("string")) {
+      return false;
+    }
+  }
+  const completedAt = variant.properties.get("completedAt");
+  if (!completedAt) {
+    return false;
+  }
+  const completedTypes = propertyTypeConstraint(completedAt, resolve).allowed;
+  return completedTypes.has("string") || completedTypes.has("null");
 }
 
-function isOperationResponseVariants(variants: readonly FlattenedObjectVariant[]): boolean {
+function isOperationResponseVariants(
+  variants: readonly FlattenedObjectVariant[],
+  resolve: ResolverFn,
+): boolean {
   const objVariants = variants.filter(
     (v) => v.typeConstraint.allowed.has("object") && !isStrictlyNullConstraint(v.typeConstraint),
   );
-  return objVariants.length > 0 && objVariants.every((v) => isAds0004OperationVariant(v));
+  return objVariants.length > 0 && objVariants.every((v) => isAds0004OperationVariant(v, resolve));
 }
 
 function extractCanonicalGetSchemas(
@@ -198,7 +225,7 @@ function extractCanonicalGetSchemas(
         schema: entry.schema,
         schemaLocation: entry.schemaLocation,
         variants: nonNull,
-        isOperation: isOperationResponseVariants(nonNull),
+        isOperation: isOperationResponseVariants(nonNull, resolve),
         truncated: collected.truncated,
       });
     }
@@ -230,6 +257,19 @@ function resolveCanonicalPointerFromSchema(
   return undefined;
 }
 
+function matchesCanonicalPointer(
+  pointer: string,
+  sourceFrom: string | undefined,
+  canonRef: ComponentRefIdentity | null,
+  resolve: ResolverFn,
+): boolean {
+  if (!canonRef || !LOCAL_COMPONENT_SCHEMA_REF_RE.test(pointer)) {
+    return false;
+  }
+  const declaredRef = extractSingleComponentRef({ $ref: pointer }, resolve, sourceFrom);
+  return areComponentRefsSame(declaredRef, canonRef);
+}
+
 function matchExplicitCanonicalPairing(
   sourceSchema: unknown,
   sourceLocation: RedoclyLocation | undefined,
@@ -248,7 +288,7 @@ function matchExplicitCanonicalPairing(
   }
   const declaredCanonicalPtr = resolveCanonicalPointerFromSchema(sourceSchema, resolve, sourceFrom);
   if (declaredCanonicalPtr && LOCAL_COMPONENT_SCHEMA_REF_RE.test(declaredCanonicalPtr)) {
-    return Boolean(canonRef && declaredCanonicalPtr === `#/components/schemas/${canonRef.name}`);
+    return matchesCanonicalPointer(declaredCanonicalPtr, sourceFrom, canonRef, resolve);
   }
   return null;
 }
@@ -497,11 +537,8 @@ function pairCanonicalsByRequestBodyOrSingle(
     if (!mediaEntry.isJson || mediaEntry.schema === undefined) {
       continue;
     }
-    const ptr = resolveCanonicalPointerFromSchema(
-      mediaEntry.schema,
-      resolve,
-      mediaEntry.schemaLocation.source?.absoluteRef,
-    );
+    const mediaFrom = mediaEntry.schemaLocation.source?.absoluteRef;
+    const ptr = resolveCanonicalPointerFromSchema(mediaEntry.schema, resolve, mediaFrom);
     if (!ptr || !LOCAL_COMPONENT_SCHEMA_REF_RE.test(ptr)) {
       continue;
     }
@@ -511,7 +548,7 @@ function pairCanonicalsByRequestBodyOrSingle(
         resolve,
         canon.schemaLocation.source?.absoluteRef,
       );
-      if (canonRef && ptr === `#/components/schemas/${canonRef.name}`) {
+      if (matchesCanonicalPointer(ptr, mediaFrom, canonRef, resolve)) {
         explicitMatches.add(canon);
       }
     }
@@ -620,7 +657,41 @@ export const ads0007ResponseRepresentationConsistency: RedoclyOas3Rule = createR
         readonly customActionPairing?: boolean;
       },
     ): void => {
-      const opHas202 = isRecord(op.responses) && op.responses["202"] !== undefined;
+      const op202Targets: Array<{
+        readonly ref: ComponentRefIdentity | null;
+        readonly objVariants: readonly FlattenedObjectVariant[];
+      }> = [];
+      if (isRecord(op.responses) && op.responses["202"] !== undefined) {
+        const schemas202 = extractOperationJsonResponseSchemas(
+          op,
+          entry.operationLocation(method),
+          ctx.resolve,
+          ["202"],
+          { firstMatchingOnly: false },
+        );
+        for (const s202 of schemas202) {
+          const collected202 = collectFlattenedObjectVariants(
+            s202.schema,
+            ctx.resolve,
+            s202.schemaLocation,
+            COMPAT_VARIANT_OPTIONS,
+          );
+          const objVariants202 = collected202.variants.filter(
+            (v) =>
+              v.typeConstraint.allowed.has("object") && !isStrictlyNullConstraint(v.typeConstraint),
+          );
+          if (isOperationResponseVariants(objVariants202, ctx.resolve)) {
+            op202Targets.push({
+              ref: extractSingleComponentRef(
+                s202.schema,
+                ctx.resolve,
+                s202.schemaLocation.source?.absoluteRef,
+              ),
+              objVariants: objVariants202,
+            });
+          }
+        }
+      }
 
       for (const resp of responses) {
         const statusCode = resp.statusCode ?? "200";
@@ -658,8 +729,20 @@ export const ads0007ResponseRepresentationConsistency: RedoclyOas3Rule = createR
         }
 
         // Only exempt an ADS-0004 Operation replay on synchronous 2xx responses when the operation
-        // actually declares a 202 Accepted async contract.
-        const respIsAsyncOpReplay = opHas202 && isOperationResponseVariants(respActive);
+        // declares a 202 Accepted Operation response that matches this synchronous response schema.
+        const respIsAsyncOpReplay =
+          op202Targets.length > 0 &&
+          isOperationResponseVariants(respActive, ctx.resolve) &&
+          op202Targets.some(
+            (target202) =>
+              areComponentRefsSame(topRef, target202.ref) ||
+              checkResponseVariantsCompatibleWithCanonical(
+                respActive,
+                target202.objVariants,
+                ctx.resolve,
+                { allowCreationSecret: false },
+              ).length === 0,
+          );
         const activeCanonicals = canonicals.filter((c) => !(respIsAsyncOpReplay && !c.isOperation));
         if (activeCanonicals.length === 0) {
           continue;
@@ -789,7 +872,7 @@ export const ads0007ResponseRepresentationConsistency: RedoclyOas3Rule = createR
           postOp,
           entry.operationLocation("post"),
           ctx.resolve,
-          ["200", "201"],
+          ["200", "201", "2XX"],
           { firstMatchingOnly: false },
         );
         if (responses.length === 0) {
@@ -1210,11 +1293,14 @@ function collectResourceAnnotations(
       return;
     }
     for (const [cbName, cbObj] of Object.entries(callbacks)) {
-      if (!isRecord(cbObj)) {
+      if (cbName.startsWith("x-") || !isRecord(cbObj)) {
         continue;
       }
       const cbLoc = loc.child([cbName]);
       for (const [expr, cbPathItem] of Object.entries(cbObj)) {
+        if (expr.startsWith("x-")) {
+          continue;
+        }
         walkPathItem(cbPathItem, cbLoc.child([expr]));
       }
     }
@@ -1254,6 +1340,9 @@ function collectResourceAnnotations(
       if (isRecord(op.responses)) {
         const respsLoc = opLoc.child(["responses"]);
         for (const [status, resp] of Object.entries(op.responses)) {
+          if (status.startsWith("x-")) {
+            continue;
+          }
           walkResponse(resp, respsLoc.child([status]));
         }
       }
@@ -1309,6 +1398,9 @@ function collectResourceAnnotations(
   if (isRecord(root.paths)) {
     const pathsLoc = ctx.location.child(["paths"]);
     for (const [pathTemplate, pathItem] of Object.entries(root.paths)) {
+      if (!pathTemplate.startsWith("/")) {
+        continue;
+      }
       walkPathItem(pathItem, pathsLoc.child([pathTemplate]));
     }
   }
@@ -1316,6 +1408,9 @@ function collectResourceAnnotations(
   if (isRecord(root.webhooks)) {
     const webhooksLoc = ctx.location.child(["webhooks"]);
     for (const [name, pathItem] of Object.entries(root.webhooks)) {
+      if (name.startsWith("x-")) {
+        continue;
+      }
       walkPathItem(pathItem, webhooksLoc.child([name]));
     }
   }
@@ -1641,8 +1736,10 @@ export const ads0007DerivedSchemaCompatibility: RedoclyOas3Rule = createRootRule
         ctx.resolve,
         entry.schemaLocation.source?.absoluteRef,
       ).allowed;
-      const nonObjectNonNull = [...topTypes].filter((t) => t !== "object" && t !== "null");
-      if (topTypes.size === ALL_JSON_TYPE_SET.size || nonObjectNonNull.length > 0) {
+      const disallowedRootTypes = [...topTypes].filter(
+        (t) => t !== "object" && (role === "patch" || t !== "null"),
+      );
+      if (topTypes.size === ALL_JSON_TYPE_SET.size || disallowedRootTypes.length > 0) {
         report(
           `derived-non-object:${role}`,
           entry.schemaLocation,
@@ -1749,7 +1846,15 @@ export const ads0007DerivedSchemaCompatibility: RedoclyOas3Rule = createRootRule
               );
             }
           }
-          for (const nestedPath of collectNestedOpenPatchObjectPaths(dv, ctx.resolve)) {
+          const nestedOpen = collectNestedOpenPatchObjectPaths(dv, ctx.resolve);
+          if (nestedOpen.truncated) {
+            report(
+              `derived-variant-cap-exceeded:${role}`,
+              entry.schemaLocation,
+              `${entry.label} or canonical schema "${canonicalName}" exceeds the ${MAX_OBJECT_VARIANTS}-variant union analysis cap and could not be fully verified for "${role}" compatibility (ADS-0007).`,
+            );
+          }
+          for (const nestedPath of nestedOpen.openPaths) {
             const topKey = nestedPath.split(".")[0] ?? "";
             const prop = topKey ? dv.properties.get(topKey) : undefined;
             const loc = selectPropertyReportLocation(

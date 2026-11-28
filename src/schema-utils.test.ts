@@ -804,4 +804,14 @@ describe("shared schema and OpenAPI utilities", () => {
     );
     expect(putBothExplicit.map((e) => e.statusCode)).toEqual(["200", "201"]);
   });
+  it("memoizes boolean annotation lookups across shared acyclic schema DAGs", () => {
+    const resolve: ResolverFn = (() => ({ error: new Error("no refs") })) as unknown as ResolverFn;
+    let node: Record<string, unknown> = { type: "string" };
+    for (let depth = 0; depth < 40; depth += 1) {
+      node = { allOf: [node, node] };
+    }
+    const started = performance.now();
+    expect(isSchemaReadOnly(node, resolve)).toBe(false);
+    expect(performance.now() - started).toBeLessThan(1000);
+  });
 });

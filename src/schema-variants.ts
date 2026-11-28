@@ -277,8 +277,6 @@ export interface FlattenedObjectVariant {
   readonly openAdditionalProperties: boolean;
   readonly hasSchemaAdditionalProperties: boolean;
   readonly additionalPropertiesSchemas: readonly SchemaFragment[];
-  readonly explicitlyForbidsAdditionalProperties: boolean;
-  readonly forbidsUnevaluatedProperties: boolean;
   readonly forbidsAdditionalProperties: boolean;
   readonly properties: ReadonlyMap<string, TrackedProperty>;
   readonly required: ReadonlySet<string>;
@@ -293,8 +291,6 @@ export const EMPTY_SEED_VARIANT: FlattenedObjectVariant = {
   openAdditionalProperties: false,
   hasSchemaAdditionalProperties: false,
   additionalPropertiesSchemas: [],
-  explicitlyForbidsAdditionalProperties: false,
-  forbidsUnevaluatedProperties: false,
   forbidsAdditionalProperties: false,
   properties: new Map(),
   required: new Set(),
@@ -369,8 +365,6 @@ export function buildFlattenedVariantSignature(
     variant.isObjectLike ? 1 : 0,
     variant.openAdditionalProperties ? 1 : 0,
     variant.hasSchemaAdditionalProperties ? 1 : 0,
-    variant.explicitlyForbidsAdditionalProperties ? 1 : 0,
-    variant.forbidsUnevaluatedProperties ? 1 : 0,
     variant.forbidsAdditionalProperties ? 1 : 0,
     propEntries,
     reqKeys,
@@ -437,10 +431,6 @@ export function mergeFlattenedVariants(
           ];
   const openAdditionalProperties =
     base.openAdditionalProperties || addition.openAdditionalProperties;
-  const explicitlyForbidsAdditionalProperties =
-    base.explicitlyForbidsAdditionalProperties || addition.explicitlyForbidsAdditionalProperties;
-  const forbidsUnevaluatedProperties =
-    base.forbidsUnevaluatedProperties || addition.forbidsUnevaluatedProperties;
   const merged: FlattenedObjectVariant = {
     typeConstraint,
     isObjectLike,
@@ -448,11 +438,8 @@ export function mergeFlattenedVariants(
     hasSchemaAdditionalProperties:
       base.hasSchemaAdditionalProperties || addition.hasSchemaAdditionalProperties,
     additionalPropertiesSchemas,
-    explicitlyForbidsAdditionalProperties,
-    forbidsUnevaluatedProperties,
     forbidsAdditionalProperties:
-      explicitlyForbidsAdditionalProperties ||
-      (forbidsUnevaluatedProperties && !openAdditionalProperties),
+      base.forbidsAdditionalProperties || addition.forbidsAdditionalProperties,
     properties,
     required,
     discriminatorProperties,
@@ -547,7 +534,7 @@ function extractLocalFlattenedVariant(
     schemaNames.add(pointerName);
   }
   if (followRef && typeof node.$ref === "string") {
-    const refName = extractComponentSchemaName(node.$ref);
+    const refName = extractComponentSchemaName(node.$ref, { decodeUri: true });
     if (refName) {
       schemaNames.add(refName);
     }
@@ -565,11 +552,7 @@ function extractLocalFlattenedVariant(
     : [];
   const openAdditionalProperties =
     node.additionalProperties === true || hasSchemaAdditionalProperties;
-  const explicitlyForbidsAdditionalProperties = node.additionalProperties === false;
-  const forbidsUnevaluatedProperties = node.unevaluatedProperties === false;
-  const forbidsAdditionalProperties =
-    explicitlyForbidsAdditionalProperties ||
-    (forbidsUnevaluatedProperties && !openAdditionalProperties);
+  const forbidsAdditionalProperties = node.additionalProperties === false;
   const hasObjectShape =
     properties.size > 0 ||
     node.additionalProperties !== undefined ||
@@ -586,8 +569,6 @@ function extractLocalFlattenedVariant(
     openAdditionalProperties,
     hasSchemaAdditionalProperties,
     additionalPropertiesSchemas,
-    explicitlyForbidsAdditionalProperties,
-    forbidsUnevaluatedProperties,
     forbidsAdditionalProperties,
     properties,
     required,
@@ -602,7 +583,7 @@ function extractDiscriminatorPropertyName(node: UnknownRecord | undefined): stri
     return undefined;
   }
   const propName = node.discriminator.propertyName;
-  return typeof propName === "string" && propName.trim().length > 0 ? propName.trim() : undefined;
+  return typeof propName === "string" && propName.trim().length > 0 ? propName : undefined;
 }
 
 export function collectFlattenedObjectVariants(
@@ -647,13 +628,22 @@ export function collectFlattenedObjectVariants(
           };
         });
       },
-      finalizeNode: (node, currentVariants) =>
-        node.nullable === true
-          ? currentVariants.map((variant) => ({
-              ...variant,
-              typeConstraint: finalizeTypeConstraint(node, variant.typeConstraint),
-            }))
-          : currentVariants,
+      finalizeNode: (node, currentVariants) => {
+        const applyNullable = node.nullable === true;
+        const applyUnevaluatedClose = node.unevaluatedProperties === false;
+        if (!applyNullable && !applyUnevaluatedClose) {
+          return currentVariants;
+        }
+        return currentVariants.map((variant) => ({
+          ...variant,
+          ...(applyNullable
+            ? { typeConstraint: finalizeTypeConstraint(node, variant.typeConstraint) }
+            : {}),
+          ...(applyUnevaluatedClose && !variant.openAdditionalProperties
+            ? { forbidsAdditionalProperties: true }
+            : {}),
+        }));
+      },
     },
     fromOverride,
   );

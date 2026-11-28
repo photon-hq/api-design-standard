@@ -4,6 +4,7 @@ import {
   checkPatchObjectVariantConstraints,
   checkResponseCompatibleWithCanonical,
   checkVariantAgainstCanonicalVariants,
+  collectArrayItemBranches,
   collectNestedOpenPatchObjectPaths,
   compareFragmentsAgainstTargets,
   extractCollectionInfo,
@@ -545,7 +546,128 @@ describe("shared resource compatibility helpers", () => {
     ).variants[0];
     expect(nestedPatch).toBeDefined();
     if (nestedPatch) {
-      expect(collectNestedOpenPatchObjectPaths(nestedPatch, resolve)).toEqual(["notifications"]);
+      expect(collectNestedOpenPatchObjectPaths(nestedPatch, resolve).openPaths).toEqual([
+        "notifications",
+      ]);
+    }
+  });
+  it("scopes unevaluatedProperties closures, propagates nested response required keys, handles tuples, and reports untyped nested PATCH objects", () => {
+    const resolve = makeResolver({});
+    const loc = makeLocation("#/test");
+
+    // A closed allOf branch is not reopened by a sibling branch's additionalProperties: true
+    const scopedClosure = collectFlattenedObjectVariants(
+      {
+        allOf: [
+          {
+            type: "object",
+            properties: { name: { type: "string" } },
+            unevaluatedProperties: false,
+          },
+          { type: "object", additionalProperties: true },
+        ],
+      },
+      resolve,
+      loc,
+    ).variants[0];
+    expect(scopedClosure?.forbidsAdditionalProperties).toBe(true);
+    if (scopedClosure) {
+      expect(checkPatchObjectVariantConstraints(scopedClosure)).toEqual([]);
+    }
+
+    // Adjacent additionalProperties: true still keeps unevaluatedProperties: false open
+    const adjacentOpen = collectFlattenedObjectVariants(
+      { type: "object", additionalProperties: true, unevaluatedProperties: false },
+      resolve,
+      loc,
+    ).variants[0];
+    expect(adjacentOpen?.forbidsAdditionalProperties).toBe(false);
+
+    // Full responses must keep nested canonical required properties required
+    const nestedCanon = {
+      type: "object",
+      required: ["profile"],
+      properties: {
+        profile: {
+          type: "object",
+          required: ["name"],
+          properties: { name: { type: "string" } },
+        },
+      },
+    };
+    const nestedOptionalResp = {
+      type: "object",
+      required: ["profile"],
+      properties: {
+        profile: { type: "object", properties: { name: { type: "string" } } },
+      },
+    };
+    expect(
+      checkResponseCompatibleWithCanonical(nestedOptionalResp, loc, nestedCanon, loc, resolve, {
+        allowCreationSecret: false,
+      }).mismatches.some((m) => m.path === "profile" && m.reason.includes("optional")),
+    ).toBe(true);
+    expect(
+      checkResponseCompatibleWithCanonical(nestedCanon, loc, nestedCanon, loc, resolve, {
+        allowCreationSecret: false,
+      }).mismatches,
+    ).toEqual([]);
+
+    // Tuple arrays with items: false are constrained by prefixItems, not treated as empty arrays
+    const tuple = collectArrayItemBranches(
+      [{ node: { type: "array", prefixItems: [{ type: "string" }], items: false } }],
+      resolve,
+    );
+    expect(tuple.branches).toHaveLength(1);
+    expect(tuple.hasUnconstrainedBranch).toBe(false);
+
+    // An array property with an unconstrained item branch is not an addressable collection
+    const looseArray = collectFlattenedObjectVariants(
+      {
+        type: "object",
+        properties: {
+          items: {
+            type: "array",
+            anyOf: [
+              {
+                items: {
+                  type: "object",
+                  required: ["id"],
+                  properties: { id: { type: "string" } },
+                },
+              },
+              {},
+            ],
+          },
+        },
+      },
+      resolve,
+      loc,
+    ).variants[0];
+    expect(looseArray).toBeDefined();
+    if (looseArray) {
+      expect(extractCollectionInfo(looseArray, resolve)).toBeNull();
+    }
+
+    // Untyped nested objects merge recursively and must be closed; typed maps replace wholesale
+    const untypedNested = collectFlattenedObjectVariants(
+      {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          meta: { type: "object" },
+          labels: { type: "object", additionalProperties: { type: "string" } },
+        },
+      },
+      resolve,
+      loc,
+    ).variants[0];
+    expect(untypedNested).toBeDefined();
+    if (untypedNested) {
+      expect(collectNestedOpenPatchObjectPaths(untypedNested, resolve)).toEqual({
+        openPaths: ["meta"],
+        truncated: false,
+      });
     }
   });
 });

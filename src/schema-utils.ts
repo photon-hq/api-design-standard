@@ -918,39 +918,69 @@ function hasBooleanSchemaAnnotation(
   key: "deprecated" | "readOnly" | "writeOnly",
 ): boolean {
   const seen = new Set<unknown>();
+  const memo = new Map<object, Map<string, boolean>>();
 
-  const hasInCombinators = (node: UnknownRecord, currentFrom: string | undefined): boolean => {
+  type AnnotResult = { readonly value: boolean; readonly hitCycle: boolean };
+
+  const hasInCombinators = (node: UnknownRecord, currentFrom: string | undefined): AnnotResult => {
+    let hitCycle = false;
     if (Array.isArray(node.allOf)) {
       for (const branch of node.allOf) {
-        if (visit(branch, currentFrom)) {
-          return true;
+        const res = visit(branch, currentFrom);
+        if (res.value) {
+          return { value: true, hitCycle: false };
+        }
+        if (res.hitCycle) {
+          hitCycle = true;
         }
       }
     }
     for (const unionKey of ["anyOf", "oneOf"] as const) {
       const branches = node[unionKey];
-      if (
-        Array.isArray(branches) &&
-        branches.length > 0 &&
-        branches.every((branch) => visit(branch, currentFrom))
-      ) {
-        return true;
+      if (!Array.isArray(branches) || branches.length === 0) {
+        continue;
+      }
+      let allTrue = true;
+      for (const branch of branches) {
+        const res = visit(branch, currentFrom);
+        if (res.hitCycle) {
+          hitCycle = true;
+        }
+        if (!res.value) {
+          allTrue = false;
+          break;
+        }
+      }
+      if (allTrue) {
+        return { value: true, hitCycle: false };
       }
     }
-    return false;
+    return { value: false, hitCycle };
   };
 
-  const visit = (node: unknown, currentFrom: string | undefined): boolean => {
-    if (!isRecord(node) || seen.has(node)) {
-      return false;
+  const visit = (node: unknown, currentFrom: string | undefined): AnnotResult => {
+    if (!isRecord(node)) {
+      return { value: false, hitCycle: false };
     }
+    if (seen.has(node)) {
+      return { value: false, hitCycle: true };
+    }
+    const cacheKey = currentFrom ?? "";
+    const cached = memo.get(node)?.get(cacheKey);
+    if (cached !== undefined) {
+      return { value: cached, hitCycle: false };
+    }
+
     seen.add(node);
+    let result: AnnotResult = { value: false, hitCycle: false };
     try {
       const direct = node[key];
       if (typeof direct === "boolean") {
-        return direct;
+        result = { value: direct, hitCycle: false };
+        return result;
       }
 
+      let hitCycle = false;
       if (typeof node.$ref === "string") {
         const resolved = safeResolveSchema(resolve, node, currentFrom);
         if (resolved) {
@@ -959,28 +989,48 @@ function hasBooleanSchemaAnnotation(
             const hopValue = hop.node[key];
             if (typeof hopValue === "boolean") {
               if (hopValue) {
-                return true;
+                result = { value: true, hitCycle: false };
+                return result;
               }
               refDecided = true;
               break;
             }
-            if (hasInCombinators(hop.node, hop.location?.source?.absoluteRef)) {
-              return true;
+            const hopComb = hasInCombinators(hop.node, hop.location?.source?.absoluteRef);
+            if (hopComb.value) {
+              result = { value: true, hitCycle: false };
+              return result;
+            }
+            if (hopComb.hitCycle) {
+              hitCycle = true;
             }
           }
-          if (!refDecided && visit(resolved.node, resolved.location?.source?.absoluteRef)) {
-            return true;
+          if (!refDecided) {
+            const targetRes = visit(resolved.node, resolved.location?.source?.absoluteRef);
+            if (targetRes.value) {
+              result = { value: true, hitCycle: false };
+              return result;
+            }
+            if (targetRes.hitCycle) {
+              hitCycle = true;
+            }
           }
         }
       }
 
-      return hasInCombinators(node, currentFrom);
+      const combRes = hasInCombinators(node, currentFrom);
+      result = combRes.value
+        ? { value: true, hitCycle: false }
+        : { value: false, hitCycle: hitCycle || combRes.hitCycle };
+      return result;
     } finally {
       seen.delete(node);
+      if (result.value || !result.hitCycle) {
+        setNodeCacheEntry(memo, node, cacheKey, result.value);
+      }
     }
   };
 
-  return visit(schema, from);
+  return visit(schema, from).value;
 }
 
 export function isSchemaDeprecated(schema: unknown, resolve: ResolverFn, from?: string): boolean {

@@ -445,17 +445,78 @@ export function collectArrayItemBranches(
       branches = next;
     };
 
-    if (isRecord(node.items) || node.items === false) {
-      const itemLoc = location?.child(["items"]);
-      intersectWith([
-        [
-          {
-            node: node.items,
-            ...(from !== undefined ? { from } : {}),
-            ...(itemLoc ? { location: itemLoc } : {}),
-          },
-        ],
-      ]);
+    const extractLocalArrayItemBranches = (
+      targetNode: UnknownRecord,
+      targetLocation: RedoclyLocation | undefined,
+      targetFrom: string | undefined,
+    ): ArrayItemBranch[] | null => {
+      const tuplePrefix =
+        Array.isArray(targetNode.prefixItems) && targetNode.prefixItems.length > 0
+          ? {
+              key: "prefixItems" as const,
+              items: targetNode.prefixItems,
+              rest: targetNode.items,
+              restKey: "items" as const,
+            }
+          : Array.isArray(targetNode.items) && targetNode.items.length > 0
+            ? {
+                key: "items" as const,
+                items: targetNode.items,
+                rest: targetNode.additionalItems,
+                restKey: "additionalItems" as const,
+              }
+            : null;
+
+      if (tuplePrefix) {
+        const tupleBranches: ArrayItemBranch[] = [];
+        for (const [index, elem] of tuplePrefix.items.entries()) {
+          if (isRecord(elem) || elem === false) {
+            const elemLoc = targetLocation?.child([tuplePrefix.key, index]);
+            tupleBranches.push([
+              {
+                node: elem,
+                ...(targetFrom !== undefined ? { from: targetFrom } : {}),
+                ...(elemLoc ? { location: elemLoc } : {}),
+              },
+            ]);
+          } else if (elem === true) {
+            tupleBranches.push([]);
+          }
+        }
+        if (isRecord(tuplePrefix.rest)) {
+          const restLoc = targetLocation?.child([tuplePrefix.restKey]);
+          tupleBranches.push([
+            {
+              node: tuplePrefix.rest,
+              ...(targetFrom !== undefined ? { from: targetFrom } : {}),
+              ...(restLoc ? { location: restLoc } : {}),
+            },
+          ]);
+        } else if (tuplePrefix.rest !== false) {
+          // Tail elements after prefixItems are unconstrained when rest schema is omitted or true.
+          tupleBranches.push([]);
+        }
+        return tupleBranches.length > 0 ? tupleBranches : null;
+      }
+
+      if (isRecord(targetNode.items) || targetNode.items === false) {
+        const itemLoc = targetLocation?.child(["items"]);
+        return [
+          [
+            {
+              node: targetNode.items,
+              ...(targetFrom !== undefined ? { from: targetFrom } : {}),
+              ...(itemLoc ? { location: itemLoc } : {}),
+            },
+          ],
+        ];
+      }
+      return null;
+    };
+
+    const localBranches = extractLocalArrayItemBranches(node, location, from);
+    if (localBranches) {
+      intersectWith(localBranches);
     }
 
     if (branches.length > 0 && typeof node.$ref === "string") {
@@ -475,18 +536,13 @@ export function collectArrayItemBranches(
         }
         if (branches.length > 0) {
           for (const hop of getRefIntermediateHops(node, resolved)) {
-            if (isRecord(hop.node.items) || hop.node.items === false) {
-              const hopFrom = hop.location?.source?.absoluteRef;
-              const hopItemLoc = hop.location?.child(["items"]);
-              intersectWith([
-                [
-                  {
-                    node: hop.node.items,
-                    ...(hopFrom !== undefined ? { from: hopFrom } : {}),
-                    ...(hopItemLoc ? { location: hopItemLoc } : {}),
-                  },
-                ],
-              ]);
+            const hopBranches = extractLocalArrayItemBranches(
+              hop.node,
+              hop.location,
+              hop.location?.source?.absoluteRef,
+            );
+            if (hopBranches) {
+              intersectWith(hopBranches);
             }
           }
         }
@@ -566,6 +622,7 @@ export function collectArrayItemBranches(
 export interface ComponentRefIdentity {
   readonly name: string;
   readonly resolvedKey?: string;
+  readonly resolvedNode?: unknown;
 }
 
 export function hasSiblingSchemaConstraints(node: UnknownRecord): boolean {
@@ -593,7 +650,7 @@ export function extractSingleComponentRef(
     if (hasSiblingSchemaConstraints(schema)) {
       return null;
     }
-    const name = extractComponentSchemaName(schema.$ref);
+    const name = extractComponentSchemaName(schema.$ref, { decodeUri: true });
     if (!name) {
       return null;
     }
@@ -602,6 +659,7 @@ export function extractSingleComponentRef(
     return {
       name,
       ...(resolvedKey !== undefined ? { resolvedKey } : {}),
+      ...(resolved?.node !== undefined ? { resolvedNode: resolved.node } : {}),
     };
   }
 
@@ -624,6 +682,9 @@ export function areComponentRefsSame(
 ): boolean {
   if (!a || !b) {
     return false;
+  }
+  if (a.resolvedNode !== undefined && b.resolvedNode !== undefined) {
+    return a.resolvedNode === b.resolvedNode;
   }
   if (a.resolvedKey !== undefined && b.resolvedKey !== undefined) {
     return a.resolvedKey === b.resolvedKey;
@@ -716,7 +777,11 @@ export function extractCollectionInfo(
       : { branches: [], truncated: false, hasUnconstrainedBranch: false };
     const itemBranches = itemCollection.branches;
 
-    if (itemBranches.length > 0 && !COLLECTION_METADATA_KEYS.has(propName)) {
+    if (
+      !itemCollection.hasUnconstrainedBranch &&
+      itemBranches.length > 0 &&
+      !COLLECTION_METADATA_KEYS.has(propName)
+    ) {
       const collectedVariants: FlattenedObjectVariant[] = [];
       let truncated = itemCollection.truncated;
       for (const branch of itemBranches) {
@@ -1154,13 +1219,19 @@ export function checkPatchObjectVariantConstraints(
   return violations;
 }
 
+export interface NestedOpenPatchObjectResult {
+  readonly openPaths: string[];
+  readonly truncated: boolean;
+}
+
 export function collectNestedOpenPatchObjectPaths(
   variant: FlattenedObjectVariant,
   resolve: ResolverFn,
   maxDepth = MAX_COMPAT_DEPTH,
-): string[] {
+): NestedOpenPatchObjectResult {
   const openPaths: string[] = [];
   const reported = new Set<string>();
+  let truncated = false;
 
   const walk = (
     current: FlattenedObjectVariant,
@@ -1189,20 +1260,24 @@ export function collectNestedOpenPatchObjectPaths(
       nextSeen.add(fragKey);
 
       const fieldPath = joinFieldPath(prefix, key);
-      const subVariants = collectFragmentsObjectVariants(
+      const subCollected = collectFragmentsObjectVariants(
         prop.fragments,
         resolve,
         COMPAT_VARIANT_OPTIONS,
-      ).variants;
-      for (const sub of subVariants) {
+      );
+      if (subCollected.truncated) {
+        truncated = true;
+      }
+      for (const sub of subCollected.variants) {
         if (
           !sub.typeConstraint.allowed.has("object") ||
           isStrictlyNullConstraint(sub.typeConstraint)
         ) {
           continue;
         }
-        // Only fixed-schema sub-objects merge recursively; open-dictionary maps replace wholesale.
-        if (sub.properties.size === 0) {
+        // Only typed open-dictionary maps (no fixed properties, typed schema additionalProperties)
+        // replace wholesale; untyped open objects and fixed-schema sub-objects must forbid extras.
+        if (sub.properties.size === 0 && sub.hasSchemaAdditionalProperties) {
           continue;
         }
         if (!sub.forbidsAdditionalProperties && !reported.has(fieldPath)) {
@@ -1215,7 +1290,7 @@ export function collectNestedOpenPatchObjectPaths(
   };
 
   walk(variant, "", 0, new Set());
-  return openPaths;
+  return { openPaths, truncated };
 }
 
 export function isTypeSubset(
@@ -1256,6 +1331,7 @@ function fragmentListKey(fragments: readonly SchemaFragment[]): string {
 export interface PropertyCompatOptions {
   readonly path: string;
   readonly forbidReadOnly?: boolean;
+  readonly requireCanonicalRequired?: boolean;
   readonly depth?: number;
   readonly seenPairs?: Set<string>;
 }
@@ -1317,7 +1393,8 @@ export function compareFragmentsAgainstTargets(
         (v) =>
           v.typeConstraint.allowed.has("object") &&
           !isStrictlyNullConstraint(v.typeConstraint) &&
-          (v.properties.size > 0 ||
+          (options.requireCanonicalRequired === true ||
+            v.properties.size > 0 ||
             v.additionalPropertiesSchemas.length > 0 ||
             v.openAdditionalProperties ||
             !v.forbidsAdditionalProperties),
@@ -1338,6 +1415,7 @@ export function compareFragmentsAgainstTargets(
       const hasConstrainedTarget = targetObjVariants.some(
         (tv) =>
           tv.properties.size > 0 ||
+          tv.required.size > 0 ||
           tv.additionalPropertiesSchemas.length > 0 ||
           tv.forbidsAdditionalProperties,
       );
@@ -1350,6 +1428,7 @@ export function compareFragmentsAgainstTargets(
             {
               pathPrefix: options.path,
               forbidReadOnly: options.forbidReadOnly === true,
+              requireCanonicalRequired: options.requireCanonicalRequired === true,
               depth: depth + 1,
               seenPairs,
             },
@@ -1391,6 +1470,7 @@ export function compareFragmentsAgainstTargets(
           const itemMismatch = compareFragmentsAgainstTargets(srcBranch, targetBranches, resolve, {
             path: `${options.path}[]`,
             forbidReadOnly: options.forbidReadOnly === true,
+            requireCanonicalRequired: options.requireCanonicalRequired === true,
             depth: depth + 1,
             seenPairs,
           });
@@ -1411,6 +1491,7 @@ export interface VariantSubsetOptions {
   readonly pathPrefix?: string;
   readonly excludedKeys?: ReadonlySet<string>;
   readonly forbidReadOnly?: boolean;
+  readonly requireCanonicalRequired?: boolean;
   readonly serverManagedKeys?: ReadonlySet<string>;
   readonly onlyOverlapping?: boolean;
   readonly depth?: number;
@@ -1505,6 +1586,7 @@ function evaluateKeysAgainstCanonicals(
       {
         path: fieldPath,
         forbidReadOnly: options.forbidReadOnly === true,
+        requireCanonicalRequired: options.requireCanonicalRequired === true,
         depth,
         ...(options.seenPairs ? { seenPairs: options.seenPairs } : {}),
       },
@@ -1567,6 +1649,7 @@ function compareAdditionalPropertiesAgainstCanonicals(
   return compareFragmentsAgainstTargets(sourceAddPropFragments, targetAddPropList, resolve, {
     path: joinFieldPath(pathPrefix, "*"),
     forbidReadOnly: options.forbidReadOnly === true,
+    requireCanonicalRequired: options.requireCanonicalRequired === true,
     depth: depth + 1,
     ...(options.seenPairs ? { seenPairs: options.seenPairs } : {}),
   });
@@ -1629,12 +1712,13 @@ export function checkVariantAgainstCanonicalVariants(
     ];
   }
 
-  // If canonical is an unconstrained open dictionary (no declared properties and no schema
-  // additionalProperties), allow arbitrary keys.
+  // If canonical is an unconstrained open dictionary (no declared properties, no required keys,
+  // and no schema additionalProperties), allow arbitrary keys.
   if (
     objCanonicals.every(
       (cv) =>
         cv.properties.size === 0 &&
+        cv.required.size === 0 &&
         cv.additionalPropertiesSchemas.length === 0 &&
         !cv.forbidsAdditionalProperties,
     )
@@ -1693,7 +1777,11 @@ export function checkVariantAgainstCanonicalVariants(
   }
 
   // Try matching any single canonical variant first; if multiple variants cover all keys
-  // (e.g. a collapsed summary over a discriminated union), fall back to their union.
+  // (e.g. a collapsed summary over a discriminated union), fall back to their union unless
+  // full-response required-property matching is active.
+  let bestSingleFailure: SchemaMismatch[] | null = null;
+  let bestRequiredFailure: SchemaMismatch[] | null = null;
+
   for (const cv of coveringCanonicals) {
     const singleMismatches = evaluateKeysAgainstCanonicals(
       sourceVariant,
@@ -1707,8 +1795,31 @@ export function checkVariantAgainstCanonicalVariants(
         ? compareAdditionalPropertiesAgainstCanonicals(sourceVariant, [cv], resolve, options)
         : null;
     if (singleMismatches.length === 0 && !singleAddPropMismatch) {
+      if (options.requireCanonicalRequired && depth > 0) {
+        const reqGaps = collectRequiredPropertyGaps(sourceVariant, cv, pathPrefix);
+        if (reqGaps.length === 0) {
+          return serverManagedMismatches;
+        }
+        if (bestRequiredFailure === null || reqGaps.length < bestRequiredFailure.length) {
+          bestRequiredFailure = reqGaps;
+        }
+        continue;
+      }
       return serverManagedMismatches;
     }
+    if (options.requireCanonicalRequired && depth > 0) {
+      const combined = [
+        ...singleMismatches,
+        ...(singleAddPropMismatch ? [singleAddPropMismatch] : []),
+      ];
+      if (bestSingleFailure === null || combined.length < bestSingleFailure.length) {
+        bestSingleFailure = combined;
+      }
+    }
+  }
+
+  if (options.requireCanonicalRequired && depth > 0) {
+    return [...serverManagedMismatches, ...(bestRequiredFailure ?? bestSingleFailure ?? [])];
   }
 
   const unionPropMismatches = evaluateKeysAgainstCanonicals(
@@ -1809,6 +1920,7 @@ function checkResponseVariantAgainstCanonicals(
       pathPrefix,
       ...(secretExtraKeys.size > 0 ? { excludedKeys: secretExtraKeys } : {}),
       forbidReadOnly: false,
+      requireCanonicalRequired: true,
     });
     if (subsetMismatches.length > 0) {
       if (bestSubsetFailure === null || subsetMismatches.length < bestSubsetFailure.length) {
