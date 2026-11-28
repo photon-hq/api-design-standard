@@ -2368,6 +2368,7 @@ describe("ADS-0007 Redocly rules", () => {
             properties: {
               id: { type: "string" },
               plan: { $ref: "#/components/schemas/Plan" },
+              billingProfile: { type: "object", properties: { name: { type: "string" } } },
               companion: {
                 oneOf: [{ $ref: "#/components/schemas/Cat" }, { $ref: "#/components/schemas/Dog" }],
               },
@@ -2402,7 +2403,10 @@ describe("ADS-0007 Redocly rules", () => {
               canonical: "#/components/schemas/Subscription",
             },
             type: "object",
-            properties: { plan: { $ref: "#/components/schemas/CreatePlanRequest" } },
+            properties: {
+              plan: { $ref: "#/components/schemas/CreatePlanRequest" },
+              billingProfile: { $ref: "#/components/schemas/CreatePlanRequest" },
+            },
           },
           PetRecord: {
             "x-photon-resource": { type: "pets.pet" },
@@ -2435,6 +2439,11 @@ describe("ADS-0007 Redocly rules", () => {
     expect(
       derivedFor("SubscriptionInputSummary").some((m) =>
         m.includes('property "plan" embeds a "create" input schema of "Plan"'),
+      ),
+    ).toBe(true);
+    expect(
+      derivedFor("SubscriptionInputSummary").some((m) =>
+        m.includes('property "billingProfile" embeds a "create" input schema of "Plan"'),
       ),
     ).toBe(true);
     expect(sliceMsgs.filter((m) => m.includes('"/v1/subscriptions"'))).toEqual([]);

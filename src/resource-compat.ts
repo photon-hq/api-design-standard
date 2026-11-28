@@ -165,7 +165,18 @@ function embeddedTargetMismatchReason(
   source: Pick<TrackedProperty, "fragments">,
   targets: readonly (TrackedProperty | undefined)[],
   resolve: ResolverFn,
+  readRepresentation: boolean,
 ): string | null {
+  const sourceAnnotations = trackedPropertyEmbeddedAnnotations(source, resolve);
+  if (sourceAnnotations.length === 0) {
+    return null;
+  }
+  const writeEmbed = readRepresentation
+    ? sourceAnnotations.find((annotation) => annotation.writeRole !== undefined)
+    : undefined;
+  if (writeEmbed) {
+    return `embeds a "${writeEmbed.writeRole}" input schema of "${writeEmbed.canonicalName}" in a read representation; embed the canonical resource or a slice of it instead`;
+  }
   const targetAnnotations = targets.flatMap((prop) =>
     prop ? trackedPropertyEmbeddedAnnotations(prop, resolve) : [],
   );
@@ -182,15 +193,14 @@ function embeddedTargetMismatchReason(
   ]
     .sort()
     .join(", ");
-  for (const annotation of trackedPropertyEmbeddedAnnotations(source, resolve)) {
-    if (annotation.writeRole !== undefined) {
-      return `embeds a "${annotation.writeRole}" input schema of "${annotation.canonicalName}" in a read representation; embed the canonical resource ${expected} or a slice of it instead`;
-    }
-    if (!targetKeys.has(annotation.canonicalType ?? annotation.canonicalName)) {
-      return `embeds canonical resource "${annotation.canonicalName}" but the canonical schema embeds ${expected}; a nested slice must target the same canonical resource`;
-    }
-  }
-  return null;
+  const mismatched = sourceAnnotations.find(
+    (annotation) =>
+      annotation.writeRole === undefined &&
+      !targetKeys.has(annotation.canonicalType ?? annotation.canonicalName),
+  );
+  return mismatched
+    ? `embeds canonical resource "${mismatched.canonicalName}" but the canonical schema embeds ${expected}; a nested slice must target the same canonical resource`
+    : null;
 }
 
 const FULL_PARAM_SEGMENT_RE = /^\{([^}]+)\}$/;
@@ -1742,6 +1752,7 @@ function evaluateKeysAgainstCanonicals(
       srcProp,
       matchingTargets.map(({ cv }) => cv.properties.get(key)),
       resolve,
+      options.forbidReadOnly !== true,
     );
     if (embeddedMismatch) {
       mismatches.push({ path: fieldPath, reason: embeddedMismatch });
