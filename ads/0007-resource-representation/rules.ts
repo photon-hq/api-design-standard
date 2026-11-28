@@ -743,6 +743,7 @@ export const ads0007ResponseRepresentationConsistency: RedoclyOas3Rule = createR
         // declares a 202 Accepted Operation response that matches this synchronous response schema.
         const respIsAsyncOpReplay =
           op202Targets.length > 0 &&
+          !respCollected.truncated &&
           isOperationResponseVariants(respActive, ctx.resolve) &&
           op202Targets.some(
             (target202) =>

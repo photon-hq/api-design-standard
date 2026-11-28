@@ -1617,7 +1617,9 @@ function compareAdditionalPropertiesAgainstCanonicals(
   }
   const allowsAnyTarget = canonicals.some(
     (cv) =>
-      (cv.openAdditionalProperties && cv.additionalPropertiesSchemas.length === 0) ||
+      (cv.openAdditionalProperties &&
+        cv.additionalPropertiesSchemas.length === 0 &&
+        !cv.forbidsAdditionalProperties) ||
       (cv.properties.size === 0 &&
         cv.additionalPropertiesSchemas.length === 0 &&
         !cv.forbidsAdditionalProperties),

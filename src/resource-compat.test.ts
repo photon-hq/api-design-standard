@@ -599,6 +599,18 @@ describe("shared resource compatibility helpers", () => {
       ).mismatches,
     ).toEqual([]);
 
+    // A closed allOf canonical still rejects a genuinely open response
+    expect(
+      checkResponseCompatibleWithCanonical(
+        { type: "object", additionalProperties: true, properties: { id: { type: "string" } } },
+        loc,
+        closedAllOfResponse,
+        loc,
+        resolve,
+        { allowCreationSecret: false },
+      ).mismatches.some((m) => m.path === "*"),
+    ).toBe(true);
+
     // Adjacent additionalProperties: true still keeps unevaluatedProperties: false open
     const adjacentOpen = collectFlattenedObjectVariants(
       { type: "object", additionalProperties: true, unevaluatedProperties: false },
