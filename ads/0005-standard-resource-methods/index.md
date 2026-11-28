@@ -115,17 +115,17 @@ Standard resource methods **MUST** use predictable `2xx` HTTP status codes:
 
 ### 6. Partial updates (`PATCH`)
 
-Every `PATCH` endpoint **MUST** implement **JSON Merge Patch ([RFC 7396](https://www.rfc-editor.org/rfc/rfc7396))** semantics over `Content-Type: application/json`:
+Every `PATCH` endpoint **MUST** use a JSON object merge-patch contract based on **JSON Merge Patch ([RFC 7396](https://www.rfc-editor.org/rfc/rfc7396))** over `Content-Type: application/json`, with two explicit Photon profile rules for typed nullable fields and dynamic key-value maps:
 
-- **Media type and payload shape**: `PATCH` requests **MUST** accept a JSON object over `application/json` (or a compatible JSON media type). Endpoints **MUST NOT** use JSON Patch ([RFC 6902](https://www.rfc-editor.org/rfc/rfc6902), `application/json-patch+json`, or a top-level patch-operation array) and **MUST NOT** accept or require field-mask query parameters or body fields (`fieldMask`, `updateMask`, `field_mask`, `update_mask`, `fieldsMask`, `fields_mask`).
+- **Media type and payload shape**: `PATCH` requests **MUST** accept a JSON object over `application/json` (or a compatible JSON media type). Top-level arrays, scalars, and `null` are forbidden. Endpoints **MUST NOT** use JSON Patch ([RFC 6902](https://www.rfc-editor.org/rfc/rfc6902), `application/json-patch+json`, or a top-level patch-operation array) and **MUST NOT** accept or require field-mask query parameters or body fields (`fieldMask`, `updateMask`, `field_mask`, `update_mask`, `fieldsMask`, `fields_mask`).
 - **Three-state field semantics**:
   - **Omitted field**: Leave the current stored value unchanged.
-  - **Explicit `null`**: Clear the field (set its stored value to `null`). Explicit `null` is valid **only** on fields whose canonical representation allows `null`; sending `null` for a non-nullable field **MUST** be rejected with `400 Bad Request`.
+  - **Explicit `null`** *(Photon typed-schema rule)*: Whereas raw RFC 7396 §2 removes an object member on `null`, Photon's typed resource schemas represent cleared nullable fields explicitly as `null` (`type: ["<T>", "null"]`). Sending `null` **MUST** clear the field to `null` (or remove an optional unsettable member where the canonical `GET` schema omits it when unset). Explicit `null` is valid **only** on fields whose canonical representation allows `null`; sending `null` for a non-nullable field **MUST** be rejected with `400 Bad Request`.
   - **Non-null value**: Set or replace the field with the supplied value.
 - **Nested objects, arrays, and maps**:
-  - Plain nested objects (fixed-schema sub-objects such as `notifications` or `settings`) **MUST** merge recursively under the same three-state rules so omitting a sibling nested field leaves that sibling unchanged.
-  - Arrays **MUST** replace wholesale—supplying an array replaces the entire stored list rather than appending or element-diffing.
-  - Arbitrary key-value maps (open dictionaries with dynamic keys such as `labels` or `metadata`) **MUST** replace wholesale unless an endpoint explicitly documents per-key merge semantics.
+  - Plain nested objects (fixed-schema sub-objects such as `notifications` or `settings`) **MUST** merge recursively under the same three-state rules per RFC 7396, so omitting a sibling nested field leaves that sibling unchanged.
+  - Arrays **MUST** replace wholesale per RFC 7396—supplying an array replaces the entire stored list rather than appending or element-diffing.
+  - **Dynamic key-value maps** *(Photon profile deviation from raw RFC 7396 §2)*: Unlike raw RFC 7396 (which recursively merges all JSON objects and requires per-key `null` tombstones to remove entries), arbitrary key-value maps (`additionalProperties` dictionaries such as `labels` or `metadata`) **MUST** replace wholesale unless an endpoint explicitly documents per-key RFC 7396 `null`-deletion merge semantics.
 - **Atomicity**: Every `PATCH` request **MUST** execute atomically (all-or-nothing). If any field fails schema validation, authorization, or a domain invariant, the server **MUST** return an error without committing a partial subset of changes.
 - **Wire contract constraints**:
   - `PATCH` request schemas **MUST NOT** declare top-level `required` properties, except an explicit `discriminator.propertyName` on a polymorphic `oneOf` or `anyOf` union schema. Every mutable field **MUST** be optional so callers can update any subset.

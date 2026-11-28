@@ -11,6 +11,7 @@ import {
 } from "../../src/openapi-utils.js";
 import {
   areComponentRefsSame,
+  COMPAT_VARIANT_OPTIONS,
   checkPatchObjectVariantConstraints,
   checkResponseCompatibleWithCanonical,
   checkVariantAgainstCanonicalVariants,
@@ -149,7 +150,12 @@ function extractCanonicalGetSchemas(
       ["200", "2XX"],
     );
     for (const entry of schemas) {
-      const collected = collectFlattenedObjectVariants(entry.schema, resolve, entry.schemaLocation);
+      const collected = collectFlattenedObjectVariants(
+        entry.schema,
+        resolve,
+        entry.schemaLocation,
+        COMPAT_VARIANT_OPTIONS,
+      );
       const nonNull = collected.variants.filter((v) => !isStrictlyNullConstraint(v.typeConstraint));
       results.push({
         pathTemplate: candidate.entry.pathTemplate,
@@ -245,11 +251,17 @@ function resolveHoistedCanonicalsViaCollectionGet(
   );
   const matched = new Set<CanonicalGetSchemaInfo>();
   for (const gs of getSchemas) {
-    const collected = collectFlattenedObjectVariants(gs.schema, resolve, gs.schemaLocation);
+    const collected = collectFlattenedObjectVariants(
+      gs.schema,
+      resolve,
+      gs.schemaLocation,
+      COMPAT_VARIANT_OPTIONS,
+    );
     for (const variant of collected.variants) {
       const info = extractCollectionInfo(variant, resolve, {
         requireScalarId: false,
         allowNonObjectMetadata: false,
+        variantOptions: COMPAT_VARIANT_OPTIONS,
       });
       if (!info) {
         continue;
@@ -371,6 +383,7 @@ function pairCanonicalsByOperationResponses(
         rs.schema,
         resolve,
         rs.schemaLocation,
+        COMPAT_VARIANT_OPTIONS,
       ).variants.filter((v) => !isStrictlyNullConstraint(v.typeConstraint));
       return schemaPairsWithCanonicalGet(rs.schema, rs.schemaLocation, rv, canon, resolve);
     }),
@@ -463,6 +476,7 @@ export const ads0007ResponseRepresentationConsistency: RedoclyOas3Rule = createR
           resp.schema,
           ctx.resolve,
           resp.schemaLocation,
+          COMPAT_VARIANT_OPTIONS,
         );
         const respNonNull = respCollected.variants.filter(
           (v) => !isStrictlyNullConstraint(v.typeConstraint),
@@ -627,7 +641,12 @@ export const ads0007CollectionSliceSubset: RedoclyOas3Rule = createRootRule(
           continue;
         }
 
-        const collected = collectFlattenedObjectVariants(gs.schema, ctx.resolve, gs.schemaLocation);
+        const collected = collectFlattenedObjectVariants(
+          gs.schema,
+          ctx.resolve,
+          gs.schemaLocation,
+          COMPAT_VARIANT_OPTIONS,
+        );
         for (const variant of collected.variants) {
           if (isSchemaOrVariantIgnored(ignoreMatcher, pathTemplate, "get", variant, topRef?.name)) {
             continue;
@@ -635,6 +654,7 @@ export const ads0007CollectionSliceSubset: RedoclyOas3Rule = createRootRule(
           const info = extractCollectionInfo(variant, ctx.resolve, {
             requireScalarId: false,
             allowNonObjectMetadata: colGets.isDirect,
+            variantOptions: COMPAT_VARIANT_OPTIONS,
           });
           if (!info) {
             continue;
@@ -754,6 +774,7 @@ export const ads0007MutationInputSymmetry: RedoclyOas3Rule = createRootRule(
           ctx.resolve,
           ignoreMatcher,
           topRef?.name,
+          COMPAT_VARIANT_OPTIONS,
         ).variants;
         for (const variant of activeVariants) {
           const bestFailure = findBestCanonicalVariantFailure(variant, canonicals, ctx.resolve, {
@@ -1141,11 +1162,13 @@ function analyzeResourceAnnotations(
           entry.schemaNode,
           ctx.resolve,
           entry.schemaLocation,
+          COMPAT_VARIANT_OPTIONS,
         ).variants.filter((v) => v.typeConstraint.allowed.has("object"));
         const cVariants = collectFlattenedObjectVariants(
           canonicalTarget.node,
           ctx.resolve,
           canonicalLocation,
+          COMPAT_VARIANT_OPTIONS,
         ).variants.filter((v) => v.typeConstraint.allowed.has("object"));
 
         for (const inputName of nonResourceInputs) {
@@ -1227,11 +1250,13 @@ export const ads0007DerivedSchemaCompatibility: RedoclyOas3Rule = createRootRule
         entry.schemaNode,
         ctx.resolve,
         entry.schemaLocation,
+        COMPAT_VARIANT_OPTIONS,
       );
       const cCollected = collectFlattenedObjectVariants(
         canonicalNode,
         ctx.resolve,
         canonicalLocation,
+        COMPAT_VARIANT_OPTIONS,
       );
 
       if (dCollected.truncated || cCollected.truncated) {

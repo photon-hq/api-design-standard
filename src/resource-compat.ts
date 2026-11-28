@@ -31,10 +31,12 @@ import {
   type UnknownRecord,
 } from "./schema-utils.js";
 import {
+  buildFlattenedVariantSignature,
   collectFlattenedObjectVariants,
   collectFragmentsObjectVariants,
   dedupeFlattenedVariants,
   type FlattenedObjectVariant,
+  type FlattenedVariantOptions,
   schemaNodeIdentity,
 } from "./schema-variants.js";
 import type { RedoclyLocation, RedoclyUserContext } from "./types.js";
@@ -43,6 +45,11 @@ const FULL_PARAM_SEGMENT_RE = /^\{([^}]+)\}$/;
 const LEADING_VERSION_SEGMENT_RE = /^v[0-9]+$/;
 
 export const MAX_COMPAT_DEPTH = 6;
+
+export const COMPAT_VARIANT_OPTIONS: FlattenedVariantOptions = {
+  variantSignature: (variant, resolve) =>
+    buildFlattenedVariantSignature(variant, resolve, { preserveNestedObjects: true }),
+};
 
 export const SECRET_OR_TOKEN_PROP_RE = /^(?:secret|token|[a-z][a-zA-Z0-9]*(?:Secret|Token))$/;
 
@@ -659,10 +666,12 @@ export function extractCollectionInfo(
   options?: {
     readonly requireScalarId?: boolean;
     readonly allowNonObjectMetadata?: boolean;
+    readonly variantOptions?: FlattenedVariantOptions;
   },
 ): AddressableCollectionInfo | null {
   const requireScalarId = options?.requireScalarId ?? true;
   const allowNonObjectMetadata = options?.allowNonObjectMetadata ?? false;
+  const variantOptions = options?.variantOptions;
 
   if (
     !variant.typeConstraint.allowed.has("object") ||
@@ -692,7 +701,7 @@ export function extractCollectionInfo(
       const collectedVariants: FlattenedObjectVariant[] = [];
       let truncated = false;
       for (const branch of itemBranches) {
-        const res = collectFragmentsObjectVariants(branch, resolve);
+        const res = collectFragmentsObjectVariants(branch, resolve, variantOptions);
         if (res.truncated) {
           truncated = true;
         }
@@ -1254,15 +1263,19 @@ export function compareFragmentsAgainstTargets(
       const sourceObjVariants = collectFragmentsObjectVariants(
         sourceFragments,
         resolve,
+        COMPAT_VARIANT_OPTIONS,
       ).variants.filter(
         (v) =>
           v.typeConstraint.allowed.has("object") &&
           !isStrictlyNullConstraint(v.typeConstraint) &&
-          v.properties.size > 0,
+          (v.properties.size > 0 ||
+            v.additionalPropertiesSchemas.length > 0 ||
+            v.openAdditionalProperties),
       );
       const targetObjVariants: FlattenedObjectVariant[] = [];
       for (const tf of targetFragmentsList) {
-        for (const tv of collectFragmentsObjectVariants(tf, resolve).variants) {
+        for (const tv of collectFragmentsObjectVariants(tf, resolve, COMPAT_VARIANT_OPTIONS)
+          .variants) {
           if (
             tv.typeConstraint.allowed.has("object") &&
             !isStrictlyNullConstraint(tv.typeConstraint)
@@ -1272,13 +1285,17 @@ export function compareFragmentsAgainstTargets(
         }
       }
 
-      const hasStructuredTargets = targetObjVariants.some((tv) => tv.properties.size > 0);
-      if (sourceObjVariants.length > 0 && hasStructuredTargets) {
-        const structuredTargets = targetObjVariants.filter((tv) => tv.properties.size > 0);
+      const constrainedTargets = targetObjVariants.filter(
+        (tv) =>
+          tv.properties.size > 0 ||
+          tv.additionalPropertiesSchemas.length > 0 ||
+          tv.forbidsAdditionalProperties,
+      );
+      if (sourceObjVariants.length > 0 && constrainedTargets.length > 0) {
         for (const sv of sourceObjVariants) {
           const nestedMismatches = checkVariantAgainstCanonicalVariants(
             sv,
-            structuredTargets,
+            constrainedTargets,
             resolve,
             {
               pathPrefix: options.path,
@@ -1430,6 +1447,61 @@ function evaluateKeysAgainstCanonicals(
   return mismatches;
 }
 
+function compareAdditionalPropertiesAgainstCanonicals(
+  sourceVariant: FlattenedObjectVariant,
+  canonicals: readonly FlattenedObjectVariant[],
+  resolve: ResolverFn,
+  options: VariantSubsetOptions,
+): SchemaMismatch | null {
+  if (
+    sourceVariant.additionalPropertiesSchemas.length === 0 &&
+    !sourceVariant.openAdditionalProperties
+  ) {
+    return null;
+  }
+  const allowsAnyTarget = canonicals.some(
+    (cv) =>
+      (cv.openAdditionalProperties && cv.additionalPropertiesSchemas.length === 0) ||
+      (cv.properties.size === 0 &&
+        cv.additionalPropertiesSchemas.length === 0 &&
+        !cv.forbidsAdditionalProperties),
+  );
+  if (allowsAnyTarget) {
+    return null;
+  }
+
+  const pathPrefix = options.pathPrefix ?? "";
+  const depth = options.depth ?? 0;
+  const targetAddPropList = canonicals
+    .filter((cv) => cv.additionalPropertiesSchemas.length > 0)
+    .map((cv) => cv.additionalPropertiesSchemas);
+
+  if (targetAddPropList.length === 0) {
+    if (
+      sourceVariant.additionalPropertiesSchemas.length > 0 &&
+      canonicals.every((cv) => cv.forbidsAdditionalProperties)
+    ) {
+      return {
+        path: joinFieldPath(pathPrefix, "*"),
+        reason: "allows additional properties while the canonical schema forbids them",
+      };
+    }
+    return null;
+  }
+
+  const sourceAddPropFragments: readonly SchemaFragment[] =
+    sourceVariant.additionalPropertiesSchemas.length > 0
+      ? sourceVariant.additionalPropertiesSchemas
+      : [{ node: {} }];
+
+  return compareFragmentsAgainstTargets(sourceAddPropFragments, targetAddPropList, resolve, {
+    path: joinFieldPath(pathPrefix, "*"),
+    forbidReadOnly: options.forbidReadOnly === true,
+    depth: depth + 1,
+    ...(options.seenPairs ? { seenPairs: options.seenPairs } : {}),
+  });
+}
+
 export function checkVariantAgainstCanonicalVariants(
   sourceVariant: FlattenedObjectVariant,
   canonicalVariants: readonly FlattenedObjectVariant[],
@@ -1448,13 +1520,20 @@ export function checkVariantAgainstCanonicalVariants(
     .sort((a, b) => a.localeCompare(b, "en"));
 
   if (options.onlyOverlapping) {
-    return evaluateKeysAgainstCanonicals(
+    const propMismatches = evaluateKeysAgainstCanonicals(
       sourceVariant,
       keysToCheck,
       objCanonicals,
       resolve,
       options,
     );
+    const addPropMismatch = compareAdditionalPropertiesAgainstCanonicals(
+      sourceVariant,
+      objCanonicals,
+      resolve,
+      options,
+    );
+    return addPropMismatch ? [...propMismatches, addPropMismatch] : propMismatches;
   }
 
   const depth = options.depth ?? 0;
@@ -1501,7 +1580,13 @@ export function checkVariantAgainstCanonicalVariants(
               options,
             )
           : [];
-      return [...missing, ...presentMismatches];
+      const addPropMismatch = compareAdditionalPropertiesAgainstCanonicals(
+        sourceVariant,
+        objCanonicals,
+        resolve,
+        options,
+      );
+      return [...missing, ...presentMismatches, ...(addPropMismatch ? [addPropMismatch] : [])];
     }
     return [
       {
@@ -1521,18 +1606,31 @@ export function checkVariantAgainstCanonicalVariants(
       resolve,
       options,
     );
-    if (singleMismatches.length === 0) {
+    const singleAddPropMismatch =
+      singleMismatches.length === 0
+        ? compareAdditionalPropertiesAgainstCanonicals(sourceVariant, [cv], resolve, options)
+        : null;
+    if (singleMismatches.length === 0 && !singleAddPropMismatch) {
       return [];
     }
   }
 
-  return evaluateKeysAgainstCanonicals(
+  const unionPropMismatches = evaluateKeysAgainstCanonicals(
     sourceVariant,
     keysToCheck,
     coveringCanonicals,
     resolve,
     options,
   );
+  const unionAddPropMismatch = compareAdditionalPropertiesAgainstCanonicals(
+    sourceVariant,
+    coveringCanonicals,
+    resolve,
+    options,
+  );
+  return unionAddPropMismatch
+    ? [...unionPropMismatches, unionAddPropMismatch]
+    : unionPropMismatches;
 }
 
 function extractTwoKeyCreationReceiptResource(
@@ -1576,7 +1674,11 @@ function extractTwoKeyCreationReceiptResource(
     if (!resTypes.has("object") || resTypes.has("null")) {
       continue;
     }
-    const resVariants = collectFragmentsObjectVariants(resProp.fragments, resolve).variants.filter(
+    const resVariants = collectFragmentsObjectVariants(
+      resProp.fragments,
+      resolve,
+      COMPAT_VARIANT_OPTIONS,
+    ).variants.filter(
       (v) =>
         v.typeConstraint.allowed.has("object") &&
         !isStrictlyNullConstraint(v.typeConstraint) &&
@@ -1631,35 +1733,55 @@ function checkResponseVariantAgainstCanonicals(
     return subsetMismatches;
   }
 
-  // Ensure the response variant includes the required properties of at least one matching canonical variant.
+  // Ensure the response variant guarantees every required property of at least one matching canonical variant.
   const nonSecretKeys = [...mv.properties.keys()].filter((k) => !secretExtraKeys.has(k));
   const candidateCanonicals = canonObjVariants.filter((cv) =>
-    nonSecretKeys.every((key) => cv.properties.has(key)),
+    nonSecretKeys.every((key) => canonicalPropertyTargetForKey(cv, key, 0) !== null),
   );
   const targetsToCheck = candidateCanonicals.length > 0 ? candidateCanonicals : canonObjVariants;
 
-  let fewestMissing: string[] | null = null;
+  let bestGap: { readonly missing: string[]; readonly optionalized: string[] } | null = null;
   for (const cv of targetsToCheck) {
-    const requiredKeys = cv.required.size > 0 ? [...cv.required] : [...cv.properties.keys()];
-    const missing = requiredKeys
-      .filter((reqKey) => !mv.properties.has(reqKey))
-      .sort((a, b) => a.localeCompare(b, "en"));
-    if (missing.length === 0) {
+    const requiredKeys = [...cv.required];
+    const missing: string[] = [];
+    const optionalized: string[] = [];
+    for (const reqKey of requiredKeys) {
+      if (!mv.properties.has(reqKey)) {
+        missing.push(reqKey);
+      } else if (!mv.required.has(reqKey)) {
+        optionalized.push(reqKey);
+      }
+    }
+    if (missing.length === 0 && optionalized.length === 0) {
       return [];
     }
-    if (fewestMissing === null || missing.length < fewestMissing.length) {
-      fewestMissing = missing;
+    missing.sort((a, b) => a.localeCompare(b, "en"));
+    optionalized.sort((a, b) => a.localeCompare(b, "en"));
+    const total = missing.length + optionalized.length;
+    if (bestGap === null || total < bestGap.missing.length + bestGap.optionalized.length) {
+      bestGap = { missing, optionalized };
     }
   }
 
-  if (fewestMissing && fewestMissing.length > 0) {
-    const formatted = fewestMissing.map((k) => `"${joinFieldPath(pathPrefix, k)}"`).join(", ");
-    return [
-      {
+  if (bestGap) {
+    const gaps: SchemaMismatch[] = [];
+    if (bestGap.missing.length > 0) {
+      const formatted = bestGap.missing.map((k) => `"${joinFieldPath(pathPrefix, k)}"`).join(", ");
+      gaps.push({
         path: pathPrefix || "(root)",
         reason: `omits canonical required properties ${formatted}`,
-      },
-    ];
+      });
+    }
+    if (bestGap.optionalized.length > 0) {
+      const formatted = bestGap.optionalized
+        .map((k) => `"${joinFieldPath(pathPrefix, k)}"`)
+        .join(", ");
+      gaps.push({
+        path: pathPrefix || "(root)",
+        reason: `makes canonical required properties ${formatted} optional`,
+      });
+    }
+    return gaps;
   }
 
   return [];
@@ -1690,11 +1812,17 @@ export function checkResponseCompatibleWithCanonical(
     return { mismatches: [], truncated: false };
   }
 
-  const respCollected = collectFlattenedObjectVariants(responseSchema, resolve, responseLocation);
+  const respCollected = collectFlattenedObjectVariants(
+    responseSchema,
+    resolve,
+    responseLocation,
+    COMPAT_VARIANT_OPTIONS,
+  );
   const canonCollected = collectFlattenedObjectVariants(
     canonicalSchema,
     resolve,
     canonicalLocation,
+    COMPAT_VARIANT_OPTIONS,
   );
   const truncated = respCollected.truncated || canonCollected.truncated;
 
@@ -1750,8 +1878,9 @@ export function collectActiveObjectVariants(
   resolve: ResolverFn,
   ignoreMatcher: RuleIgnoreMatcher,
   topRefName?: string,
+  options?: FlattenedVariantOptions,
 ): { readonly variants: readonly FlattenedObjectVariant[]; readonly truncated: boolean } {
-  const collected = collectFlattenedObjectVariants(schema, resolve, schemaLocation);
+  const collected = collectFlattenedObjectVariants(schema, resolve, schemaLocation, options);
   const active: FlattenedObjectVariant[] = [];
   for (const variant of collected.variants) {
     if (

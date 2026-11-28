@@ -3477,6 +3477,53 @@ describe("ADS-0005 Redocly CLI end-to-end linting", () => {
             responses: { "200": okProject },
           },
         },
+        "/v1/projects/{projectId}/scalar-patch": {
+          parameters: [pathParam("projectId")],
+          get: { operationId: "getScalarPatch", summary: "Get", responses: { "200": okProject } },
+          patch: {
+            operationId: "patchWithScalarBody",
+            summary: "Scalar string PATCH body",
+            requestBody: {
+              required: true,
+              content: {
+                "application/json": {
+                  schema: { type: "string" },
+                },
+              },
+            },
+            responses: { "200": okProject },
+          },
+        },
+        "/v1/projects/{projectId}/union-scalar-patch": {
+          parameters: [pathParam("projectId")],
+          get: {
+            operationId: "getUnionScalarPatch",
+            summary: "Get",
+            responses: { "200": okProject },
+          },
+          patch: {
+            operationId: "patchWithUnionScalarBody",
+            summary: "Union allowing object or null",
+            requestBody: {
+              required: true,
+              content: {
+                "application/json": {
+                  schema: {
+                    oneOf: [
+                      {
+                        type: "object",
+                        additionalProperties: false,
+                        properties: { name: { type: "string" } },
+                      },
+                      { type: "null" },
+                    ],
+                  },
+                },
+              },
+            },
+            responses: { "200": okProject },
+          },
+        },
         "/v1/projects/{projectId}/discriminated-extra-req": {
           parameters: [pathParam("projectId")],
           get: { operationId: "getDisc", summary: "Get", responses: { "200": okProject } },
@@ -3527,6 +3574,18 @@ describe("ADS-0005 Redocly CLI end-to-end linting", () => {
     ).toBe(true);
     expect(messages.some((m) => m.includes("without forbidding unknown fields"))).toBe(true);
     expect(messages.some((m) => m.includes("accepts a top-level JSON array"))).toBe(true);
+    expect(
+      messages.some((m) =>
+        m.includes('/scalar-patch" (application/json) allows non-object top-level type "string"'),
+      ),
+    ).toBe(true);
+    expect(
+      messages.some((m) =>
+        m.includes(
+          '/union-scalar-patch" (application/json) allows non-object top-level type "null"',
+        ),
+      ),
+    ).toBe(true);
     expect(
       messages.some((m) => m.includes('declares required top-level properties ("senderId")')),
     ).toBe(true);

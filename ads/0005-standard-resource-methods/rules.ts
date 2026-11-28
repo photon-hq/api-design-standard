@@ -41,6 +41,7 @@ import {
 } from "../../src/resource-compat.js";
 import {
   ALL_JSON_TYPE_SET,
+  formatTypeSummary,
   isRecord,
   isStrictlyNullConstraint,
   isTrackedPropertyDeprecated,
@@ -842,7 +843,7 @@ export const ads0005PatchMergeSemantics: RedoclyOas3Rule = createRootRule(
           continue;
         }
 
-        // 1b. Reject top-level JSON Patch array schemas
+        // 1b. Reject non-object top-level JSON schemas (RFC 6902 patch arrays and scalars/null)
         const topTypes = effectiveFragmentsTypeSet(
           [
             {
@@ -855,12 +856,22 @@ export const ads0005PatchMergeSemantics: RedoclyOas3Rule = createRootRule(
           ],
           ctx.resolve,
         );
-        if (topTypes.size < ALL_JSON_TYPE_SET.size && topTypes.has("array")) {
-          report(
-            `patch-top-level-array:${mediaEntry.mediaType}`,
-            schemaReportLoc,
-            `PATCH "${pathTemplate}" (${mediaEntry.mediaType}) accepts a top-level JSON array. Partial updates must use a JSON Merge Patch object (RFC 7396) rather than a patch-operation array (ADS-0005).`,
-          );
+        if (topTypes.size < ALL_JSON_TYPE_SET.size) {
+          if (topTypes.has("array")) {
+            report(
+              `patch-top-level-array:${mediaEntry.mediaType}`,
+              schemaReportLoc,
+              `PATCH "${pathTemplate}" (${mediaEntry.mediaType}) accepts a top-level JSON array. Partial updates must use a JSON Merge Patch object (RFC 7396) rather than a patch-operation array (ADS-0005).`,
+            );
+          }
+          const nonObjectScalars = [...topTypes].filter((t) => t !== "object" && t !== "array");
+          if (nonObjectScalars.length > 0) {
+            report(
+              `patch-top-level-non-object:${mediaEntry.mediaType}`,
+              schemaReportLoc,
+              `PATCH "${pathTemplate}" (${mediaEntry.mediaType}) allows non-object top-level type "${formatTypeSummary(new Set(nonObjectScalars))}". Partial updates must accept a JSON object body (ADS-0005).`,
+            );
+          }
         }
 
         const collected = collectActiveObjectVariants(

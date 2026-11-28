@@ -275,5 +275,65 @@ describe("shared resource compatibility helpers", () => {
       },
     );
     expect(driftedResult.mismatches.length).toBeGreaterThan(0);
+
+    // Optionalizing canonical required properties must be rejected
+    const optionalizedResp = {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        name: { type: "string" },
+      },
+    };
+    const optResult = checkResponseCompatibleWithCanonical(
+      optionalizedResp,
+      loc,
+      apiKeySchema,
+      loc,
+      resolve,
+      { allowCreationSecret: false, allowCreationReceiptEnvelope: false },
+    );
+    expect(optResult.mismatches.some((m) => m.reason.includes("optional"))).toBe(true);
+
+    // Canonical with no required properties must allow valid narrower responses
+    const allOptionalCanon = {
+      type: "object",
+      properties: {
+        a: { type: "string" },
+        b: { type: "string" },
+      },
+    };
+    const narrowerResp = {
+      type: "object",
+      properties: { a: { type: "string" } },
+    };
+    expect(
+      checkResponseCompatibleWithCanonical(narrowerResp, loc, allOptionalCanon, loc, resolve, {
+        allowCreationSecret: false,
+        allowCreationReceiptEnvelope: false,
+      }).mismatches,
+    ).toEqual([]);
+
+    // Dictionary value types (property-free additionalProperties) are recursively checked
+    const stringMapCanon = {
+      type: "object",
+      properties: {
+        labels: { type: "object", additionalProperties: { type: "string" } },
+      },
+    };
+    const intMapSource = {
+      type: "object",
+      properties: {
+        labels: { type: "object", additionalProperties: { type: "integer" } },
+      },
+    };
+    const mapMismatches = checkResponseCompatibleWithCanonical(
+      intMapSource,
+      loc,
+      stringMapCanon,
+      loc,
+      resolve,
+      { allowCreationSecret: false, allowCreationReceiptEnvelope: false },
+    ).mismatches;
+    expect(mapMismatches.some((m) => m.path === "labels.*")).toBe(true);
   });
 });

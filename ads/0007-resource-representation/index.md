@@ -48,7 +48,7 @@ Every addressable resource and singleton **MUST** have a single authoritative **
 
 Long-running operations (defined in `ADS-0004`) **MUST** be modeled as a canonical resource scoped to the owning service or domain (for example `projects.operation` or `billing.operation`), not as a single shared cross-service union across all domains.
 
-- Each service's `Operation` canonical schema **MUST** satisfy the universal `ADS-0004` contract (`id`, `done`, `createdAt`, `updatedAt`, and terminal `result` or `error`), while specializing `metadata` and `result` strictly to the operation types that service owns.
+- Each service's `Operation` canonical schema **MUST** satisfy the universal `ADS-0004` contract (`id`, `type`, `status`, `createdAt`, `updatedAt`, `completedAt`, `response`, and `error`, plus optional `cancellable`, `nextAction`, and `metadata` with all `ADS-0004` status-specific invariants), while specializing `type`, `response`, `nextAction`, and `metadata` strictly to the operation types that service owns.
 - Scoping the canonical `Operation` resource per service keeps generated SDK unions small, prevents unrelated services from coupling their release cycles, and gives each service's `GET .../operations/{operationId}` endpoint a clean canonical schema `C`.
 - Asynchronous mutations returning `202 Accepted` return the owning service's canonical `Operation` resource rather than the target domain resource.
 
@@ -221,26 +221,29 @@ components:
 
 ### Per-service `Operation` canonical resource
 
-**Good** — each service declares its own canonical `Operation` schema (`billing.operation`) on its operations route while reusing the `ADS-0004` operation contract:
+**Good** — each service declares its own canonical `Operation` schema (`billing.operation`) on its operations route while preserving the `ADS-0004` status invariants and field names (`id`, `type`, `status`, `createdAt`, `updatedAt`, `completedAt`, `response`, `error`):
 
 ```yaml
 components:
   schemas:
-    BillingOperation:
-      x-photon-resource:
-        type: billing.operation
+    BillingOperationBase:
       type: object
       required:
         - id
-        - done
+        - type
+        - status
         - createdAt
         - updatedAt
+        - completedAt
+        - response
+        - error
       properties:
         id:
           type: string
           readOnly: true
-        done:
-          type: boolean
+        type:
+          type: string
+          const: billing.checkout
           readOnly: true
         createdAt:
           type: string
@@ -250,11 +253,44 @@ components:
           type: string
           format: date-time
           readOnly: true
-        result:
-          type: object
-          properties:
-            invoiceId:
-              type: string
+    BillingOperation:
+      x-photon-resource:
+        type: billing.operation
+      oneOf:
+        - allOf:
+            - $ref: "#/components/schemas/BillingOperationBase"
+            - type: object
+              properties:
+                status:
+                  type: string
+                  enum:
+                    - pending
+                    - running
+                completedAt:
+                  type: "null"
+                response:
+                  type: "null"
+                error:
+                  type: "null"
+        - allOf:
+            - $ref: "#/components/schemas/BillingOperationBase"
+            - type: object
+              properties:
+                status:
+                  type: string
+                  const: succeeded
+                completedAt:
+                  type: string
+                  format: date-time
+                response:
+                  type: object
+                  required:
+                    - invoiceId
+                  properties:
+                    invoiceId:
+                      type: string
+                error:
+                  type: "null"
 ```
 
 ### Non-conformant patterns

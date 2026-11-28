@@ -336,16 +336,18 @@ export function schemaNodeIdentity(node: unknown): string {
   return `${typeof node}:${String(node)}`;
 }
 
-export function defaultFlattenedVariantSignature(
+export function buildFlattenedVariantSignature(
   variant: FlattenedObjectVariant,
   resolve: ResolverFn,
+  options?: { readonly preserveNestedObjects?: boolean },
 ): string {
   const types = formatAllowedTypes(variant.typeConstraint.allowed, ",");
+  const preserveObjects = options?.preserveNestedObjects === true;
   const propEntries = [...variant.properties.keys()].sort().map((key) => {
     const prop = variant.properties.get(key);
     const tc = prop ? propertyTypeConstraint(prop, resolve) : UNCONSTRAINED_TYPE_CONSTRAINT;
     const pTypes = formatAllowedTypes(tc.allowed, ",");
-    if (prop && tc.allowed.has("array")) {
+    if (prop && (tc.allowed.has("array") || (preserveObjects && tc.allowed.has("object")))) {
       const fragIds = prop.fragments
         .map((frag) => (frag.location ? locationKey(frag.location) : schemaNodeIdentity(frag.node)))
         .sort();
@@ -355,15 +357,29 @@ export function defaultFlattenedVariantSignature(
   });
   const reqKeys = [...variant.required].sort();
   const discKeys = [...variant.discriminatorProperties].sort();
+  const addPropIds = preserveObjects
+    ? variant.additionalPropertiesSchemas
+        .map((frag) => (frag.location ? locationKey(frag.location) : schemaNodeIdentity(frag.node)))
+        .sort()
+    : [];
   return JSON.stringify([
     types,
     variant.isObjectLike ? 1 : 0,
+    variant.openAdditionalProperties ? 1 : 0,
     variant.hasSchemaAdditionalProperties ? 1 : 0,
     variant.forbidsAdditionalProperties ? 1 : 0,
     propEntries,
     reqKeys,
     discKeys,
+    ...(preserveObjects ? [addPropIds] : []),
   ]);
+}
+
+export function defaultFlattenedVariantSignature(
+  variant: FlattenedObjectVariant,
+  resolve: ResolverFn,
+): string {
+  return buildFlattenedVariantSignature(variant, resolve);
 }
 
 export interface FlattenedVariantOptions {

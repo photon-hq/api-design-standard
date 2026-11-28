@@ -434,16 +434,30 @@ describe("ADS-0007 Redocly rules", () => {
           BillingOperation: {
             "x-photon-resource": { type: "billing.operation" },
             type: "object",
-            required: ["id", "type", "status", "createdAt", "updatedAt"],
+            required: [
+              "id",
+              "type",
+              "status",
+              "createdAt",
+              "updatedAt",
+              "completedAt",
+              "response",
+              "error",
+            ],
             properties: {
               id: { type: "string", readOnly: true },
               type: { type: "string", const: "billing.checkout" },
               status: { type: "string", enum: ["pending", "succeeded", "failed"] },
               createdAt: { type: "string", format: "date-time", readOnly: true },
               updatedAt: { type: "string", format: "date-time", readOnly: true },
-              result: {
+              completedAt: { type: ["string", "null"], format: "date-time", readOnly: true },
+              response: {
                 type: ["object", "null"],
                 properties: { invoiceId: { type: "string" } },
+              },
+              error: {
+                type: ["object", "null"],
+                properties: { title: { type: "string" } },
               },
             },
           },
@@ -457,6 +471,51 @@ describe("ADS-0007 Redocly rules", () => {
             properties: {
               id: { type: "string", readOnly: true },
               status: { type: "string", enum: ["pending", "succeeded", "failed"] },
+            },
+          },
+          NestedUnionCanonical: {
+            "x-photon-resource": { type: "events.nested-union" },
+            anyOf: [
+              {
+                type: "object",
+                required: ["id", "payload"],
+                properties: {
+                  id: { type: "string", readOnly: true },
+                  payload: {
+                    type: "object",
+                    required: ["value"],
+                    properties: { value: { type: "string" } },
+                  },
+                },
+              },
+              {
+                type: "object",
+                required: ["id", "payload"],
+                properties: {
+                  id: { type: "string", readOnly: true },
+                  payload: {
+                    type: "object",
+                    required: ["value"],
+                    properties: { value: { type: "integer" } },
+                  },
+                },
+              },
+            ],
+          },
+          NestedUnionIntegerSlice: {
+            "x-photon-resource": {
+              role: "slice",
+              canonical: "#/components/schemas/NestedUnionCanonical",
+            },
+            type: "object",
+            required: ["id", "payload"],
+            properties: {
+              id: { type: "string", readOnly: true },
+              payload: {
+                type: "object",
+                required: ["value"],
+                properties: { value: { type: "integer" } },
+              },
             },
           },
         },
