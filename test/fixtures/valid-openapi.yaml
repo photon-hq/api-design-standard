@@ -591,10 +591,33 @@ components:
       properties:
         id:
           type: string
+          readOnly: true
         createdAt:
           type: string
           format: date-time
+          readOnly: true
     Project:
+      x-photon-resource:
+        type: projects.project
+      allOf:
+        - $ref: "#/components/schemas/BaseResource"
+        - type: object
+          required:
+            - organizationId
+            - name
+          properties:
+            organizationId:
+              type: string
+            name:
+              type: string
+            description:
+              type:
+                - string
+                - "null"
+    ProjectSummary:
+      x-photon-resource:
+        role: slice
+        canonical: "#/components/schemas/Project"
       allOf:
         - $ref: "#/components/schemas/BaseResource"
         - type: object
@@ -607,6 +630,8 @@ components:
             name:
               type: string
     ApiKey:
+      x-photon-resource:
+        type: projects.api-key
       type: object
       required:
         - id
@@ -616,6 +641,7 @@ components:
       properties:
         id:
           type: string
+          readOnly: true
         projectId:
           type: string
         organizationId:
@@ -641,6 +667,9 @@ components:
           items:
             $ref: "#/components/schemas/ApiKey"
     CreateApiKeyRequest:
+      x-photon-resource:
+        role: create
+        canonical: "#/components/schemas/ApiKey"
       type: object
       required:
         - name
@@ -655,12 +684,17 @@ components:
         items:
           type: array
           items:
-            $ref: "#/components/schemas/Project"
+            $ref: "#/components/schemas/ProjectSummary"
         nextPageToken:
           type: string
           minLength: 1
           description: Opaque continuation token for the next page. Omitted on the final page.
     CreateProjectRequest:
+      x-photon-resource:
+        role: create
+        canonical: "#/components/schemas/Project"
+        nonResourceInputs:
+          - templateId
       type: object
       required:
         - organizationId
@@ -670,12 +704,29 @@ components:
           type: string
         name:
           type: string
+        description:
+          type:
+            - string
+            - "null"
+        templateId:
+          type: string
     UpdateProjectRequest:
+      x-photon-resource:
+        role: patch
+        canonical: "#/components/schemas/Project"
       type: object
+      additionalProperties: false
+      minProperties: 1
       properties:
         name:
           type: string
+        description:
+          type:
+            - string
+            - "null"
     Webhook:
+      x-photon-resource:
+        type: webhooks.webhook
       allOf:
         - $ref: "#/components/schemas/BaseResource"
         - type: object
@@ -705,6 +756,9 @@ components:
           minLength: 1
           description: Opaque continuation token for the next page. Omitted on the final page.
     CreateWebhookRequest:
+      x-photon-resource:
+        role: create
+        canonical: "#/components/schemas/Webhook"
       type: object
       required:
         - url
@@ -715,7 +769,12 @@ components:
         enabled:
           type: boolean
     UpdateWebhookRequest:
+      x-photon-resource:
+        role: patch
+        canonical: "#/components/schemas/Webhook"
       type: object
+      additionalProperties: false
+      minProperties: 1
       properties:
         url:
           type: string
@@ -723,6 +782,8 @@ components:
         enabled:
           type: boolean
     AgentProfile:
+      x-photon-resource:
+        type: agents.profile
       type: object
       required:
         - projectId
@@ -737,7 +798,12 @@ components:
             - string
             - "null"
     UpdateAgentProfileRequest:
+      x-photon-resource:
+        role: patch
+        canonical: "#/components/schemas/AgentProfile"
       type: object
+      additionalProperties: false
+      minProperties: 1
       properties:
         displayName:
           type: string
@@ -946,6 +1012,8 @@ components:
             nextAction:
               type: "null"
     PlanChangeOperation:
+      x-photon-resource:
+        type: projects.operation
       oneOf:
         - $ref: "#/components/schemas/ActivePlanChangeOperation"
         - $ref: "#/components/schemas/RequiresActionPlanChangeOperation"

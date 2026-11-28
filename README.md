@@ -11,8 +11,9 @@ Each standard in **Photon API Design Standards (ADS)** defines a service-agnosti
 | [ADS-0001](./ads/0001-resource-identifiers/index.md) | Resource Identifiers and Path Parameter Naming | Approved | `photon-ads/ads-0001-resource-primary-id`, `photon-ads/ads-0001-path-param-naming`, `photon-ads/ads-0001-path-param-consistency` |
 | [ADS-0002](./ads/0002-top-level-json-response/index.md) | Top-Level JSON Response Structure | Approved | `photon-ads/ads-0002-top-level-json-object`, `photon-ads/ads-0002-no-single-resource-wrapper`, `photon-ads/ads-0002-flat-creation-secret` |
 | [ADS-0004](./ads/0004-long-running-operations/index.md) | Long-Running Operations | Approved | `photon-ads/ads-0004-operation-resource-shape`, `photon-ads/ads-0004-operation-status-invariants`, `photon-ads/ads-0004-accepted-operation-headers`, `photon-ads/ads-0004-operation-cancel-method` |
-| [ADS-0005](./ads/0005-standard-resource-methods/index.md) | Standard Resource Methods and Lifecycle | Approved | `photon-ads/ads-0005-addressable-resource-read`, `photon-ads/ads-0005-standard-http-methods`, `photon-ads/ads-0005-standard-status-codes`, `photon-ads/ads-0005-url-path-naming` |
+| [ADS-0005](./ads/0005-standard-resource-methods/index.md) | Standard Resource Methods and Lifecycle | Approved | `photon-ads/ads-0005-addressable-resource-read`, `photon-ads/ads-0005-standard-http-methods`, `photon-ads/ads-0005-standard-status-codes`, `photon-ads/ads-0005-url-path-naming`, `photon-ads/ads-0005-patch-merge-semantics` |
 | [ADS-0006](./ads/0006-list-pagination/index.md) | List Pagination | Approved | `photon-ads/ads-0006-standard-pagination-params`, `photon-ads/ads-0006-page-size-bounds`, `photon-ads/ads-0006-pagination-response-shape` |
+| [ADS-0007](./ads/0007-resource-representation/index.md) | Resource Representation Consistency | Approved | `photon-ads/ads-0007-response-representation-consistency`, `photon-ads/ads-0007-collection-slice-subset`, `photon-ads/ads-0007-mutation-input-symmetry`, `photon-ads/ads-0007-resource-annotation-valid`, `photon-ads/ads-0007-derived-schema-compatibility`, `photon-ads/ads-0007-no-polymorphic-expand` |
 
 ### Status Lifecycle
 
@@ -86,16 +87,23 @@ rules:
   photon-ads/ads-0005-standard-http-methods: error
   photon-ads/ads-0005-standard-status-codes: error
   photon-ads/ads-0005-url-path-naming: error
+  photon-ads/ads-0005-patch-merge-semantics: error
   photon-ads/ads-0006-standard-pagination-params: error
   photon-ads/ads-0006-page-size-bounds: error
   photon-ads/ads-0006-pagination-response-shape: error
+  photon-ads/ads-0007-response-representation-consistency: error
+  photon-ads/ads-0007-collection-slice-subset: error
+  photon-ads/ads-0007-mutation-input-symmetry: error
+  photon-ads/ads-0007-resource-annotation-valid: error
+  photon-ads/ads-0007-derived-schema-compatibility: error
+  photon-ads/ads-0007-no-polymorphic-expand: error
 ```
 
 Each `ignore` entry accepts `path`, `method`, `schema`, and an optional `reason` string:
 
 - `path`: Exact OpenAPI path template (trailing slash trimmed except `/`). Omitting `method` matches all methods (and path-level parameters) on that path.
 - `method`: Case-insensitive HTTP method (`get`, `post`, `patch`, `put`, `delete`, etc.) narrowing a `path` or `schema` match where operation context applies. Component schema diagnostics (under `components.schemas`) have no HTTP method context, so suppressing them requires a schema-only `ignore` entry.
-- `schema`: Component schema name under `components.schemas` (used by `photon-ads/ads-0001-resource-primary-id`, `photon-ads/ads-0004-operation-resource-shape`, `photon-ads/ads-0004-operation-status-invariants`, and `photon-ads/ads-0006-pagination-response-shape`).
+- `schema`: Component schema name under `components.schemas` (used by `photon-ads/ads-0001-resource-primary-id`, `photon-ads/ads-0004-operation-resource-shape`, `photon-ads/ads-0004-operation-status-invariants`, `photon-ads/ads-0005-patch-merge-semantics`, `photon-ads/ads-0006-pagination-response-shape`, and `photon-ads/ads-0007-*`).
 - `reason`: Optional human-readable explanation for reviewers.
 
 Run Redocly against your OpenAPI 3 specification:
@@ -128,6 +136,10 @@ ads/
     rules.ts       # Deterministic Redocly OpenAPI 3 rules
     rules.test.ts  # Unit and end-to-end Redocly CLI tests
   0006-list-pagination/
+    index.md       # Authoritative Markdown specification and rule table
+    rules.ts       # Deterministic Redocly OpenAPI 3 rules
+    rules.test.ts  # Unit and end-to-end Redocly CLI tests
+  0007-resource-representation/
     index.md       # Authoritative Markdown specification and rule table
     rules.ts       # Deterministic Redocly OpenAPI 3 rules
     rules.test.ts  # Unit and end-to-end Redocly CLI tests

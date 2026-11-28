@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   extractOperationJsonResponseSchemas,
+  extractRequestBodyMediaSchemas,
   hasHeaderCaseInsensitive,
   inspectResponseContent,
   resolveOperationParameters,
@@ -12,13 +13,16 @@ import {
   computeMinLength,
   computeTypeConstraint,
   extractComponentSchemaName,
+  formatTypeSummary,
   intersectTypeSets,
   isNonNullIntegerConstraint,
   isNonNullObjectConstraint,
   isNonNullStringConstraint,
   isSchemaDeprecated,
+  isSchemaReadOnly,
   isStrictlyNullConstraint,
   isTrackedPropertyDeprecated,
+  isTrackedPropertyReadOnly,
   jsonTypeOfValue,
   mergeTrackedProperty,
   type ResolverFn,
@@ -628,5 +632,198 @@ describe("shared schema and OpenAPI utilities", () => {
         resolve,
       ),
     ).toBe(true);
+  });
+
+  it("evaluates formatTypeSummary, readOnly annotations, variant flags, and requestBody media schemas", () => {
+    expect(formatTypeSummary(new Set(["string", "null"]))).toBe("string|null");
+    expect(formatTypeSummary(new Set())).toBe("never");
+
+    const readOnlyTarget = { type: "string", readOnly: true };
+    const resolve = makeResolver({
+      "#/components/schemas/ReadOnlyId": {
+        node: readOnlyTarget,
+        pointer: "#/components/schemas/ReadOnlyId",
+      },
+      "#/components/requestBodies/PatchBody": {
+        node: {
+          content: {
+            "application/merge-patch+json": {
+              schema: {
+                type: "object",
+                additionalProperties: false,
+                properties: { name: { type: "string" } },
+              },
+            },
+            "text/plain": { schema: { type: "string" } },
+          },
+        },
+        pointer: "#/components/requestBodies/PatchBody",
+      },
+    });
+
+    expect(isSchemaReadOnly({ $ref: "#/components/schemas/ReadOnlyId" }, resolve)).toBe(true);
+    expect(
+      isSchemaReadOnly({ $ref: "#/components/schemas/ReadOnlyId", readOnly: false }, resolve),
+    ).toBe(false);
+    expect(
+      isTrackedPropertyReadOnly(
+        {
+          name: "id",
+          fragments: [
+            { node: { type: "string" } },
+            { node: { $ref: "#/components/schemas/ReadOnlyId" } },
+          ],
+        },
+        resolve,
+      ),
+    ).toBe(true);
+
+    const media = extractRequestBodyMediaSchemas(
+      { requestBody: { $ref: "#/components/requestBodies/PatchBody" } },
+      makeLocation("#/paths/~1v1~1projects~1{projectId}/patch"),
+      resolve,
+    );
+    expect(media).toHaveLength(2);
+    expect(media[0]?.mediaType).toBe("application/merge-patch+json");
+    expect(media[0]?.isJson).toBe(true);
+    expect(media[0]?.requestBodyFromRef).toBe(true);
+    expect(media[1]?.isJson).toBe(false);
+
+    const variants = collectFlattenedObjectVariants(
+      {
+        oneOf: [
+          {
+            type: "object",
+            additionalProperties: false,
+            required: ["kind"],
+            properties: { kind: { type: "string", const: "a" } },
+          },
+        ],
+        discriminator: { propertyName: "kind" },
+      },
+      resolve,
+    ).variants;
+    expect(variants).toHaveLength(1);
+    expect(variants[0]?.forbidsAdditionalProperties).toBe(true);
+    expect([...(variants[0]?.discriminatorProperties ?? [])]).toEqual(["kind"]);
+
+    // unevaluatedProperties: false does not close an object when additionalProperties: true already evaluates extra keys
+    const openWithUneval = collectFlattenedObjectVariants(
+      {
+        type: "object",
+        properties: { name: { type: "string" } },
+        additionalProperties: true,
+        unevaluatedProperties: false,
+      },
+      resolve,
+    ).variants;
+    expect(openWithUneval[0]?.forbidsAdditionalProperties).toBe(false);
+
+    // Dictionary anyOf branches with distinct additionalProperties value schemas remain distinct
+    const dictUnion = collectFlattenedObjectVariants(
+      {
+        anyOf: [
+          { type: "object", additionalProperties: { type: "string" } },
+          { type: "object", additionalProperties: { type: "integer" } },
+        ],
+      },
+      resolve,
+    ).variants;
+    expect(dictUnion).toHaveLength(2);
+
+    // isSchemaReadOnly detects all-readOnly anyOf/oneOf unions (including shared $ref DAGs) without false-positiving mixed unions
+    const readOnlyStrRef = { type: "string", readOnly: true };
+    const roResolve = makeResolver({
+      "#/components/schemas/RoStr": { node: readOnlyStrRef, pointer: "#/components/schemas/RoStr" },
+    });
+    expect(
+      isSchemaReadOnly(
+        {
+          anyOf: [{ $ref: "#/components/schemas/RoStr" }, { type: "integer", readOnly: true }],
+        },
+        roResolve,
+      ),
+    ).toBe(true);
+    expect(
+      isSchemaReadOnly(
+        {
+          anyOf: [{ $ref: "#/components/schemas/RoStr" }, { $ref: "#/components/schemas/RoStr" }],
+        },
+        roResolve,
+      ),
+    ).toBe(true);
+    expect(
+      isSchemaReadOnly(
+        {
+          anyOf: [{ $ref: "#/components/schemas/RoStr" }, { type: "integer" }],
+        },
+        roResolve,
+      ),
+    ).toBe(false);
+
+    // extractOperationJsonResponseSchemas in all-match mode resolves 201 and 2XX (for 200) independently
+    const putOpLoc = makeLocation("#/paths/~1v1~1items~1{itemId}/put");
+    const putAll = extractOperationJsonResponseSchemas(
+      {
+        responses: {
+          "201": {
+            content: {
+              "application/json": {
+                schema: { type: "object", properties: { a: { type: "string" } } },
+              },
+            },
+          },
+          "2XX": {
+            content: {
+              "application/json": {
+                schema: { type: "object", properties: { b: { type: "string" } } },
+              },
+            },
+          },
+        },
+      },
+      putOpLoc,
+      resolve,
+      ["200", "201", "2XX"],
+      { firstMatchingOnly: false },
+    );
+    expect(putAll.map((e) => e.statusCode)).toEqual(["201", "2XX"]);
+
+    const putBothExplicit = extractOperationJsonResponseSchemas(
+      {
+        responses: {
+          "200": { content: { "application/json": { schema: { type: "object" } } } },
+          "201": { content: { "application/json": { schema: { type: "object" } } } },
+          "2XX": { content: { "application/json": { schema: { type: "object" } } } },
+        },
+      },
+      putOpLoc,
+      resolve,
+      ["200", "201", "2XX"],
+      { firstMatchingOnly: false },
+    );
+    expect(putBothExplicit.map((e) => e.statusCode)).toEqual(["200", "201"]);
+  });
+  it("memoizes boolean annotation lookups across shared acyclic schema DAGs", () => {
+    const resolve: ResolverFn = (() => ({ error: new Error("no refs") })) as unknown as ResolverFn;
+    const visitBudget = 1000;
+    let annotationReads = 0;
+    const countedNode = (fields: Record<string, unknown>): Record<string, unknown> =>
+      Object.defineProperty(fields, "readOnly", {
+        enumerable: false,
+        get() {
+          annotationReads += 1;
+          if (annotationReads > visitBudget) {
+            throw new Error("annotation lookup exceeded visit budget");
+          }
+          return undefined;
+        },
+      });
+    let node = countedNode({ type: "string" });
+    for (let depth = 0; depth < 40; depth += 1) {
+      node = countedNode({ allOf: [node, node] });
+    }
+    expect(isSchemaReadOnly(node, resolve)).toBe(false);
+    expect(annotationReads).toBeLessThanOrEqual(41);
   });
 });

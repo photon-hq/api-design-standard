@@ -1,45 +1,71 @@
-import { HTTP_METHODS } from "../../src/ignore.js";
 import {
   createRootRule,
   EXACT_2XX_STATUS_RE,
   extractOperationJsonResponseSchemas,
-  hasHeaderCaseInsensitive,
+  extractRequestBodyMediaSchemas,
   inspectResponseContent,
   iterateRootPathItems,
-  type ResolvedPathItem,
   resolveOperationParameters,
 } from "../../src/openapi-utils.js";
 import {
+  type AddressableCollectionInfo,
+  type ArrayItemBranch,
+  areSchemasCompatibleForHoistedGet,
+  COMPAT_VARIANT_OPTIONS,
+  checkPatchObjectVariantConstraints,
+  collectActiveObjectVariants,
+  collectIndexedPaths,
+  collectNestedOpenPatchObjectPaths,
+  computeHoistedCollectionCandidates,
+  endsWithPathParam,
+  extractAddressableCollection,
+  extractSingleComponentRef,
+  findMatchingHoistedGets,
+  formatSegments,
+  getReturnsCollectionEnvelope,
+  type HoistedGetCandidate,
+  hasAnyGetOnStructuralKey,
+  hasAnyOperationOnStructuralKey,
+  type IndexedPathEntry,
+  isAddressableResourceVariant,
+  isCustomActionSubRoute,
+  isParamSegment,
+  looksLikeOperationResourceVariant,
+  looksLikePluralSubCollectionSegment,
+  normalizePathTemplate,
+  operationReturnsAddressableResource,
+  QUERY_OR_ACTION_POST_SEGMENTS,
+  splitPathSegments,
+  structuralPathKey,
+  suggestResourceIdParam,
+  wordSet,
+} from "../../src/resource-compat.js";
+import {
+  ALL_JSON_TYPE_SET,
   computeTypeConstraint,
-  extractComponentSchemaName,
-  getRefIntermediateHops,
-  intersectTypeSets,
+  formatTypeSummary,
   isRecord,
   isStrictlyNullConstraint,
-  type JsonSchemaType,
-  localTypeConstraint,
-  locationKey,
   MAX_OBJECT_VARIANTS,
-  propertyTypeConstraint,
   type ResolverFn,
-  type SchemaFragment,
-  safeResolveSchema,
-  type TypeConstraint,
+  selectPropertyReportLocation,
   type UnknownRecord,
 } from "../../src/schema-utils.js";
 import {
   collectFlattenedObjectVariants,
-  collectFragmentsObjectVariants,
-  dedupeFlattenedVariants,
   type FlattenedObjectVariant,
 } from "../../src/schema-variants.js";
-import type {
-  AdsStandardMetadata,
-  RedoclyLocation,
-  RedoclyOas3Rule,
-  RedoclyUserContext,
-} from "../../src/types.js";
+import type { AdsStandardMetadata, RedoclyLocation, RedoclyOas3Rule } from "../../src/types.js";
 import { PLUGIN_ID } from "../0001-resource-identifiers/rules.js";
+
+export {
+  computeHoistedCollectionCandidates,
+  endsWithPathParam,
+  looksLikePluralSubCollectionSegment,
+  normalizePathTemplate,
+  splitPathSegments,
+  suggestResourceIdParam,
+};
 
 export const ADS_0005_METADATA: AdsStandardMetadata = {
   ads: "0005",
@@ -74,45 +100,25 @@ export const ADS_0005_METADATA: AdsStandardMetadata = {
       summary:
         "Static URL path segments (excluding path parameters and leading version prefixes) must use lowercase kebab-case.",
     },
+    {
+      name: "ads-0005-patch-merge-semantics",
+      id: `${PLUGIN_ID}/ads-0005-patch-merge-semantics`,
+      severity: "error",
+      summary:
+        "PATCH operations must use RFC 7396 JSON Merge Patch over JSON without RFC 6902 patch arrays, field/update mask parameters or properties, top-level required properties (outside explicit union discriminators), or open undeclared properties.",
+    },
   ],
 };
 
-const FULL_PARAM_SEGMENT_RE = /^\{([^}]+)\}$/;
 const CUSTOM_METHOD_PARAM_SEGMENT_RE = /^\{([^}]+)\}:(.+)$/;
 const LEADING_VERSION_SEGMENT_RE = /^v[0-9]+$/;
 const KEBAB_CASE_SEGMENT_RE = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/;
+const JSON_PATCH_MEDIA_TYPE_RE = /^application\/json-patch\+json(?:\s*;|$)/i;
 
 const CRUD_VERB_EXACT_RE = /^(create|get|list|update|delete|remove|fetch|edit|add)$/i;
 const CRUD_VERB_DELIMITED_RE = /^(create|get|list|update|delete|remove|fetch|edit|add)[-_]/i;
 const CRUD_VERB_CAMEL_RE =
   /^(create|get|list|update|delete|remove|fetch|edit|add|Create|Get|List|Update|Delete|Remove|Fetch|Edit|Add)(?=[A-Z])/;
-
-function wordSet(words: string): ReadonlySet<string> {
-  return new Set(words.trim().split(/\s+/));
-}
-
-const COLLECTION_METADATA_KEYS = wordSet(`
-  nextPageToken prevPageToken previousPageToken pageToken cursor nextCursor prevCursor
-  previousCursor hasMore hasNextPage hasPreviousPage totalCount total totalItems totalPages
-  count limit offset pageSize perPage page pageInfo pagination meta
-`);
-
-const NON_PLURAL_S_WORDS = wordSet(`
-  as alias bias bus canvas cors dns gas ios is os plus sms this tls yes
-`);
-
-const ACTION_VERB_PREFIXES = wordSet(`
-  abort accept acknowledge activate approve archive assign attach authorize bind
-  cancel check claim clear clone close commit complete confirm deactivate
-  deauthorize decline deploy detach disable disconnect dismiss duplicate enable
-  escalate expire export extend finalize fork import invite leave link lock mark
-  merge migrate mute pause pin preview promote publish purge reconnect redeem
-  refresh refund reissue reject release renew reopen replay reprocess resend reset
-  resolve restart restore resume retry revoke rollback rotate send set share sign
-  split start stop submit subscribe suspend sync terminate test transfer trigger
-  unarchive unassign unbind undeploy unlink unlock unmute unpin unpublish unshare
-  unsubscribe unsuspend validate verify void
-`);
 
 const SAFE_HTTP_METHODS = ["get", "head"] as const;
 
@@ -123,85 +129,12 @@ const SAFE_METHOD_DISALLOWED_ACTION_SEGMENTS = wordSet(`
   install uninstall deploy rollback pause resume verify
 `);
 
-const QUERY_OR_ACTION_POST_SEGMENTS = wordSet(`
-  search query preview validate check verify batch export import count stats
-  summary health status
+const BANNED_PATCH_MASK_NAMES = wordSet(`
+  fieldmask updatemask field_mask update_mask fieldsmask fields_mask
 `);
 
-const DELETE_RECEIPT_META_KEYS = wordSet(`
-  deleted deletedAt object status message
-`);
-
-const PURE_REF_ANNOTATION_KEYS = wordSet(`
-  $ref title description summary default deprecated readOnly writeOnly
-  example examples externalDocs $comment
-`);
-
-const SCALAR_ID_TYPES: ReadonlySet<JsonSchemaType> = new Set(["string", "integer", "number"]);
-
-export function normalizePathTemplate(pathTemplate: string): string {
-  const trimmed = pathTemplate.trim().replace(/\/+$/, "");
-  return trimmed.length === 0 ? "/" : trimmed;
-}
-
-function hasTrailingSlash(pathTemplate: string): boolean {
-  const trimmed = pathTemplate.trim();
-  return trimmed.length > 1 && trimmed.endsWith("/");
-}
-
-export function splitPathSegments(pathTemplate: string): string[] {
-  const normalized = normalizePathTemplate(pathTemplate);
-  if (normalized === "/") {
-    return [];
-  }
-  return normalized
-    .slice(1)
-    .split("/")
-    .filter((segment) => segment.length > 0);
-}
-
-function isParamSegment(segment: string): boolean {
-  return FULL_PARAM_SEGMENT_RE.test(segment);
-}
-
-export function endsWithPathParam(pathTemplate: string): boolean {
-  const segments = splitPathSegments(pathTemplate);
-  const last = segments[segments.length - 1];
-  return last !== undefined && isParamSegment(last);
-}
-
-function structuralPathKey(segments: readonly string[], trailingSlash = false): string {
-  if (segments.length === 0) {
-    return "/";
-  }
-  const base = `/${segments.map((segment) => (isParamSegment(segment) ? "{}" : segment)).join("/")}`;
-  return trailingSlash ? `${base}/` : base;
-}
-
-function formatSegments(segments: readonly string[]): string {
-  return segments.length === 0 ? "/" : `/${segments.join("/")}`;
-}
-
-export function computeHoistedCollectionCandidates(
-  collectionSegments: readonly string[],
-): string[][] {
-  const hasVersionPrefix =
-    collectionSegments.length > 0 && LEADING_VERSION_SEGMENT_RE.test(collectionSegments[0] ?? "");
-  const prefix = hasVersionPrefix ? [collectionSegments[0] as string] : [];
-  const rest = hasVersionPrefix ? collectionSegments.slice(1) : [...collectionSegments];
-
-  const candidates: string[][] = [];
-  let offset = 0;
-  while (offset + 2 < rest.length) {
-    const scopeSeg = rest[offset];
-    const paramSeg = rest[offset + 1];
-    if (!scopeSeg || !paramSeg || isParamSegment(scopeSeg) || !isParamSegment(paramSeg)) {
-      break;
-    }
-    offset += 2;
-    candidates.push([...prefix, ...rest.slice(offset)]);
-  }
-  return candidates;
+export function isBannedPatchMaskName(name: string): boolean {
+  return BANNED_PATCH_MASK_NAMES.has(name.toLowerCase());
 }
 
 export function findCrudVerbInPathSegment(segment: string): string | null {
@@ -253,733 +186,10 @@ export function isValidKebabCasePathSegment(segment: string, index: number): boo
   return KEBAB_CASE_SEGMENT_RE.test(segment);
 }
 
-function isActionVerbSegment(segment: string): boolean {
-  const lower = segment.toLowerCase();
-  if (ACTION_VERB_PREFIXES.has(lower)) {
-    return true;
-  }
-  const first = lower.split("-")[0];
-  return first !== undefined && ACTION_VERB_PREFIXES.has(first);
-}
-
-export function looksLikePluralSubCollectionSegment(segment: string): boolean {
-  const lower = segment.toLowerCase();
-  const parts = lower.split("-").filter((part) => part.length > 0);
-  if (parts.length === 0) {
-    return false;
-  }
-  const first = parts[0];
-  if (parts.length > 1 && first && ACTION_VERB_PREFIXES.has(first)) {
-    return false;
-  }
-  const lastWord = parts[parts.length - 1];
-  if (!lastWord || lastWord.length < 3) {
-    return false;
-  }
-  if (
-    lastWord.endsWith("ss") ||
-    lastWord.endsWith("us") ||
-    lastWord.endsWith("is") ||
-    NON_PLURAL_S_WORDS.has(lastWord)
-  ) {
-    return false;
-  }
-  return lastWord.endsWith("s");
-}
-
-function singularizeWord(word: string): string {
-  const lower = word.toLowerCase();
-  if (lower.length <= 2) {
-    return lower;
-  }
-  if (lower.endsWith("ies") && lower.length > 3) {
-    return `${lower.slice(0, -3)}y`;
-  }
-  if (/(?:ch|sh|x|z|ss)es$/.test(lower) && lower.length > 4) {
-    return lower.slice(0, -2);
-  }
-  if (
-    lower.endsWith("s") &&
-    !lower.endsWith("ss") &&
-    !lower.endsWith("us") &&
-    !lower.endsWith("is") &&
-    !NON_PLURAL_S_WORDS.has(lower)
-  ) {
-    return lower.slice(0, -1);
-  }
-  return lower;
-}
-
-export function suggestResourceIdParam(collectionSegment: string): string {
-  const parts = collectionSegment
-    .toLowerCase()
-    .split(/[^a-z0-9]+/)
-    .filter((part) => part.length > 0);
-  if (parts.length === 0) {
-    return "resourceId";
-  }
-  const singularParts = parts.map((part, index) =>
-    index === parts.length - 1 ? singularizeWord(part) : part,
-  );
-  const stem = singularParts
-    .map((part, index) => (index === 0 ? part : `${part.charAt(0).toUpperCase()}${part.slice(1)}`))
-    .join("");
-  if (!/^[a-z][a-zA-Z0-9]*$/.test(stem)) {
-    return "resourceId";
-  }
-  return stem.endsWith("Id") ? stem : `${stem}Id`;
-}
-
-function isScalarIdTypeConstraint(tc: TypeConstraint): boolean {
-  if (tc.allowed.size === 0) {
-    return false;
-  }
-  let hasScalar = false;
-  for (const t of tc.allowed) {
-    if (t === "null") {
-      continue;
-    }
-    if (!SCALAR_ID_TYPES.has(t)) {
-      return false;
-    }
-    hasScalar = true;
-  }
-  return hasScalar;
-}
-
-type ArrayItemBranch = readonly SchemaFragment[];
-
-function collectArrayItemBranches(
-  fragments: readonly SchemaFragment[],
-  resolve: ResolverFn,
-): ArrayItemBranch[] {
-  const visitNode = (
-    node: unknown,
-    location: RedoclyLocation | undefined,
-    from: string | undefined,
-    seen: ReadonlySet<unknown>,
-  ): ArrayItemBranch[] => {
-    if (node === false) {
-      return [];
-    }
-    if (!isRecord(node) || seen.has(node)) {
-      return [[]];
-    }
-    if (!localTypeConstraint(node).allowed.has("array")) {
-      return [];
-    }
-    const nextSeen = new Set(seen);
-    nextSeen.add(node);
-
-    let branches: ArrayItemBranch[] = [[]];
-
-    const intersectWith = (incoming: ArrayItemBranch[]): void => {
-      if (incoming.length === 0) {
-        branches = [];
-        return;
-      }
-      const next: ArrayItemBranch[] = [];
-      for (const a of branches) {
-        for (const b of incoming) {
-          next.push([...a, ...b]);
-          if (next.length >= MAX_OBJECT_VARIANTS) {
-            branches = next;
-            return;
-          }
-        }
-      }
-      branches = next;
-    };
-
-    if (isRecord(node.items)) {
-      const itemLoc = location?.child(["items"]);
-      intersectWith([
-        [
-          {
-            node: node.items,
-            ...(from !== undefined ? { from } : {}),
-            ...(itemLoc ? { location: itemLoc } : {}),
-          },
-        ],
-      ]);
-    }
-
-    if (branches.length > 0 && typeof node.$ref === "string") {
-      const resolved = safeResolveSchema(resolve, node, from);
-      if (resolved) {
-        if (resolved.node === false) {
-          branches = [];
-        } else if (isRecord(resolved.node)) {
-          intersectWith(
-            visitNode(
-              resolved.node,
-              resolved.location,
-              resolved.location?.source?.absoluteRef,
-              nextSeen,
-            ),
-          );
-        }
-        if (branches.length > 0) {
-          for (const hop of getRefIntermediateHops(node, resolved)) {
-            if (isRecord(hop.node.items)) {
-              const hopFrom = hop.location?.source?.absoluteRef;
-              const hopItemLoc = hop.location?.child(["items"]);
-              intersectWith([
-                [
-                  {
-                    node: hop.node.items,
-                    ...(hopFrom !== undefined ? { from: hopFrom } : {}),
-                    ...(hopItemLoc ? { location: hopItemLoc } : {}),
-                  },
-                ],
-              ]);
-            }
-          }
-        }
-      }
-    }
-
-    if (branches.length > 0 && Array.isArray(node.allOf)) {
-      for (const [index, branch] of node.allOf.entries()) {
-        intersectWith(visitNode(branch, location?.child(["allOf", index]), from, nextSeen));
-        if (branches.length === 0) {
-          break;
-        }
-      }
-    }
-
-    if (branches.length > 0) {
-      for (const unionKey of ["oneOf", "anyOf"] as const) {
-        const unionBranches = node[unionKey];
-        if (!Array.isArray(unionBranches) || unionBranches.length === 0) {
-          continue;
-        }
-        const collected: ArrayItemBranch[] = [];
-        for (const [index, branch] of unionBranches.entries()) {
-          if (!computeTypeConstraint(branch, resolve, from).allowed.has("array")) {
-            continue;
-          }
-          const sub = visitNode(branch, location?.child([unionKey, index]), from, nextSeen);
-          for (const item of sub) {
-            collected.push(item);
-          }
-        }
-        intersectWith(collected);
-        if (branches.length === 0) {
-          break;
-        }
-      }
-    }
-
-    return branches;
-  };
-
-  let combined: ArrayItemBranch[] = [[]];
-  for (const frag of fragments) {
-    const sub = visitNode(frag.node, frag.location, frag.from, new Set());
-    if (sub.length === 0) {
-      return [];
-    }
-    const next: ArrayItemBranch[] = [];
-    for (const a of combined) {
-      for (const b of sub) {
-        next.push([...a, ...b]);
-        if (next.length >= MAX_OBJECT_VARIANTS) {
-          break;
-        }
-      }
-      if (next.length >= MAX_OBJECT_VARIANTS) {
-        break;
-      }
-    }
-    combined = next;
-  }
-
-  return combined.filter((branch) => branch.length > 0);
-}
-
-interface ComponentRefIdentity {
-  readonly name: string;
-  readonly resolvedKey?: string;
-}
-
-function hasSiblingSchemaConstraints(node: UnknownRecord): boolean {
-  for (const key of Object.keys(node)) {
-    if (!PURE_REF_ANNOTATION_KEYS.has(key) && !key.startsWith("x-")) {
-      return true;
-    }
-  }
-  return false;
-}
-
-function extractSingleComponentRef(
-  schema: unknown,
-  resolve: ResolverFn,
-  from: string | undefined,
-  seen: ReadonlySet<unknown> = new Set(),
-): ComponentRefIdentity | null {
-  if (!isRecord(schema) || seen.has(schema)) {
-    return null;
-  }
-  const nextSeen = new Set(seen);
-  nextSeen.add(schema);
-
-  if (typeof schema.$ref === "string") {
-    if (hasSiblingSchemaConstraints(schema)) {
-      return null;
-    }
-    const name = extractComponentSchemaName(schema.$ref);
-    if (!name) {
-      return null;
-    }
-    const resolved = safeResolveSchema(resolve, schema, from);
-    const resolvedKey = resolved?.location ? locationKey(resolved.location) : undefined;
-    return {
-      name,
-      ...(resolvedKey !== undefined ? { resolvedKey } : {}),
-    };
-  }
-
-  if (
-    Array.isArray(schema.allOf) &&
-    schema.allOf.length === 1 &&
-    Object.keys(schema).every(
-      (key) => key === "allOf" || PURE_REF_ANNOTATION_KEYS.has(key) || key.startsWith("x-"),
-    )
-  ) {
-    return extractSingleComponentRef(schema.allOf[0], resolve, from, nextSeen);
-  }
-
-  return null;
-}
-
-function isAddressableResourceVariant(
-  variant: FlattenedObjectVariant,
-  resolve: ResolverFn,
-): boolean {
-  if (!variant.typeConstraint.allowed.has("object")) {
-    return false;
-  }
-  const idProp = variant.properties.get("id");
-  if (!idProp) {
-    return false;
-  }
-  return isScalarIdTypeConstraint(propertyTypeConstraint(idProp, resolve));
-}
-
-function isDeletionReceiptVariant(variant: FlattenedObjectVariant): boolean {
-  let hasReceiptMeta = false;
-  for (const key of variant.properties.keys()) {
-    if (key === "id") {
-      continue;
-    }
-    if (DELETE_RECEIPT_META_KEYS.has(key)) {
-      hasReceiptMeta = true;
-    } else {
-      return false;
-    }
-  }
-  return hasReceiptMeta;
-}
-
-function looksLikeOperationResourceVariant(variant: FlattenedObjectVariant): boolean {
-  const props = variant.properties;
-  return (
-    props.has("id") &&
-    props.has("status") &&
-    props.has("type") &&
-    props.has("createdAt") &&
-    props.has("updatedAt")
-  );
-}
-
-interface AddressableCollectionInfo {
-  readonly arrayPropertyName: string;
-  readonly itemBranches: readonly ArrayItemBranch[];
-  readonly itemVariants: readonly FlattenedObjectVariant[];
-}
-
-function extractAddressableCollection(
-  variant: FlattenedObjectVariant,
-  resolve: ResolverFn,
-): AddressableCollectionInfo | null {
-  if (
-    !variant.typeConstraint.allowed.has("object") ||
-    variant.properties.size === 0 ||
-    variant.hasSchemaAdditionalProperties
-  ) {
-    return null;
-  }
-  if (variant.properties.has("id")) {
-    return null;
-  }
-
-  const arrayProps: Array<{ name: string; branches: ArrayItemBranch[] }> = [];
-  for (const [propName, prop] of variant.properties.entries()) {
-    const tc = propertyTypeConstraint(prop, resolve);
-    const itemBranches = tc.allowed.has("array")
-      ? collectArrayItemBranches(prop.fragments, resolve)
-      : [];
-    if (itemBranches.length > 0 && !COLLECTION_METADATA_KEYS.has(propName)) {
-      arrayProps.push({ name: propName, branches: itemBranches });
-    } else if (!COLLECTION_METADATA_KEYS.has(propName)) {
-      return null;
-    }
-  }
-
-  if (arrayProps.length !== 1) {
-    return null;
-  }
-
-  const target = arrayProps[0];
-  if (!target) {
-    return null;
-  }
-
-  const itemVariants: FlattenedObjectVariant[] = [];
-  for (const branch of target.branches) {
-    const res = collectFragmentsObjectVariants(branch, resolve);
-    for (const itemVariant of res.variants) {
-      if (!isStrictlyNullConstraint(itemVariant.typeConstraint)) {
-        itemVariants.push(itemVariant);
-      }
-    }
-  }
-
-  if (itemVariants.length === 0) {
-    return null;
-  }
-  if (!itemVariants.every((itemVariant) => isAddressableResourceVariant(itemVariant, resolve))) {
-    return null;
-  }
-
-  return {
-    arrayPropertyName: target.name,
-    itemBranches: target.branches,
-    itemVariants: dedupeFlattenedVariants(itemVariants, resolve),
-  };
-}
-
-function variantsShareCompatibleScalarId(
-  sourceVariant: FlattenedObjectVariant,
-  getVariant: FlattenedObjectVariant,
-  resolve: ResolverFn,
-): boolean {
-  if (
-    !sourceVariant.typeConstraint.allowed.has("object") ||
-    !getVariant.typeConstraint.allowed.has("object")
-  ) {
-    return false;
-  }
-  const sourceId = sourceVariant.properties.get("id");
-  const getId = getVariant.properties.get("id");
-  if (!sourceId || !getId) {
-    return false;
-  }
-  const idOverlap = intersectTypeSets(
-    propertyTypeConstraint(sourceId, resolve).allowed,
-    propertyTypeConstraint(getId, resolve).allowed,
-  );
-  for (const t of idOverlap) {
-    if (SCALAR_ID_TYPES.has(t)) {
-      return true;
-    }
-  }
-  return false;
-}
-
-function arePropertyTypeConstraintsCompatible(a: TypeConstraint, b: TypeConstraint): boolean {
-  const overlap = intersectTypeSets(a.allowed, b.allowed);
-  if (overlap.size === 0) {
-    return false;
-  }
-  const aNonNull = new Set([...a.allowed].filter((t) => t !== "null"));
-  const bNonNull = new Set([...b.allowed].filter((t) => t !== "null"));
-  if (aNonNull.size > 0 && bNonNull.size > 0) {
-    return intersectTypeSets(aNonNull, bNonNull).size > 0;
-  }
-  return true;
-}
-
-function areVariantsStructurallyCompatible(
-  listVariant: FlattenedObjectVariant,
-  getVariant: FlattenedObjectVariant,
-  resolve: ResolverFn,
-  allowDeletionReceipt = false,
-): boolean {
-  if (!variantsShareCompatibleScalarId(listVariant, getVariant, resolve)) {
-    return false;
-  }
-
-  if (allowDeletionReceipt && isDeletionReceiptVariant(listVariant)) {
-    return true;
-  }
-
-  for (const reqName of listVariant.required) {
-    const getProp = getVariant.properties.get(reqName);
-    if (!getProp) {
-      return false;
-    }
-    const listProp = listVariant.properties.get(reqName);
-    if (
-      listProp &&
-      !arePropertyTypeConstraintsCompatible(
-        propertyTypeConstraint(listProp, resolve),
-        propertyTypeConstraint(getProp, resolve),
-      )
-    ) {
-      return false;
-    }
-  }
-
-  const listNonIdKeys = [...listVariant.properties.keys()].filter((k) => k !== "id");
-  const getNonIdKeys = [...getVariant.properties.keys()].filter((k) => k !== "id");
-  if (listNonIdKeys.length === 0) {
-    return getNonIdKeys.length === 0;
-  }
-
-  let hasCompatibleSharedField = false;
-  for (const key of listNonIdKeys) {
-    const listProp = listVariant.properties.get(key);
-    const getProp = getVariant.properties.get(key);
-    if (!listProp || !getProp) {
-      continue;
-    }
-    if (
-      !arePropertyTypeConstraintsCompatible(
-        propertyTypeConstraint(listProp, resolve),
-        propertyTypeConstraint(getProp, resolve),
-      )
-    ) {
-      return false;
-    }
-    hasCompatibleSharedField = true;
-  }
-
-  return hasCompatibleSharedField;
-}
-
-function areSchemasCompatibleForHoistedGet(
-  sourceItemBranches: readonly ArrayItemBranch[],
-  sourceVariants: readonly FlattenedObjectVariant[],
-  getSchema: unknown,
-  getSchemaLocation: RedoclyLocation,
-  resolve: ResolverFn,
-  allowDeletionReceipt = false,
-): boolean {
-  const getFrom = getSchemaLocation.source?.absoluteRef;
-  if (sourceItemBranches.length === 1 && sourceItemBranches[0]?.length === 1) {
-    const singleFrag = sourceItemBranches[0][0];
-    if (singleFrag) {
-      const listRef = extractSingleComponentRef(singleFrag.node, resolve, singleFrag.from);
-      const getRef = extractSingleComponentRef(getSchema, resolve, getFrom);
-      if (listRef && getRef) {
-        if (listRef.resolvedKey !== undefined && listRef.resolvedKey === getRef.resolvedKey) {
-          return true;
-        }
-        if (
-          listRef.name === getRef.name &&
-          (listRef.resolvedKey === undefined || getRef.resolvedKey === undefined)
-        ) {
-          return true;
-        }
-      }
-    }
-  }
-
-  const getCollected = collectFlattenedObjectVariants(getSchema, resolve, getSchemaLocation);
-  const getVariants = getCollected.variants.filter(
-    (variant) => !isStrictlyNullConstraint(variant.typeConstraint),
-  );
-  if (getVariants.length === 0 || sourceVariants.length === 0) {
-    return false;
-  }
-
-  return sourceVariants.every((listVariant) =>
-    getVariants.some((getVariant) =>
-      areVariantsStructurallyCompatible(listVariant, getVariant, resolve, allowDeletionReceipt),
-    ),
-  );
-}
-
-function isFireAndForgetAcceptedOnly(
-  operation: UnknownRecord,
-  operationLocation: RedoclyLocation,
-  resolve: ResolverFn,
-): boolean {
-  if (!isRecord(operation.responses)) {
-    return false;
-  }
-  const twoXxKeys = Object.keys(operation.responses).filter(
-    (code) => EXACT_2XX_STATUS_RE.test(code) || code.toUpperCase() === "2XX",
-  );
-  if (twoXxKeys.length !== 1 || twoXxKeys[0] !== "202") {
-    return false;
-  }
-  const inspected = inspectResponseContent(
-    operation.responses["202"],
-    operationLocation.child(["responses", "202"]),
-    resolve,
-  );
-  if (!inspected) {
-    return true;
-  }
-  return !hasHeaderCaseInsensitive(inspected.node.headers, "location");
-}
-
-function operationReturnsAddressableResource(
-  operation: UnknownRecord,
-  operationLocation: RedoclyLocation,
-  resolve: ResolverFn,
-  statusCodes: readonly string[],
-): boolean {
-  const schemas = extractOperationJsonResponseSchemas(
-    operation,
-    operationLocation,
-    resolve,
-    statusCodes,
-  );
-  for (const entry of schemas) {
-    const collected = collectFlattenedObjectVariants(entry.schema, resolve, entry.schemaLocation);
-    const nonNull = collected.variants.filter((v) => !isStrictlyNullConstraint(v.typeConstraint));
-    if (nonNull.length > 0 && nonNull.every((v) => isAddressableResourceVariant(v, resolve))) {
-      return true;
-    }
-  }
-  return false;
-}
-
-function getReturnsCollectionEnvelope(
-  getOp: unknown,
-  getLoc: RedoclyLocation,
-  resolve: ResolverFn,
-): {
-  readonly hasJsonSchema: boolean;
-  readonly isCollection: boolean;
-  readonly isAddressableCollection: boolean;
-} {
-  if (!isRecord(getOp)) {
-    return { hasJsonSchema: false, isCollection: false, isAddressableCollection: false };
-  }
-  const schemas = extractOperationJsonResponseSchemas(getOp, getLoc, resolve, ["200", "2XX"]);
-  if (schemas.length === 0) {
-    return { hasJsonSchema: false, isCollection: false, isAddressableCollection: false };
-  }
-  let isCollection = false;
-  for (const entry of schemas) {
-    const collected = collectFlattenedObjectVariants(entry.schema, resolve, entry.schemaLocation);
-    for (const variant of collected.variants) {
-      if (extractAddressableCollection(variant, resolve) !== null) {
-        return { hasJsonSchema: true, isCollection: true, isAddressableCollection: true };
-      }
-      if (variant.typeConstraint.allowed.has("array")) {
-        isCollection = true;
-        continue;
-      }
-      if (!variant.typeConstraint.allowed.has("object") || variant.properties.has("id")) {
-        continue;
-      }
-      for (const [propName, prop] of variant.properties.entries()) {
-        if (
-          !COLLECTION_METADATA_KEYS.has(propName) &&
-          propertyTypeConstraint(prop, resolve).allowed.has("array")
-        ) {
-          isCollection = true;
-        }
-      }
-    }
-  }
-  return { hasJsonSchema: true, isCollection, isAddressableCollection: false };
-}
-
-interface IndexedPathEntry extends ResolvedPathItem {
-  readonly pathItem: UnknownRecord;
-  readonly normalizedPath: string;
-  readonly segments: readonly string[];
-  readonly structuralKey: string;
-}
-
-function collectIndexedPaths(
-  root: UnknownRecord,
-  ctx: RedoclyUserContext,
-): {
-  entries: IndexedPathEntry[];
-  byStructuralKey: Map<string, IndexedPathEntry[]>;
-} {
-  const entries: IndexedPathEntry[] = [];
-  const byStructuralKey = new Map<string, IndexedPathEntry[]>();
-
-  for (const resolved of iterateRootPathItems(root, ctx)) {
-    if (!resolved.pathItem) {
-      continue;
-    }
-    const normalizedPath = normalizePathTemplate(resolved.pathTemplate);
-    const segments = splitPathSegments(resolved.pathTemplate);
-    const structuralKey = structuralPathKey(segments, hasTrailingSlash(resolved.pathTemplate));
-    const entry: IndexedPathEntry = {
-      ...resolved,
-      pathItem: resolved.pathItem,
-      normalizedPath,
-      segments,
-      structuralKey,
-    };
-    entries.push(entry);
-    const bucket = byStructuralKey.get(structuralKey);
-    if (bucket) {
-      bucket.push(entry);
-    } else {
-      byStructuralKey.set(structuralKey, [entry]);
-    }
-  }
-
-  return { entries, byStructuralKey };
-}
-
-function hasMatchingEntryOnStructuralKey(
-  byStructuralKey: ReadonlyMap<string, readonly IndexedPathEntry[]>,
-  key: string,
-  predicate: (entry: IndexedPathEntry) => boolean,
-): boolean {
-  return byStructuralKey.get(key)?.some(predicate) ?? false;
-}
-
-function hasAnyGetOnStructuralKey(
-  byStructuralKey: ReadonlyMap<string, readonly IndexedPathEntry[]>,
-  key: string,
-): boolean {
-  return hasMatchingEntryOnStructuralKey(byStructuralKey, key, (entry) =>
-    isRecord(entry.pathItem.get),
-  );
-}
-
-function hasAnyOperationOnStructuralKey(
-  byStructuralKey: ReadonlyMap<string, readonly IndexedPathEntry[]>,
-  key: string,
-): boolean {
-  return hasMatchingEntryOnStructuralKey(byStructuralKey, key, (entry) =>
-    HTTP_METHODS.some((method) => isRecord(entry.pathItem[method])),
-  );
-}
-
-function hasAnyStrictDescendant(
-  entries: readonly IndexedPathEntry[],
-  prefixStructuralKey: string,
-): boolean {
-  const prefix = prefixStructuralKey.endsWith("/")
-    ? prefixStructuralKey
-    : `${prefixStructuralKey}/`;
-  return entries.some(
-    (entry) =>
-      entry.structuralKey.length > prefix.length &&
-      entry.structuralKey.startsWith(prefix) &&
-      HTTP_METHODS.some((method) => isRecord(entry.pathItem[method])),
-  );
-}
-
 function isOperationSatisfiedByHoistedGets(
   op: UnknownRecord,
   opLoc: RedoclyLocation,
-  hoistedGets: ReadonlyArray<{ entry: IndexedPathEntry; getOp: UnknownRecord }>,
+  hoistedGets: readonly HoistedGetCandidate[],
   resolve: ResolverFn,
   options?: { readonly allowDeletionReceipt?: boolean },
 ): boolean {
@@ -1057,26 +267,6 @@ export const ads0005AddressableResourceRead: RedoclyOas3Rule = createRootRule(
   ({ root, ctx, ignoreMatcher, reportOnce: report }) => {
     const { entries, byStructuralKey } = collectIndexedPaths(root, ctx);
 
-    const findMatchingHoistedGets = (
-      collectionSegments: readonly string[],
-    ): Array<{ entry: IndexedPathEntry; getOp: UnknownRecord }> => {
-      const hoistedCollections = computeHoistedCollectionCandidates(collectionSegments);
-      const matches: Array<{ entry: IndexedPathEntry; getOp: UnknownRecord }> = [];
-      for (const candidate of hoistedCollections) {
-        const candidateItemKey = structuralPathKey([...candidate, "{}"]);
-        const bucket = byStructuralKey.get(candidateItemKey);
-        if (!bucket) {
-          continue;
-        }
-        for (const candidateEntry of bucket) {
-          if (isRecord(candidateEntry.pathItem.get)) {
-            matches.push({ entry: candidateEntry, getOp: candidateEntry.pathItem.get });
-          }
-        }
-      }
-      return matches;
-    };
-
     for (const entry of entries) {
       const { pathTemplate, segments, structuralKey, pathItem } = entry;
       const isItemPath = segments.length > 0 && isParamSegment(segments[segments.length - 1] ?? "");
@@ -1087,7 +277,7 @@ export const ads0005AddressableResourceRead: RedoclyOas3Rule = createRootRule(
         const itemParam = segments[segments.length - 1] ?? "{resourceId}";
         const hasDirectGet = hasAnyGetOnStructuralKey(byStructuralKey, structuralKey);
         const hoistedCandidates = computeHoistedCollectionCandidates(parentSegments);
-        const hoistedGets = findMatchingHoistedGets(parentSegments);
+        const hoistedGets = findMatchingHoistedGets(byStructuralKey, parentSegments);
 
         for (const method of ["patch", "put", "delete"] as const) {
           const op = pathItem[method];
@@ -1149,58 +339,33 @@ export const ads0005AddressableResourceRead: RedoclyOas3Rule = createRootRule(
 
       // Part A3: Custom action sub-route `POST <itemPath>/<staticActionSegment>`
       if (
+        isCustomActionSubRoute(entry, entries, byStructuralKey, ctx.resolve) &&
         isRecord(pathItem.post) &&
-        segments.length >= 2 &&
-        isParamSegment(segments[segments.length - 2] ?? "")
+        !ignoreMatcher.isIgnored({ path: pathTemplate, method: "post" })
       ) {
-        const actionSegment = segments[segments.length - 1] ?? "";
         const postOp = pathItem.post;
         const postLoc = entry.operationLocation("post");
-        const recognizedAction = isActionVerbSegment(actionSegment);
+        const parentItemSegments = segments.slice(0, -1);
+        const parentItemKey = structuralPathKey(parentItemSegments);
+        const parentCollectionSegments = parentItemSegments.slice(0, -1);
+        const parentItemParam = parentItemSegments[parentItemSegments.length - 1] ?? "{resourceId}";
+        const hasParentGet = hasAnyGetOnStructuralKey(byStructuralKey, parentItemKey);
+        const hoistedCandidates = computeHoistedCollectionCandidates(parentCollectionSegments);
+        const hoistedGets = findMatchingHoistedGets(byStructuralKey, parentCollectionSegments);
+        const satisfiedByHoisted =
+          !hasParentGet &&
+          isOperationSatisfiedByHoistedGets(postOp, postLoc, hoistedGets, ctx.resolve);
 
-        const isSubCollectionOrResource =
-          isRecord(pathItem.get) ||
-          isRecord(pathItem.patch) ||
-          isRecord(pathItem.put) ||
-          isRecord(pathItem.delete) ||
-          (!recognizedAction && hasAnyStrictDescendant(entries, structuralKey)) ||
-          computeHoistedCollectionCandidates(segments).some((hoistedCol) =>
-            hasAnyOperationOnStructuralKey(
-              byStructuralKey,
-              structuralPathKey([...hoistedCol, "{}"]),
-            ),
-          ) ||
-          (isRecord(postOp.responses) && isRecord(postOp.responses["201"])) ||
-          looksLikePluralSubCollectionSegment(actionSegment) ||
-          (!recognizedAction && isFireAndForgetAcceptedOnly(postOp, postLoc, ctx.resolve));
-
-        if (
-          !isSubCollectionOrResource &&
-          !ignoreMatcher.isIgnored({ path: pathTemplate, method: "post" })
-        ) {
-          const parentItemSegments = segments.slice(0, -1);
-          const parentItemKey = structuralPathKey(parentItemSegments);
-          const parentCollectionSegments = parentItemSegments.slice(0, -1);
-          const parentItemParam =
-            parentItemSegments[parentItemSegments.length - 1] ?? "{resourceId}";
-          const hasParentGet = hasAnyGetOnStructuralKey(byStructuralKey, parentItemKey);
-          const hoistedCandidates = computeHoistedCollectionCandidates(parentCollectionSegments);
-          const hoistedGets = findMatchingHoistedGets(parentCollectionSegments);
-          const satisfiedByHoisted =
-            !hasParentGet &&
-            isOperationSatisfiedByHoistedGets(postOp, postLoc, hoistedGets, ctx.resolve);
-
-          if (!hasParentGet && !satisfiedByHoisted) {
-            const hoistedHint =
-              hoistedCandidates.length > 0
-                ? ` or a schema-compatible hoisted canonical route such as "GET ${formatSegments([...(hoistedCandidates[hoistedCandidates.length - 1] ?? []), parentItemParam])}"`
-                : "";
-            report(
-              "action-missing-item-get",
-              entry.operationReportLocation("post"),
-              `POST "${pathTemplate}" performs a custom action on an addressable resource without a corresponding GET endpoint. Add "GET ${formatSegments(parentItemSegments)}"${hoistedHint} (ADS-0005).`,
-            );
-          }
+        if (!hasParentGet && !satisfiedByHoisted) {
+          const hoistedHint =
+            hoistedCandidates.length > 0
+              ? ` or a schema-compatible hoisted canonical route such as "GET ${formatSegments([...(hoistedCandidates[hoistedCandidates.length - 1] ?? []), parentItemParam])}"`
+              : "";
+          report(
+            "action-missing-item-get",
+            entry.operationReportLocation("post"),
+            `POST "${pathTemplate}" performs a custom action on an addressable resource without a corresponding GET endpoint. Add "GET ${formatSegments(parentItemSegments)}"${hoistedHint} (ADS-0005).`,
+          );
         }
       }
 
@@ -1255,7 +420,7 @@ export const ads0005AddressableResourceRead: RedoclyOas3Rule = createRootRule(
       }
 
       const hoistedCandidates = computeHoistedCollectionCandidates(segments);
-      const hoistedGets = findMatchingHoistedGets(segments);
+      const hoistedGets = findMatchingHoistedGets(byStructuralKey, segments);
 
       const allCollectionsMatched = collectionInfos.every((info) =>
         hoistedGets.some((hoisted) => {
@@ -1614,9 +779,200 @@ export const ads0005UrlPathNaming: RedoclyOas3Rule = createRootRule(
   },
 );
 
+export const ads0005PatchMergeSemantics: RedoclyOas3Rule = createRootRule(
+  ({ root, ctx, ignoreMatcher, reportOnce: report }) => {
+    for (const pathEntry of iterateRootPathItems(root, ctx)) {
+      const { pathTemplate, pathItem } = pathEntry;
+      if (!pathItem || !isRecord(pathItem.patch)) {
+        continue;
+      }
+      if (ignoreMatcher.isIgnored({ path: pathTemplate, method: "patch" })) {
+        continue;
+      }
+
+      // 2a. Reject fieldMask / updateMask query parameters on PATCH (no deprecation exemption)
+      for (const param of resolveOperationParameters(pathEntry, "patch", ctx.resolve)) {
+        if (param.in === "query" && isBannedPatchMaskName(param.name)) {
+          report(
+            `patch-query-mask:${param.name.toLowerCase()}`,
+            param.reportLocation,
+            `PATCH "${pathTemplate}" must not declare query parameter "${param.name}". Partial updates must use RFC 7396 JSON Merge Patch semantics without field masks (ADS-0005).`,
+          );
+        }
+      }
+
+      const patchOp = pathItem.patch;
+      const patchLoc = pathEntry.operationLocation("patch");
+      const opFromRef = pathEntry.isOperationFromRef("patch");
+      const mediaEntries = extractRequestBodyMediaSchemas(patchOp, patchLoc, ctx.resolve);
+      let hasCompatibleJsonBody = false;
+      let reportedJsonPatchMedia = false;
+
+      for (const mediaEntry of mediaEntries) {
+        const useOpLocation = opFromRef || mediaEntry.requestBodyFromRef;
+        const mediaReportLoc = useOpLocation
+          ? pathEntry.operationReportLocation("patch")
+          : mediaEntry.mediaTypeLocation.key();
+        const schemaReportLoc = useOpLocation
+          ? pathEntry.operationReportLocation("patch")
+          : mediaEntry.schemaLocation;
+
+        const topLevelRef =
+          mediaEntry.schema !== undefined
+            ? extractSingleComponentRef(
+                mediaEntry.schema,
+                ctx.resolve,
+                mediaEntry.schemaLocation.source?.absoluteRef,
+              )
+            : null;
+        if (
+          topLevelRef &&
+          ignoreMatcher.isIgnored({ path: pathTemplate, method: "patch", schema: topLevelRef.name })
+        ) {
+          if (mediaEntry.isJson && !JSON_PATCH_MEDIA_TYPE_RE.test(mediaEntry.mediaType)) {
+            hasCompatibleJsonBody = true;
+          }
+          continue;
+        }
+
+        // 1a. Reject RFC 6902 application/json-patch+json media type
+        if (JSON_PATCH_MEDIA_TYPE_RE.test(mediaEntry.mediaType)) {
+          reportedJsonPatchMedia = true;
+          report(
+            `patch-json-patch-media-type:${mediaEntry.mediaType.toLowerCase()}`,
+            mediaReportLoc,
+            `PATCH "${pathTemplate}" uses "${mediaEntry.mediaType}" (RFC 6902 JSON Patch). Partial updates must use RFC 7396 JSON Merge Patch over "application/json" instead (ADS-0005).`,
+          );
+          continue;
+        }
+
+        if (!mediaEntry.isJson || mediaEntry.schema === undefined) {
+          continue;
+        }
+        hasCompatibleJsonBody = true;
+
+        // 1b. Reject unrestricted and non-object top-level JSON schemas (arrays, scalars, null, {} / true)
+        const topTypes = computeTypeConstraint(
+          mediaEntry.schema,
+          ctx.resolve,
+          mediaEntry.schemaLocation.source?.absoluteRef,
+        ).allowed;
+        if (topTypes.size === ALL_JSON_TYPE_SET.size) {
+          report(
+            `patch-top-level-unrestricted:${mediaEntry.mediaType}`,
+            schemaReportLoc,
+            `PATCH "${pathTemplate}" (${mediaEntry.mediaType}) request schema does not restrict the top-level payload to a JSON object. Declare "type: object" for JSON Merge Patch bodies (ADS-0005).`,
+          );
+        } else {
+          if (topTypes.has("array")) {
+            report(
+              `patch-top-level-array:${mediaEntry.mediaType}`,
+              schemaReportLoc,
+              `PATCH "${pathTemplate}" (${mediaEntry.mediaType}) accepts a top-level JSON array. Partial updates must use a JSON Merge Patch object (RFC 7396) rather than a patch-operation array (ADS-0005).`,
+            );
+          }
+          const nonObjectScalars = [...topTypes].filter((t) => t !== "object" && t !== "array");
+          if (nonObjectScalars.length > 0) {
+            report(
+              `patch-top-level-non-object:${mediaEntry.mediaType}`,
+              schemaReportLoc,
+              `PATCH "${pathTemplate}" (${mediaEntry.mediaType}) allows non-object top-level type "${formatTypeSummary(new Set(nonObjectScalars))}". Partial updates must accept a JSON object body (ADS-0005).`,
+            );
+          }
+        }
+
+        const collected = collectActiveObjectVariants(
+          mediaEntry.schema,
+          mediaEntry.schemaLocation,
+          pathTemplate,
+          "patch",
+          ctx.resolve,
+          ignoreMatcher,
+          topLevelRef?.name,
+          COMPAT_VARIANT_OPTIONS,
+        );
+
+        let nestedTruncated = false;
+        for (const variant of collected.variants) {
+          // 2b. Reject fieldMask / updateMask top-level body properties (no deprecation exemption)
+          for (const [propName, prop] of variant.properties.entries()) {
+            if (isBannedPatchMaskName(propName)) {
+              const propLoc = selectPropertyReportLocation(
+                prop,
+                mediaEntry.schemaLocation,
+                schemaReportLoc,
+              );
+              report(
+                `patch-body-mask:${propName.toLowerCase()}`,
+                propLoc,
+                `PATCH "${pathTemplate}" (${mediaEntry.mediaType}) must not declare top-level mask property "${propName}". Partial updates must use RFC 7396 JSON Merge Patch semantics without field masks (ADS-0005).`,
+              );
+            }
+          }
+
+          // 3 & 4. No top-level required properties (outside explicit union discriminator) and forbid unknown properties
+          for (const violation of checkPatchObjectVariantConstraints(variant)) {
+            if (violation.kind === "required" && violation.disallowedRequired) {
+              const formatted = violation.disallowedRequired.map((name) => `"${name}"`).join(", ");
+              report(
+                `patch-required:${formatted}`,
+                schemaReportLoc,
+                `PATCH "${pathTemplate}" (${mediaEntry.mediaType}) request schema declares required top-level properties (${formatted}). RFC 7396 JSON Merge Patch bodies must make mutable fields optional so callers can update any subset (ADS-0005).`,
+              );
+            } else if (violation.kind === "additional-properties") {
+              report(
+                `patch-open-additional-properties:${mediaEntry.mediaType}`,
+                schemaReportLoc,
+                `PATCH "${pathTemplate}" (${mediaEntry.mediaType}) request schema does not forbid unknown fields. Set "additionalProperties: false" (or "unevaluatedProperties: false" on composed schemas) so unknown properties are rejected (ADS-0005).`,
+              );
+            }
+          }
+
+          // 4b. Check closure recursively on fixed-schema nested objects merged under RFC 7396
+          const nestedOpen = collectNestedOpenPatchObjectPaths(variant, ctx.resolve);
+          if (nestedOpen.truncated) {
+            nestedTruncated = true;
+          }
+          for (const nestedPath of nestedOpen.openPaths) {
+            const topKey = nestedPath.split(".")[0] ?? "";
+            const prop = topKey ? variant.properties.get(topKey) : undefined;
+            const nestedLoc = selectPropertyReportLocation(
+              prop,
+              mediaEntry.schemaLocation,
+              schemaReportLoc,
+            );
+            report(
+              `patch-nested-open-additional-properties:${mediaEntry.mediaType}:${nestedPath}`,
+              nestedLoc,
+              `PATCH "${pathTemplate}" (${mediaEntry.mediaType}) nested object "${nestedPath}" does not forbid unknown fields. Set "additionalProperties: false" (or "unevaluatedProperties: false" on composed schemas) on recursively merged objects (ADS-0005).`,
+            );
+          }
+        }
+
+        if (collected.truncated || nestedTruncated) {
+          report(
+            `patch-variant-cap-exceeded:${mediaEntry.mediaType}`,
+            schemaReportLoc,
+            `PATCH "${pathTemplate}" (${mediaEntry.mediaType}) request schema exceeds the ${MAX_OBJECT_VARIANTS}-variant union analysis cap and could not be fully verified for RFC 7396 JSON Merge Patch semantics (ADS-0005).`,
+          );
+        }
+      }
+
+      if (!hasCompatibleJsonBody && !reportedJsonPatchMedia) {
+        report(
+          "patch-missing-json-body",
+          pathEntry.operationReportLocation("patch"),
+          `PATCH "${pathTemplate}" must declare a JSON request body ("application/json") using JSON Merge Patch semantics (ADS-0005).`,
+        );
+      }
+    }
+  },
+);
+
 export const ads0005Rules: Record<string, RedoclyOas3Rule> = {
   "ads-0005-addressable-resource-read": ads0005AddressableResourceRead,
   "ads-0005-standard-http-methods": ads0005StandardHttpMethods,
   "ads-0005-standard-status-codes": ads0005StandardStatusCodes,
   "ads-0005-url-path-naming": ads0005UrlPathNaming,
+  "ads-0005-patch-merge-semantics": ads0005PatchMergeSemantics,
 };

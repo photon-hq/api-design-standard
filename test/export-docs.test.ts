@@ -128,13 +128,14 @@ describe("docs-reference export", () => {
       expect(first.overview.body).not.toMatch(pattern);
     }
 
-    expect(first.standards).toHaveLength(5);
+    expect(first.standards).toHaveLength(6);
     expect(first.standards.map((standard) => standard.slug)).toEqual([
       "ads-0001",
       "ads-0002",
       "ads-0004",
       "ads-0005",
       "ads-0006",
+      "ads-0007",
     ]);
     const ads0001 = first.standards[0];
     expect(ads0001).toBeDefined();
@@ -273,10 +274,10 @@ describe("docs-reference export", () => {
     expect(ads0005?.title).toBe("ADS-0005: Standard Resource Methods and Lifecycle");
     expect(ads0005?.sidebarTitle).toBe("ADS-0005 · Standard Resource Methods");
     expect(ads0005?.description).toBe(
-      "Standard HTTP methods, read symmetry for addressable resources, canonical success status codes, representation consistency, and URL path naming across Photon public HTTP APIs.",
+      "Standard HTTP methods, read symmetry for addressable resources, canonical success status codes, representation consistency, URL path naming, and RFC 7396 JSON Merge Patch semantics across Photon public HTTP APIs.",
     );
     expect(ads0005?.status).toBe("Approved");
-    expect(ads0005?.updated).toBe("2026-11-27");
+    expect(ads0005?.updated).toBe("2026-11-28");
     expect(ads0005?.rules).toEqual([
       {
         id: "photon-ads/ads-0005-addressable-resource-read",
@@ -302,6 +303,12 @@ describe("docs-reference export", () => {
         summary:
           "Static URL path segments (excluding path parameters and leading version prefixes) must use lowercase kebab-case.",
       },
+      {
+        id: "photon-ads/ads-0005-patch-merge-semantics",
+        severity: "error",
+        summary:
+          "PATCH operations must use RFC 7396 JSON Merge Patch over JSON without RFC 6902 patch arrays, field/update mask parameters or properties, top-level required properties (outside explicit union discriminators), or open undeclared properties.",
+      },
     ]);
     expect(ads0005?.body).not.toMatch(/^---/);
     expect(ads0005?.body).not.toMatch(/^#\s+/);
@@ -314,6 +321,8 @@ describe("docs-reference export", () => {
       "#### Protocol-mandated browser callbacks (`GET .../callback`)",
     );
     expect(ads0005?.body).toContain("RFC 6749 Section 4.1.2");
+    expect(ads0005?.body).toContain("### 6. Partial updates (`PATCH`)");
+    expect(ads0005?.body).toContain("JSON Merge Patch (RFC 7396)");
     expect(ads0005?.body).toContain('"nextPageToken": "eyJjIjoiMjAyNi0xMS0yNiJ9"');
     expect(ads0005?.body).not.toContain('"nextPageToken": null');
     expect(ads0005?.body).not.toMatch(/^##\s+(?:Deterministic\s+)?Lint\s+Rules\b/im);
@@ -329,7 +338,7 @@ describe("docs-reference export", () => {
       "Forward opaque token pagination using pageSize, pageToken, and nextPageToken, strict bounds validation, end-of-list omission, deterministic ordering, and unified error contracts across Photon public HTTP APIs.",
     );
     expect(ads0006?.status).toBe("Approved");
-    expect(ads0006?.updated).toBe("2026-11-26");
+    expect(ads0006?.updated).toBe("2026-11-28");
     expect(ads0006?.rules).toEqual([
       {
         id: "photon-ads/ads-0006-standard-pagination-params",
@@ -360,6 +369,39 @@ describe("docs-reference export", () => {
     expect(ads0006?.body).not.toMatch(/^##\s+(?:Deterministic\s+)?Lint\s+Rules\b/im);
     expect(() =>
       validateMintlifyMdxSafety("ads/0006-list-pagination/index.md", ads0006?.body ?? ""),
+    ).not.toThrow();
+
+    const ads0007 = first.standards[5];
+    expect(ads0007).toBeDefined();
+    expect(ads0007?.ads).toBe("0007");
+    expect(ads0007?.slug).toBe("ads-0007");
+    expect(ads0007?.folder).toBe("0007-resource-representation");
+    expect(ads0007?.title).toBe("ADS-0007: Resource Representation Consistency");
+    expect(ads0007?.sidebarTitle).toBe("ADS-0007 · Resource Representation");
+    expect(ads0007?.status).toBe("Approved");
+    expect(ads0007?.updated).toBe("2026-11-28");
+    expect(ads0007?.rules.map((rule) => rule.id)).toEqual([
+      "photon-ads/ads-0007-response-representation-consistency",
+      "photon-ads/ads-0007-collection-slice-subset",
+      "photon-ads/ads-0007-mutation-input-symmetry",
+      "photon-ads/ads-0007-resource-annotation-valid",
+      "photon-ads/ads-0007-derived-schema-compatibility",
+      "photon-ads/ads-0007-no-polymorphic-expand",
+    ]);
+    expect(ads0007?.rules.every((rule) => rule.severity === "error")).toBe(true);
+    expect(ads0007?.body).not.toMatch(/^---/);
+    expect(ads0007?.body).not.toMatch(/^#\s+/);
+    expect(ads0007?.body).toContain("## Scope");
+    expect(ads0007?.body).toContain("## Normative Rules");
+    expect(ads0007?.body).toContain("## Examples");
+    expect(ads0007?.body).toContain("## Changelog");
+    expect(ads0007?.body).toContain("Approved and published as `ADS-0007`");
+    expect(ads0007?.body).toContain(
+      "Forward cursor pagination (`pageSize`, `pageToken`, `nextPageToken`) is defined in `ADS-0006`.",
+    );
+    expect(ads0007?.body).not.toMatch(/^##\s+(?:Deterministic\s+)?Lint\s+Rules\b/im);
+    expect(() =>
+      validateMintlifyMdxSafety("ads/0007-resource-representation/index.md", ads0007?.body ?? ""),
     ).not.toThrow();
 
     for (const standard of first.standards) {
@@ -538,6 +580,7 @@ describe("docs-reference export", () => {
         "ads-0004",
         "ads-0005",
         "ads-0006",
+        "ads-0007",
       ]);
       expect(exported.standards.every((standard) => standard.status === "Approved")).toBe(true);
     } finally {

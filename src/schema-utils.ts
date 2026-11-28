@@ -224,6 +224,10 @@ export function formatAllowedTypes(allowed: ReadonlySet<JsonSchemaType>, separat
   return ALL_JSON_TYPES.filter((t) => allowed.has(t)).join(separator);
 }
 
+export function formatTypeSummary(allowed: ReadonlySet<JsonSchemaType>): string {
+  return allowed.size > 0 ? formatAllowedTypes(allowed) : "never";
+}
+
 export function extractNodeDeclaredTypeSets(
   node: UnknownRecord,
   includeNullableOnType = false,
@@ -907,59 +911,140 @@ export function computeIntegerBounds(
   });
 }
 
-export function isSchemaDeprecated(schema: unknown, resolve: ResolverFn, from?: string): boolean {
+function hasBooleanSchemaAnnotation(
+  schema: unknown,
+  resolve: ResolverFn,
+  from: string | undefined,
+  key: "deprecated" | "readOnly" | "writeOnly",
+): boolean {
   const seen = new Set<unknown>();
+  const memo = new Map<object, Map<string, boolean>>();
 
-  const hasDeprecatedAllOf = (node: UnknownRecord, currentFrom: string | undefined): boolean => {
-    if (!Array.isArray(node.allOf)) {
-      return false;
-    }
-    for (const branch of node.allOf) {
-      if (visit(branch, currentFrom)) {
-        return true;
+  type AnnotResult = { readonly value: boolean; readonly hitCycle: boolean };
+
+  const hasInCombinators = (node: UnknownRecord, currentFrom: string | undefined): AnnotResult => {
+    let hitCycle = false;
+    if (Array.isArray(node.allOf)) {
+      for (const branch of node.allOf) {
+        const res = visit(branch, currentFrom);
+        if (res.value) {
+          return { value: true, hitCycle: false };
+        }
+        if (res.hitCycle) {
+          hitCycle = true;
+        }
       }
     }
-    return false;
+    for (const unionKey of ["anyOf", "oneOf"] as const) {
+      const branches = node[unionKey];
+      if (!Array.isArray(branches) || branches.length === 0) {
+        continue;
+      }
+      let allTrue = true;
+      for (const branch of branches) {
+        const res = visit(branch, currentFrom);
+        if (res.hitCycle) {
+          hitCycle = true;
+        }
+        if (!res.value) {
+          allTrue = false;
+          break;
+        }
+      }
+      if (allTrue) {
+        return { value: true, hitCycle: false };
+      }
+    }
+    return { value: false, hitCycle };
   };
 
-  const visit = (node: unknown, currentFrom: string | undefined): boolean => {
-    if (!isRecord(node) || seen.has(node)) {
-      return false;
+  const visit = (node: unknown, currentFrom: string | undefined): AnnotResult => {
+    if (!isRecord(node)) {
+      return { value: false, hitCycle: false };
     }
+    if (seen.has(node)) {
+      return { value: false, hitCycle: true };
+    }
+    const cacheKey = currentFrom ?? "";
+    const cached = memo.get(node)?.get(cacheKey);
+    if (cached !== undefined) {
+      return { value: cached, hitCycle: false };
+    }
+
     seen.add(node);
+    let result: AnnotResult = { value: false, hitCycle: false };
+    try {
+      const direct = node[key];
+      if (typeof direct === "boolean") {
+        result = { value: direct, hitCycle: false };
+        return result;
+      }
 
-    if (typeof node.deprecated === "boolean") {
-      return node.deprecated;
-    }
-
-    if (typeof node.$ref === "string") {
-      const resolved = safeResolveSchema(resolve, node, currentFrom);
-      if (resolved) {
-        let refDecided = false;
-        for (const hop of getRefIntermediateHops(node, resolved, { reverse: false })) {
-          if (typeof hop.node.deprecated === "boolean") {
-            if (hop.node.deprecated) {
-              return true;
+      let hitCycle = false;
+      if (typeof node.$ref === "string") {
+        const resolved = safeResolveSchema(resolve, node, currentFrom);
+        if (resolved) {
+          let refDecided = false;
+          for (const hop of getRefIntermediateHops(node, resolved, { reverse: false })) {
+            const hopValue = hop.node[key];
+            if (typeof hopValue === "boolean") {
+              if (hopValue) {
+                result = { value: true, hitCycle: false };
+                return result;
+              }
+              refDecided = true;
+              break;
             }
-            refDecided = true;
-            break;
+            const hopComb = hasInCombinators(hop.node, hop.location?.source?.absoluteRef);
+            if (hopComb.value) {
+              result = { value: true, hitCycle: false };
+              return result;
+            }
+            if (hopComb.hitCycle) {
+              hitCycle = true;
+            }
           }
-          if (hasDeprecatedAllOf(hop.node, hop.location?.source?.absoluteRef)) {
-            return true;
+          if (!refDecided) {
+            const targetRes = visit(resolved.node, resolved.location?.source?.absoluteRef);
+            if (targetRes.value) {
+              result = { value: true, hitCycle: false };
+              return result;
+            }
+            if (targetRes.hitCycle) {
+              hitCycle = true;
+            }
           }
-        }
-        if (!refDecided && visit(resolved.node, resolved.location?.source?.absoluteRef)) {
-          return true;
         }
       }
-    }
 
-    return hasDeprecatedAllOf(node, currentFrom);
+      const combRes = hasInCombinators(node, currentFrom);
+      result = combRes.value
+        ? { value: true, hitCycle: false }
+        : { value: false, hitCycle: hitCycle || combRes.hitCycle };
+      return result;
+    } finally {
+      seen.delete(node);
+      if (result.value || !result.hitCycle) {
+        setNodeCacheEntry(memo, node, cacheKey, result.value);
+      }
+    }
   };
 
-  return visit(schema, from);
+  return visit(schema, from).value;
+}
+
+export function isSchemaDeprecated(schema: unknown, resolve: ResolverFn, from?: string): boolean {
+  return hasBooleanSchemaAnnotation(schema, resolve, from, "deprecated");
+}
+
+export function isSchemaReadOnly(schema: unknown, resolve: ResolverFn, from?: string): boolean {
+  return hasBooleanSchemaAnnotation(schema, resolve, from, "readOnly");
 }
 
 export function isTrackedPropertyDeprecated(prop: TrackedProperty, resolve: ResolverFn): boolean {
   return prop.fragments.some((frag) => isSchemaDeprecated(frag.node, resolve, frag.from));
+}
+
+export function isTrackedPropertyReadOnly(prop: TrackedProperty, resolve: ResolverFn): boolean {
+  return prop.fragments.some((frag) => isSchemaReadOnly(frag.node, resolve, frag.from));
 }
