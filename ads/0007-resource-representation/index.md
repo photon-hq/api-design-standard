@@ -3,13 +3,13 @@ title: "ADS-0007: Resource Representation Consistency"
 sidebarTitle: "ADS-0007 · Resource Representation"
 description: "Single canonical resource schemas, per-service Operation resources, cross-method response consistency, strict collection slices, mutation input symmetry, and the x-photon-resource OpenAPI extension across Photon public HTTP APIs."
 ads: "0007"
-status: "Draft"
+status: "Approved"
 updated: "2026-11-28"
 ---
 
 # ADS-0007: Resource Representation Consistency
 
-- **Status**: Draft
+- **Status**: Approved
 - **Updated**: 2026-11-28
 
 When a resource uses one canonical schema across reads, lists, and mutations, callers, generated SDKs, CLIs, dashboards, and automated agents can cache, diff, and update state without endpoint-specific field mappers or per-method type conversions. This standard is part of Photon API Design Standards and uses the keywords **MUST**, **MUST NOT**, **SHOULD**, and **MAY** as described in RFC 2119.
@@ -31,7 +31,7 @@ Related concerns are governed by separate standards:
 - Flat top-level JSON response objects and flat one-time creation secrets are defined in `ADS-0002`.
 - Long-running operation lifecycle, polling, and `Operation` envelope fields are defined in `ADS-0004`.
 - Standard HTTP methods, read symmetry, canonical status codes, URL naming, and RFC 7396 JSON Merge Patch wire rules are defined in `ADS-0005`.
-- Forward cursor pagination (`items`, `pageSize`, `pageToken`, `nextPageToken`) is defined in `ADS-0006`.
+- Forward cursor pagination (`pageSize`, `pageToken`, `nextPageToken`) is defined in `ADS-0006`.
 
 ## Normative Rules
 
@@ -417,4 +417,4 @@ The `@photon-hq/api-design-standards` Redocly plugin (`photon-ads`) enforces ADS
 
 ## Changelog
 
-- **2026-11-28**: Drafted `ADS-0007` defining the canonical resource model, per-service `Operation` canonical resources, cross-method response consistency, collection slices, mutation input symmetry, and the `x-photon-resource` OpenAPI extension.
+- **2026-11-28**: Approved and published as `ADS-0007`, defining the canonical resource model, per-service `Operation` canonical resources, cross-method response consistency, collection slices, mutation input symmetry, and the `x-photon-resource` OpenAPI extension.

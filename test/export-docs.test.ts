@@ -128,13 +128,14 @@ describe("docs-reference export", () => {
       expect(first.overview.body).not.toMatch(pattern);
     }
 
-    expect(first.standards).toHaveLength(5);
+    expect(first.standards).toHaveLength(6);
     expect(first.standards.map((standard) => standard.slug)).toEqual([
       "ads-0001",
       "ads-0002",
       "ads-0004",
       "ads-0005",
       "ads-0006",
+      "ads-0007",
     ]);
     const ads0001 = first.standards[0];
     expect(ads0001).toBeDefined();
@@ -370,6 +371,38 @@ describe("docs-reference export", () => {
       validateMintlifyMdxSafety("ads/0006-list-pagination/index.md", ads0006?.body ?? ""),
     ).not.toThrow();
 
+    const ads0007 = first.standards[5];
+    expect(ads0007).toBeDefined();
+    expect(ads0007?.ads).toBe("0007");
+    expect(ads0007?.slug).toBe("ads-0007");
+    expect(ads0007?.folder).toBe("0007-resource-representation");
+    expect(ads0007?.title).toBe("ADS-0007: Resource Representation Consistency");
+    expect(ads0007?.sidebarTitle).toBe("ADS-0007 · Resource Representation");
+    expect(ads0007?.status).toBe("Approved");
+    expect(ads0007?.updated).toBe("2026-11-28");
+    expect(ads0007?.rules.map((rule) => rule.id)).toEqual([
+      "photon-ads/ads-0007-response-representation-consistency",
+      "photon-ads/ads-0007-collection-slice-subset",
+      "photon-ads/ads-0007-mutation-input-symmetry",
+      "photon-ads/ads-0007-resource-annotation-valid",
+      "photon-ads/ads-0007-derived-schema-compatibility",
+    ]);
+    expect(ads0007?.rules.every((rule) => rule.severity === "error")).toBe(true);
+    expect(ads0007?.body).not.toMatch(/^---/);
+    expect(ads0007?.body).not.toMatch(/^#\s+/);
+    expect(ads0007?.body).toContain("## Scope");
+    expect(ads0007?.body).toContain("## Normative Rules");
+    expect(ads0007?.body).toContain("## Examples");
+    expect(ads0007?.body).toContain("## Changelog");
+    expect(ads0007?.body).toContain("Approved and published as `ADS-0007`");
+    expect(ads0007?.body).toContain(
+      "Forward cursor pagination (`pageSize`, `pageToken`, `nextPageToken`) is defined in `ADS-0006`.",
+    );
+    expect(ads0007?.body).not.toMatch(/^##\s+(?:Deterministic\s+)?Lint\s+Rules\b/im);
+    expect(() =>
+      validateMintlifyMdxSafety("ads/0007-resource-representation/index.md", ads0007?.body ?? ""),
+    ).not.toThrow();
+
     for (const standard of first.standards) {
       expect(standard.status).toBe("Approved");
       for (const pattern of FORBIDDEN_DOCS_PATTERNS) {
@@ -546,6 +579,7 @@ describe("docs-reference export", () => {
         "ads-0004",
         "ads-0005",
         "ads-0006",
+        "ads-0007",
       ]);
       expect(exported.standards.every((standard) => standard.status === "Approved")).toBe(true);
     } finally {
