@@ -1,7 +1,7 @@
 ---
 title: "ADS-0007: Resource Representation Consistency"
 sidebarTitle: "ADS-0007 · Resource Representation"
-description: "Single canonical resource schemas, per-service Operation resources, cross-method response consistency, strict collection slices, mutation input symmetry, and the x-photon-resource OpenAPI extension across Photon public HTTP APIs."
+description: "Single canonical resource schemas, per-service Operation resources, cross-method response consistency, strict collection slices, mutation input symmetry, sub-resources, and the x-photon-resource OpenAPI extension across Photon public HTTP APIs."
 ads: "0007"
 status: "Approved"
 updated: "2026-11-28"
@@ -24,7 +24,7 @@ This standard governs schema consistency across every representation of a resour
 - Strict subset guarantees for collection `GET` item slices.
 - Field-name, type, and writability symmetry for `POST`, `PATCH`, and `PUT` request bodies.
 - Declarative schema roles through the `x-photon-resource` OpenAPI extension.
-- Embedded resources, nested slices, and owned value objects inside a parent resource's fields.
+- Sub-resources: owned value objects, embedded resources and nested slices, and URL-nested collection and singleton sub-resources.
 
 Related concerns are governed by separate standards:
 
@@ -130,18 +130,47 @@ Each derived `role` enforces a strict contract against its canonical schema `C`:
 | `patch` | Strict subset of `C` with compatible types (recursively) | Forbidden (`readOnly: true`, `id`, `createdAt`, `updatedAt`, embedded resources per §7) | No top-level `required` (except an explicit union discriminator); `additionalProperties: false` (or `unevaluatedProperties: false`) required per `ADS-0005` §6 |
 | `replace` | Strict subset of `C` with compatible types (recursively) | Forbidden (`readOnly: true`, `id`, `createdAt`, `updatedAt`, embedded resources per §7) | Full-replacement `PUT` input |
 
-### 7. Embedded Resources and Owned Value Objects
+### 7. Sub-Resources: Owned Value Objects, Embedded Resources, and Nested Routes
 
-A parent resource's JSON fields **MAY** contain sub-objects. How a sub-object behaves depends on whether it has an identity of its own:
+A resource can relate to a smaller resource or object in one of three ways. Choose the pattern by whether the sub-object has an identity and a lifecycle of its own:
 
-- **Owned value objects**: A 1:1 sub-object owned exclusively by the parent, with no independent identity, endpoint, or `x-photon-resource` annotation (for example `notifications` or `scheduledPlanChange`), lives inline in `C`. Mutable owned value objects are writable in `create`, `patch`, and `replace` inputs and merge recursively on `PATCH` per `ADS-0005` §6.
-- **Embedded canonical resources and slices**: When a parent embeds another resource (for example `Subscription.plan` embedding `Plan`) or a projection of one (for example `PaymentAction.operation` embedding `OperationSummary`), the embedded property:
-  - **MUST** reuse the target's canonical schema or a strict `slice` of it, never an ad-hoc third shape.
-  - **MUST NOT** embed unbounded child collections; expose a separate paginated collection endpoint per `ADS-0006` instead.
-  - **MUST NOT** use polymorphic expand unions that return either an identifier string or the object (`string | Object`); pair a flat `<resource>Id` field with the embedded object instead.
-  - **MUST** remain read-only on parent mutations: collection `POST`, `PATCH`, and `PUT` request bodies, and `create`, `patch`, and `replace` schemas, **MUST NOT** accept embedded canonical or `slice` resources as writable inputs, even when the embedded property on `C` is not marked `readOnly: true`. Change the relationship through the flat `<resource>Id` field or through the embedded resource's own endpoints.
-- **Nested slicing**: A parent `slice` (such as a collection list item) **MAY** omit an embedded resource or narrow it to a strict `slice` of the embedded resource's canonical schema.
-- A property embeds a resource when its schema, directly or through `$ref`, an `allOf` member, an `anyOf` or `oneOf` branch (including a nullable branch), or array `items`, resolves to a schema that declares canonical `x-photon-resource: { type }` or derived `x-photon-resource: { role: "slice" }`.
+| Pattern | Identity and endpoint | `x-photon-resource` | Where it appears | Writable through the parent |
+| --- | --- | --- | --- | --- |
+| Owned value object | None; exists only inside the parent | None | Inline property of `C` | Yes, in `create`, `patch`, and `replace` inputs |
+| Embedded canonical resource or slice | Its own canonical resource and endpoints | `{ type }` on the canonical schema, or `{ role: "slice", canonical }` | Property of `C`, beside a flat `<resource>Id` | No; change `<resource>Id` or use the resource's own endpoints |
+| URL-nested sub-resource | Its own canonical resource, mounted under the parent path | `{ type }` on the canonical schema | A separate route, not a property of `C` | Through its own `POST`, `PATCH`, or `PUT` routes |
+
+#### 7.1 Owned value objects
+
+An owned value object is a 1:1 sub-object owned exclusively by the parent, with no independent identity, endpoint, or `x-photon-resource` annotation (for example `notifications` or `scheduledPlanChange`).
+
+- It **MUST** be declared inline in `C` (directly or through a `$ref` to an unannotated component schema).
+- When mutable, it **MUST** be writable in `create`, `patch`, and `replace` inputs with the same shape as on `C`.
+- In `PATCH` request bodies, its fields **MUST** be recursively optional, it **MUST** declare `additionalProperties: false` (or `unevaluatedProperties: false`), and it merges recursively per `ADS-0005` §6.
+
+#### 7.2 Embedded canonical resources and slices
+
+A parent **MAY** embed another resource (for example `Subscription.plan` embedding `Plan`) or a projection of one (for example `PaymentAction.operation` embedding `OperationSummary`) for read convenience. The embedded property:
+
+- **MUST** reuse the embedded resource's canonical schema (`x-photon-resource: { type }`) or a strict `slice` of it (`x-photon-resource: { role: "slice", canonical }`), never an ad-hoc third shape.
+- **SHOULD** sit beside a flat `<resource>Id` field (for example `planId`) that carries the identifier per `ADS-0001`.
+- **MUST NOT** embed unbounded child collections; expose a separate paginated collection endpoint per `ADS-0006` instead.
+- **MUST NOT** use polymorphic expand unions that return either an identifier string or the object (`string | Plan`, `string | Plan | null`, `(string | Plan)[]`, or `string[] | Plan[]`). Always return the embedded object in the same shape and pair it with the flat `<resource>Id` field.
+- **MUST** remain read-only on parent mutations. Collection `POST`, `PATCH`, and `PUT` request bodies, and `create`, `patch`, and `replace` schemas, **MUST NOT** accept an embedded canonical resource or `slice` as a writable input, even when the embedded property on `C` does not carry `readOnly: true`. This also applies to an embedded resource nested inside an owned value object.
+- **MUST NOT** embed a `create`, `patch`, or `replace` input schema inside a read representation.
+
+A property embeds a resource when its schema, directly or through `$ref`, an `allOf` member, an `anyOf` or `oneOf` branch (including a nullable branch), or array `items`, resolves to a schema that declares canonical `x-photon-resource: { type }` or `x-photon-resource: { role: "slice" }`. A sub-object whose schema carries no `x-photon-resource` annotation is treated as an owned value object, so the embedded-resource rules in this section apply only to annotated targets.
+
+**Nested slicing**: A parent `slice` (such as a collection list item) **MAY** omit an embedded resource or narrow it to a `slice` whose `x-photon-resource.canonical` points to the same canonical resource that `C` embeds. A nested slice **MUST NOT** substitute a slice of a different canonical resource, even when that slice is structurally a subset (for example narrowing `Subscription.plan` to an `InvoiceSummary` that declares only `id`). When `C` embeds a polymorphic union of canonical resources (for example `Cat | Dog`), a nested slice **MAY** narrow it to slices of any of those members.
+
+#### 7.3 URL-nested independent sub-resources
+
+An independent canonical resource (`x-photon-resource: { type }`) **MAY** be mounted under a parent path instead of being embedded in the parent's representation:
+
+- **Collection sub-resources** (for example `/v1/projects/{projectId}/api-keys` with a nested or hoisted single-resource `/{apiKeyId}` route) stay decoupled from the parent's JSON representation. The parent **MUST NOT** embed the full collection; clients list it through the paginated collection endpoint.
+- **Singleton sub-resources** (for example `/v1/projects/{projectId}/subscription`, `/v1/subscriptions/{subscriptionId}/usage`, or `/v1/projects/{projectId}/settings`) model a 0..1 or 1:1 sub-resource that warrants its own endpoint because it is heavy or computed, needs independent authorization, or has an independent mutation lifecycle. A singleton's `GET` defines its canonical schema `C`, and `PATCH` or `PUT` on the same path follow §3 and §5 like any other resource.
+
+`x-photon-resource` stays URL-agnostic. It declares only `type`, `role`, `canonical`, and `nonResourceInputs`, with no parent or singleton metadata. Route hierarchy is inferred from the OpenAPI `paths` and the canonical schemas those routes return.
 
 ## Examples
 
@@ -369,9 +398,9 @@ components:
                   type: "null"
 ```
 
-### Embedded resources, nested slices, and owned value objects
+### Sub-resources: owned value objects, embedded resources, and nested slices
 
-**Good** — `Subscription` embeds the canonical `Plan` next to a flat `planId` and owns an inline `notifications` value object. The list slice narrows `plan` to `PlanSummary`, and the `patch` input changes the plan only through `planId` while `notifications` stays recursively optional:
+**Good** — `Subscription` embeds the canonical `Plan` beside a flat `planId` and owns an inline `notifications` value object. The list slice narrows `plan` to `PlanSummary`, a slice of the same canonical `Plan`. The `patch` input changes the plan only through `planId`, and `notifications` stays recursively optional:
 
 ```yaml
 components:
@@ -441,6 +470,32 @@ components:
             sms: { type: boolean }
 ```
 
+**Good** — a singleton sub-resource with its own endpoint. `GET` and `PATCH` share one path and one canonical schema:
+
+```yaml
+paths:
+  /v1/projects/{projectId}/subscription:
+    get:
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Subscription"
+    patch:
+      requestBody:
+        content:
+          application/merge-patch+json:
+            schema:
+              $ref: "#/components/schemas/UpdateSubscriptionRequest"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Subscription"
+```
+
 **Bad** — a `patch` input that accepts the embedded `Plan` as a writable object instead of `planId`:
 
 ```yaml
@@ -453,6 +508,42 @@ UpdateSubscriptionRequest:
   properties:
     plan:
       $ref: "#/components/schemas/Plan"
+```
+
+**Bad** — a polymorphic expand union that returns either the plan identifier or the plan object:
+
+```yaml
+Subscription:
+  x-photon-resource:
+    type: billing.subscription
+  type: object
+  properties:
+    plan:
+      oneOf:
+        - type: string
+        - $ref: "#/components/schemas/Plan"
+```
+
+**Bad** — a nested slice that narrows `Subscription.plan` to a slice of a different canonical resource. It fails even though `InvoiceSummary` declares only `id`, because `Subscription.plan` embeds `Plan`:
+
+```yaml
+InvoiceSummary:
+  x-photon-resource:
+    role: slice
+    canonical: "#/components/schemas/Invoice"
+  type: object
+  properties:
+    id: { type: string }
+
+SubscriptionSummary:
+  x-photon-resource:
+    role: slice
+    canonical: "#/components/schemas/Subscription"
+  type: object
+  properties:
+    id: { type: string }
+    plan:
+      $ref: "#/components/schemas/InvoiceSummary"
 ```
 
 ### Non-conformant patterns
@@ -503,19 +594,21 @@ components:
 
 ## Lint Rules
 
-The `@photon-hq/api-design-standards` Redocly plugin (`photon-ads`) enforces ADS-0007 using a two-tier model with five deterministic OpenAPI 3 rules. All five rules run at `error` severity in `photon-ads/recommended` and support declarative rule-level `ignore` entries (`path`, optional `method`, and optional `schema`).
+The `@photon-hq/api-design-standards` Redocly plugin (`photon-ads`) enforces ADS-0007 using a two-tier model with six deterministic OpenAPI 3 rules. All six rules run at `error` severity in `photon-ads/recommended` and support declarative rule-level `ignore` entries (`path`, optional `method`, and optional `schema`).
 
 - **Tier 1 (zero-annotation structural rules)**: `photon-ads/ads-0007-response-representation-consistency`, `photon-ads/ads-0007-collection-slice-subset`, and `photon-ads/ads-0007-mutation-input-symmetry` operate automatically on OpenAPI path topology without requiring `x-photon-resource`. Direct child routes (`.../{resourceId}`) and hoisted canonical routes (stripping one or more leading `/<scope>/{<scopeParam>}` pairs after any version prefix and confirming schema overlap) are resolved automatically.
-- **Tier 2 (`x-photon-resource` rules)**: `photon-ads/ads-0007-resource-annotation-valid` and `photon-ads/ads-0007-derived-schema-compatibility` validate every `x-photon-resource` annotation and enforce strict role contracts (`slice`, `create`, `patch`, `replace`) against the referenced canonical component schema.
+- **Tier 2 (`x-photon-resource` rules)**: `photon-ads/ads-0007-resource-annotation-valid`, `photon-ads/ads-0007-derived-schema-compatibility`, and `photon-ads/ads-0007-no-polymorphic-expand` validate every `x-photon-resource` annotation, enforce strict role contracts (`slice`, `create`, `patch`, `replace`) against the referenced canonical component schema, and reject `string | Object` expand unions over annotated resources.
+- **Embedded resources (§7)**: The embedded-resource checks in the Tier 1 and Tier 2 rules recognize an embedded resource only when its target schema declares `x-photon-resource`, so unannotated owned value objects never trigger them.
 
 | Rule ID | Default Severity | What it enforces |
 | --- | --- | --- |
 | `photon-ads/ads-0007-response-representation-consistency` | `error` | Requires `PATCH 200`, `PUT 200`/`201`, and synchronous collection `POST 200`/`201` JSON responses to be structurally consistent with the resource's canonical single-resource `GET 200` schema (allowing flat one-time creation secrets per `ADS-0002` §3 and excluding `ADS-0004` `Operation` responses and `204` responses). |
-| `photon-ads/ads-0007-collection-slice-subset` | `error` | Requires every collection `GET 200` list item schema to be a strict property and type subset of its corresponding direct or hoisted canonical single-resource `GET 200` schema (recursively across nested objects and arrays). |
+| `photon-ads/ads-0007-collection-slice-subset` | `error` | Requires every collection `GET 200` list item schema to be a strict property and type subset of its corresponding direct or hoisted canonical single-resource `GET 200` schema (recursively across nested objects and arrays), and requires a nested slice of an embedded resource to target the same canonical resource that the canonical schema embeds (§7.2). |
 | `photon-ads/ads-0007-mutation-input-symmetry` | `error` | Requires every `PATCH`, `PUT`, and collection `POST` JSON request body property overlapping with the canonical `GET 200` schema to use a compatible type recursively, and rejects `readOnly: true` canonical properties, embedded canonical resources and slices (§7), and server-managed `createdAt`/`updatedAt` (and `id` on `PATCH`/`PUT`). |
 | `photon-ads/ads-0007-resource-annotation-valid` | `error` | Validates every `x-photon-resource` extension: enforces canonical `type` format (`^[a-z][a-z0-9-]*\.[a-z][a-z0-9-]*$`) and document-wide uniqueness, validates derived `role` (`slice`, `create`, `patch`, `replace`) and local `#/components/schemas/<Name>` pointer to an existing canonical schema (no dangling refs, self-refs, or derived chains), and validates `nonResourceInputs` (allowed only on `create`, non-empty unique strings declared on the derived schema and absent from the canonical schema). |
-| `photon-ads/ads-0007-derived-schema-compatibility` | `error` | Enforces strict role compatibility for every derived `x-photon-resource` schema against its canonical schema: property/type subsetting (excluding declared `nonResourceInputs` on `create`), `readOnly`/server-managed field and embedded canonical resource or slice rejection on `create`/`patch`/`replace`, and RFC 7396 optional-fields plus `additionalProperties: false` (or `unevaluatedProperties: false`) checks on `patch`. |
+| `photon-ads/ads-0007-derived-schema-compatibility` | `error` | Enforces strict role compatibility for every derived `x-photon-resource` schema against its canonical schema: property/type subsetting (excluding declared `nonResourceInputs` on `create`), `readOnly`/server-managed field and embedded canonical resource or slice rejection on `create`/`patch`/`replace`, nested-slice canonical-target integrity for embedded resources (§7.2), and RFC 7396 optional-fields plus `additionalProperties: false` (or `unevaluatedProperties: false`) checks on `patch`. |
+| `photon-ads/ads-0007-no-polymorphic-expand` | `error` | Rejects any `anyOf` or `oneOf` that combines a string branch (including a string array) with a branch embedding a schema that declares canonical `x-photon-resource: { type }` or `{ role: "slice" }`, directly or through `$ref`, `allOf`, or array `items` (§7.2). `string | null` and unions with unannotated objects are allowed. |
 
 ## Changelog
 
-- **2026-11-28**: Approved and published as `ADS-0007`, defining the canonical resource model, per-service `Operation` canonical resources, cross-method response consistency, collection slices, mutation input symmetry, the `x-photon-resource` OpenAPI extension, and embedded resource and owned value object rules.
+- **2026-11-28**: Approved and published as `ADS-0007`, defining the canonical resource model, per-service `Operation` canonical resources, cross-method response consistency, collection slices, mutation input symmetry, the `x-photon-resource` OpenAPI extension, and sub-resource rules for owned value objects, embedded resources and nested slices, and URL-nested collection and singleton sub-resources.

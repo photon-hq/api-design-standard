@@ -42,49 +42,155 @@ import type { RedoclyLocation, RedoclyUserContext } from "./types.js";
 
 export const PHOTON_RESOURCE_EXTENSION = "x-photon-resource";
 
-function schemaEmbedsResource(
+const COMPONENT_SCHEMA_REF_NAME_RE = /#\/components\/schemas\/([^/]+)$/;
+const WRITE_RESOURCE_ROLES = new Set<string>(["create", "patch", "replace"]);
+
+export interface EmbeddedResourceAnnotation {
+  readonly canonicalType?: string;
+  readonly canonicalName: string;
+  readonly writeRole?: string;
+}
+
+function componentNameFromRef(ref: string): string | undefined {
+  const match = COMPONENT_SCHEMA_REF_NAME_RE.exec(ref);
+  return match?.[1] ? decodeURIComponent(match[1]) : undefined;
+}
+
+function embeddedAnnotationFor(
+  ext: UnknownRecord,
+  refName: string | undefined,
+  resolve: ResolverFn,
+  from: string | undefined,
+): EmbeddedResourceAnnotation | null {
+  if (typeof ext.type === "string") {
+    return { canonicalType: ext.type, canonicalName: refName ?? ext.type };
+  }
+  if (typeof ext.role !== "string" || typeof ext.canonical !== "string") {
+    return null;
+  }
+  const canonicalName = componentNameFromRef(ext.canonical) ?? ext.canonical;
+  if (WRITE_RESOURCE_ROLES.has(ext.role)) {
+    return { canonicalName, writeRole: ext.role };
+  }
+  if (ext.role !== "slice") {
+    return null;
+  }
+  const canonical = safeResolveSchema(resolve, { $ref: ext.canonical }, from)?.node;
+  const canonicalExt = isRecord(canonical) ? canonical[PHOTON_RESOURCE_EXTENSION] : undefined;
+  return {
+    ...(isRecord(canonicalExt) && typeof canonicalExt.type === "string"
+      ? { canonicalType: canonicalExt.type }
+      : {}),
+    canonicalName,
+  };
+}
+
+export function collectEmbeddedResourceAnnotations(
   schema: unknown,
   resolve: ResolverFn,
   from: string | undefined,
-  seen: ReadonlySet<unknown>,
-): boolean {
+  refName?: string,
+  seen: ReadonlySet<unknown> = new Set(),
+): EmbeddedResourceAnnotation[] {
   if (!isRecord(schema) || seen.has(schema)) {
-    return false;
+    return [];
   }
   const ext = schema[PHOTON_RESOURCE_EXTENSION];
-  if (isRecord(ext) && (typeof ext.type === "string" || ext.role === "slice")) {
-    return true;
+  if (isRecord(ext)) {
+    const annotation = embeddedAnnotationFor(ext, refName, resolve, from);
+    return annotation ? [annotation] : [];
   }
   const nextSeen = new Set(seen);
   nextSeen.add(schema);
+  const found: EmbeddedResourceAnnotation[] = [];
   if (typeof schema.$ref === "string") {
     const resolved = safeResolveSchema(resolve, schema, from);
-    if (
-      resolved &&
-      schemaEmbedsResource(resolved.node, resolve, resolved.location?.source?.absoluteRef, nextSeen)
-    ) {
-      return true;
+    if (resolved) {
+      found.push(
+        ...collectEmbeddedResourceAnnotations(
+          resolved.node,
+          resolve,
+          resolved.location?.source?.absoluteRef ?? from,
+          componentNameFromRef(schema.$ref),
+          nextSeen,
+        ),
+      );
     }
   }
   for (const key of ["allOf", "anyOf", "oneOf"] as const) {
     const branches = schema[key];
-    if (
-      Array.isArray(branches) &&
-      branches.some((branch) => schemaEmbedsResource(branch, resolve, from, nextSeen))
-    ) {
-      return true;
+    if (Array.isArray(branches)) {
+      for (const branch of branches) {
+        found.push(
+          ...collectEmbeddedResourceAnnotations(branch, resolve, from, undefined, nextSeen),
+        );
+      }
     }
   }
-  return schemaEmbedsResource(schema.items, resolve, from, nextSeen);
+  found.push(
+    ...collectEmbeddedResourceAnnotations(schema.items, resolve, from, undefined, nextSeen),
+  );
+  return found;
+}
+
+export function schemaEmbedsResource(
+  schema: unknown,
+  resolve: ResolverFn,
+  from: string | undefined,
+): boolean {
+  return collectEmbeddedResourceAnnotations(schema, resolve, from).some(
+    (annotation) => annotation.writeRole === undefined,
+  );
+}
+
+function trackedPropertyEmbeddedAnnotations(
+  prop: Pick<TrackedProperty, "fragments">,
+  resolve: ResolverFn,
+): EmbeddedResourceAnnotation[] {
+  return prop.fragments.flatMap((frag) =>
+    collectEmbeddedResourceAnnotations(frag.node, resolve, frag.from),
+  );
 }
 
 export function isTrackedPropertyEmbeddedResource(
   prop: TrackedProperty,
   resolve: ResolverFn,
 ): boolean {
-  return prop.fragments.some((frag) =>
-    schemaEmbedsResource(frag.node, resolve, frag.from, new Set()),
+  return trackedPropertyEmbeddedAnnotations(prop, resolve).some(
+    (annotation) => annotation.writeRole === undefined,
   );
+}
+
+function embeddedTargetMismatchReason(
+  source: Pick<TrackedProperty, "fragments">,
+  targets: readonly (TrackedProperty | undefined)[],
+  resolve: ResolverFn,
+): string | null {
+  const targetAnnotations = targets.flatMap((prop) =>
+    prop ? trackedPropertyEmbeddedAnnotations(prop, resolve) : [],
+  );
+  const targetKeys = new Set(
+    targetAnnotations
+      .filter((annotation) => annotation.writeRole === undefined)
+      .map((annotation) => annotation.canonicalType ?? annotation.canonicalName),
+  );
+  if (targetKeys.size === 0) {
+    return null;
+  }
+  const expected = [
+    ...new Set(targetAnnotations.map((annotation) => `"${annotation.canonicalName}"`)),
+  ]
+    .sort()
+    .join(", ");
+  for (const annotation of trackedPropertyEmbeddedAnnotations(source, resolve)) {
+    if (annotation.writeRole !== undefined) {
+      return `embeds a "${annotation.writeRole}" input schema of "${annotation.canonicalName}" in a read representation; embed the canonical resource ${expected} or a slice of it instead`;
+    }
+    if (!targetKeys.has(annotation.canonicalType ?? annotation.canonicalName)) {
+      return `embeds canonical resource "${annotation.canonicalName}" but the canonical schema embeds ${expected}; a nested slice must target the same canonical resource`;
+    }
+  }
+  return null;
 }
 
 const FULL_PARAM_SEGMENT_RE = /^\{([^}]+)\}$/;
@@ -1630,6 +1736,16 @@ function evaluateKeysAgainstCanonicals(
         });
         continue;
       }
+    }
+
+    const embeddedMismatch = embeddedTargetMismatchReason(
+      srcProp,
+      matchingTargets.map(({ cv }) => cv.properties.get(key)),
+      resolve,
+    );
+    if (embeddedMismatch) {
+      mismatches.push({ path: fieldPath, reason: embeddedMismatch });
+      continue;
     }
 
     if (matchingTargets.some(({ target }) => target === "any")) {

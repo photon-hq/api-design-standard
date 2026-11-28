@@ -386,6 +386,7 @@ describe("docs-reference export", () => {
       "photon-ads/ads-0007-mutation-input-symmetry",
       "photon-ads/ads-0007-resource-annotation-valid",
       "photon-ads/ads-0007-derived-schema-compatibility",
+      "photon-ads/ads-0007-no-polymorphic-expand",
     ]);
     expect(ads0007?.rules.every((rule) => rule.severity === "error")).toBe(true);
     expect(ads0007?.body).not.toMatch(/^---/);

@@ -178,7 +178,7 @@ afterAll(async () => {
 });
 
 describe("ADS-0007 unit helpers", () => {
-  it("exports metadata for all five error-level ADS-0007 rules", () => {
+  it("exports metadata for all six error-level ADS-0007 rules", () => {
     expect(ADS_0007_METADATA.ads).toBe("0007");
     expect(ADS_0007_METADATA.slug).toBe("ads-0007");
     expect(ADS_0007_METADATA.folder).toBe("0007-resource-representation");
@@ -188,6 +188,7 @@ describe("ADS-0007 unit helpers", () => {
       "photon-ads/ads-0007-mutation-input-symmetry",
       "photon-ads/ads-0007-resource-annotation-valid",
       "photon-ads/ads-0007-derived-schema-compatibility",
+      "photon-ads/ads-0007-no-polymorphic-expand",
     ]);
     expect(ADS_0007_METADATA.rules.every((r) => r.severity === "error")).toBe(true);
   });
@@ -1883,6 +1884,564 @@ describe("ADS-0007 Redocly rules", () => {
     expect(
       derivedFor("SubscriptionSummaryWithExtra").some((m) =>
         m.includes('property "plan.legacyCode" does not exist'),
+      ),
+    ).toBe(true);
+  });
+
+  it("applies ADS-0007 to URL-nested singleton sub-resources on the same path", async () => {
+    const doc = baseOpenApi({
+      paths: {
+        "/v1/projects/{projectId}/subscription": {
+          parameters: [pathParam("projectId")],
+          get: {
+            operationId: "getProjectSubscription",
+            summary: "Singleton subscription",
+            responses: {
+              "200": jsonResponse({ $ref: "#/components/schemas/ProjectSubscription" }),
+            },
+          },
+          patch: {
+            operationId: "patchProjectSubscription",
+            summary: "Update the singleton subscription",
+            requestBody: jsonRequestBody({
+              type: "object",
+              additionalProperties: false,
+              properties: { planId: { type: "string" }, autoRenew: { type: "boolean" } },
+            }),
+            responses: {
+              "200": jsonResponse({ $ref: "#/components/schemas/ProjectSubscription" }),
+            },
+          },
+          put: {
+            operationId: "replaceProjectSubscription",
+            summary: "Replace the singleton subscription",
+            requestBody: jsonRequestBody({
+              type: "object",
+              properties: { planId: { type: "string" }, autoRenew: { type: "boolean" } },
+            }),
+            responses: {
+              "200": jsonResponse({ $ref: "#/components/schemas/ProjectSubscription" }),
+            },
+          },
+        },
+        "/v1/subscriptions/{subscriptionId}/usage": {
+          parameters: [pathParam("subscriptionId")],
+          get: {
+            operationId: "getSubscriptionUsage",
+            summary: "Computed usage singleton",
+            responses: { "200": jsonResponse({ $ref: "#/components/schemas/SubscriptionUsage" }) },
+          },
+          patch: {
+            operationId: "patchSubscriptionUsage",
+            summary: "PATCH with type drift and a readOnly input",
+            requestBody: jsonRequestBody({
+              type: "object",
+              additionalProperties: false,
+              properties: {
+                alertThreshold: { type: "string" },
+                totalMessages: { type: "integer" },
+              },
+            }),
+            responses: { "200": jsonResponse({ $ref: "#/components/schemas/SubscriptionUsage" }) },
+          },
+          put: {
+            operationId: "replaceSubscriptionUsage",
+            summary: "PUT returning a drifted representation",
+            requestBody: jsonRequestBody({
+              type: "object",
+              properties: { alertThreshold: { type: "integer" } },
+            }),
+            responses: {
+              "200": jsonResponse({
+                type: "object",
+                required: ["totalMessages", "alertThreshold"],
+                properties: {
+                  totalMessages: { type: "integer" },
+                  alertThreshold: { type: "integer" },
+                  legacyTotal: { type: "integer" },
+                },
+              }),
+            },
+          },
+        },
+      },
+      components: {
+        schemas: {
+          ProjectSubscription: {
+            type: "object",
+            required: ["planId", "autoRenew"],
+            properties: {
+              planId: { type: "string" },
+              autoRenew: { type: "boolean" },
+              updatedAt: { type: "string", format: "date-time", readOnly: true },
+            },
+          },
+          SubscriptionUsage: {
+            type: "object",
+            required: ["totalMessages", "alertThreshold"],
+            properties: {
+              totalMessages: { type: "integer", readOnly: true },
+              alertThreshold: { type: "integer" },
+            },
+          },
+        },
+      },
+    });
+
+    const { report } = await lintOpenApi(doc);
+    const messages = ads0007Problems(report).map((p) => `${p.ruleId} ${p.message}`);
+    expect(messages.filter((m) => m.includes("/v1/projects/{projectId}/subscription"))).toEqual([]);
+    expect(
+      messages.some(
+        (m) =>
+          m.includes("ads-0007-mutation-input-symmetry") &&
+          m.includes('PATCH "/v1/subscriptions/{subscriptionId}/usage"') &&
+          m.includes('"alertThreshold"'),
+      ),
+    ).toBe(true);
+    expect(
+      messages.some(
+        (m) =>
+          m.includes("ads-0007-mutation-input-symmetry") &&
+          m.includes('PATCH "/v1/subscriptions/{subscriptionId}/usage"') &&
+          m.includes('"totalMessages" is marked readOnly'),
+      ),
+    ).toBe(true);
+    expect(
+      messages.some(
+        (m) =>
+          m.includes("ads-0007-response-representation-consistency") &&
+          m.includes('PUT "/v1/subscriptions/{subscriptionId}/usage"') &&
+          m.includes("legacyTotal"),
+      ),
+    ).toBe(true);
+  });
+
+  it("rejects embedded resources written through owned value objects, nullable unions, and arrays", async () => {
+    const settingsWithPlan = {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        timezone: { type: "string" },
+        defaultPlan: { $ref: "#/components/schemas/Plan" },
+      },
+    };
+    const nullablePlan = {
+      anyOf: [{ $ref: "#/components/schemas/PlanSummary" }, { type: "null" }],
+    };
+    const addons = { type: "array", items: { $ref: "#/components/schemas/Addon" } };
+    const doc = baseOpenApi({
+      paths: {
+        "/v1/subscriptions": {
+          post: {
+            operationId: "createSubscription",
+            summary: "Writes an embedded plan nested in an owned value object",
+            requestBody: jsonRequestBody({
+              type: "object",
+              properties: { planId: { type: "string" }, settings: settingsWithPlan },
+            }),
+            responses: { "201": jsonResponse({ $ref: "#/components/schemas/Subscription" }) },
+          },
+        },
+        "/v1/subscriptions/{subscriptionId}": {
+          parameters: [pathParam("subscriptionId")],
+          get: {
+            operationId: "getSubscription",
+            summary: "Subscription canonical GET",
+            responses: { "200": jsonResponse({ $ref: "#/components/schemas/Subscription" }) },
+          },
+          patch: {
+            operationId: "patchSubscription",
+            summary: "Writes a nullable embedded plan slice",
+            requestBody: jsonRequestBody({
+              type: "object",
+              additionalProperties: false,
+              properties: {
+                previousPlan: nullablePlan,
+                settings: {
+                  type: "object",
+                  additionalProperties: false,
+                  properties: { timezone: { type: "string" } },
+                },
+              },
+            }),
+            responses: { "200": jsonResponse({ $ref: "#/components/schemas/Subscription" }) },
+          },
+          put: {
+            operationId: "replaceSubscription",
+            summary: "Writes an array of embedded add-ons",
+            requestBody: jsonRequestBody({
+              type: "object",
+              properties: { planId: { type: "string" }, addons },
+            }),
+            responses: { "200": jsonResponse({ $ref: "#/components/schemas/Subscription" }) },
+          },
+        },
+      },
+      components: {
+        schemas: {
+          Plan: {
+            "x-photon-resource": { type: "billing.plan" },
+            type: "object",
+            required: ["id"],
+            properties: { id: { type: "string" }, name: { type: "string" } },
+          },
+          PlanSummary: {
+            "x-photon-resource": { role: "slice", canonical: "#/components/schemas/Plan" },
+            type: "object",
+            required: ["id"],
+            properties: { id: { type: "string" } },
+          },
+          Addon: {
+            "x-photon-resource": { type: "billing.addon" },
+            type: "object",
+            required: ["id"],
+            properties: { id: { type: "string" } },
+          },
+          Subscription: {
+            "x-photon-resource": { type: "billing.subscription" },
+            type: "object",
+            required: ["id", "planId", "settings"],
+            properties: {
+              id: { type: "string", readOnly: true },
+              planId: { type: "string" },
+              settings: settingsWithPlan,
+              previousPlan: nullablePlan,
+              addons,
+            },
+          },
+          CreateSubscriptionRequest: {
+            "x-photon-resource": { role: "create", canonical: "#/components/schemas/Subscription" },
+            type: "object",
+            properties: { planId: { type: "string" }, settings: settingsWithPlan },
+          },
+          PatchSubscriptionRequest: {
+            "x-photon-resource": { role: "patch", canonical: "#/components/schemas/Subscription" },
+            type: "object",
+            additionalProperties: false,
+            properties: { previousPlan: nullablePlan },
+          },
+          ReplaceSubscriptionRequest: {
+            "x-photon-resource": {
+              role: "replace",
+              canonical: "#/components/schemas/Subscription",
+            },
+            type: "object",
+            properties: { planId: { type: "string" }, addons },
+          },
+        },
+      },
+    });
+
+    const { report } = await lintOpenApi(doc);
+    const embedded = "embeds a canonical resource or slice";
+    const mutMsgs = ads0007ProblemsFor(report, "ads-0007-mutation-input-symmetry").map(
+      (p) => p.message,
+    );
+    const derivMsgs = ads0007ProblemsFor(report, "ads-0007-derived-schema-compatibility").map(
+      (p) => p.message,
+    );
+    const hasMut = (prefix: string, field: string) =>
+      mutMsgs.some((m) => m.startsWith(prefix) && m.includes(`"${field}" ${embedded}`));
+    const hasDerived = (schemaName: string, field: string) =>
+      derivMsgs.some(
+        (m) => m.includes(`"${schemaName}"`) && m.includes(`property "${field}" ${embedded}`),
+      );
+
+    expect(hasMut('POST "/v1/subscriptions"', "settings.defaultPlan")).toBe(true);
+    expect(hasMut('PATCH "/v1/subscriptions/{subscriptionId}"', "previousPlan")).toBe(true);
+    expect(hasMut('PUT "/v1/subscriptions/{subscriptionId}"', "addons")).toBe(true);
+    expect(hasDerived("CreateSubscriptionRequest", "settings.defaultPlan")).toBe(true);
+    expect(hasDerived("PatchSubscriptionRequest", "previousPlan")).toBe(true);
+    expect(hasDerived("ReplaceSubscriptionRequest", "addons")).toBe(true);
+    expect(
+      [...mutMsgs, ...derivMsgs].some((m) => m.includes("timezone") || m.includes("planId")),
+    ).toBe(false);
+  });
+
+  it("rejects polymorphic string | resource expand unions", async () => {
+    const configPath = await writeRedoclyConfig({
+      "photon-ads/ads-0007-no-polymorphic-expand": {
+        severity: "error",
+        ignore: [{ schema: "LegacyExpand", reason: "Kept for compatibility" }],
+      },
+    });
+    const planRef = { $ref: "#/components/schemas/Plan" };
+    const doc = baseOpenApi({
+      paths: {
+        "/v1/invoices": {
+          post: {
+            operationId: "createInvoice",
+            summary: "Inline expand union in a request body",
+            requestBody: jsonRequestBody({
+              type: "object",
+              properties: { plan: { oneOf: [{ type: "string" }, planRef] } },
+            }),
+            responses: {
+              "201": jsonResponse({ type: "object", properties: { id: { type: "string" } } }),
+            },
+          },
+        },
+      },
+      components: {
+        schemas: {
+          Plan: {
+            "x-photon-resource": { type: "billing.plan" },
+            type: "object",
+            required: ["id"],
+            properties: { id: { type: "string" } },
+          },
+          PlanSummary: {
+            "x-photon-resource": { role: "slice", canonical: "#/components/schemas/Plan" },
+            type: "object",
+            properties: { id: { type: "string" } },
+          },
+          PlanId: { type: "string" },
+          PlainObject: { type: "object", properties: { id: { type: "string" } } },
+          Expansions: {
+            type: "object",
+            properties: {
+              planId: { type: "string" },
+              plan: planRef,
+              stringOrPlan: { oneOf: [{ type: "string" }, planRef] },
+              stringOrSliceOrNull: {
+                anyOf: [
+                  { type: "string" },
+                  { $ref: "#/components/schemas/PlanSummary" },
+                  { type: "null" },
+                ],
+              },
+              arrayUnion: {
+                oneOf: [
+                  { type: "array", items: { type: "string" } },
+                  { type: "array", items: planRef },
+                ],
+              },
+              unionItems: { type: "array", items: { anyOf: [{ type: "string" }, planRef] } },
+              refStringOrPlan: { oneOf: [{ $ref: "#/components/schemas/PlanId" }, planRef] },
+              nullableString: { anyOf: [{ type: "string" }, { type: "null" }] },
+              stringOrPlain: {
+                oneOf: [{ type: "string" }, { $ref: "#/components/schemas/PlainObject" }],
+              },
+            },
+          },
+          LegacyExpand: {
+            type: "object",
+            properties: { plan: { oneOf: [{ type: "string" }, planRef] } },
+          },
+        },
+      },
+    });
+
+    const { report } = await lintOpenApi(doc, configPath);
+    const pointers = ads0007ProblemsFor(report, "ads-0007-no-polymorphic-expand")
+      .map((p) => p.location?.[0]?.pointer ?? "")
+      .sort();
+    expect(pointers).toEqual(
+      [
+        "#/components/schemas/Expansions/properties/arrayUnion/oneOf",
+        "#/components/schemas/Expansions/properties/refStringOrPlan/oneOf",
+        "#/components/schemas/Expansions/properties/stringOrPlan/oneOf",
+        "#/components/schemas/Expansions/properties/stringOrSliceOrNull/anyOf",
+        "#/components/schemas/Expansions/properties/unionItems/items/anyOf",
+        "#/paths/~1v1~1invoices/post/requestBody/content/application~1json/schema/properties/plan/oneOf",
+      ].sort(),
+    );
+    expect(
+      ads0007ProblemsFor(report, "ads-0007-no-polymorphic-expand").every((p) =>
+        p.message.includes('flat "<resource>Id" string field'),
+      ),
+    ).toBe(true);
+  });
+
+  it("requires nested slices to target the canonical resource the parent embeds", async () => {
+    const listOf = (schemaName: string) =>
+      jsonResponse({
+        type: "object",
+        required: ["items"],
+        properties: {
+          items: { type: "array", items: { $ref: `#/components/schemas/${schemaName}` } },
+        },
+      });
+    const petVariant = (kind: string, timestampsRequired: boolean) => ({
+      type: "object",
+      required: timestampsRequired ? ["id", "kind", "createdAt", "updatedAt"] : ["id", "kind"],
+      properties: {
+        id: { type: "string" },
+        kind: { type: "string", const: kind },
+        createdAt: { type: "string", format: "date-time" },
+        updatedAt: { type: "string", format: "date-time" },
+      },
+    });
+    const doc = baseOpenApi({
+      paths: {
+        "/v1/subscriptions": {
+          get: {
+            operationId: "listSubscriptions",
+            summary: "List items narrow plan to a plan slice",
+            responses: { "200": listOf("SubscriptionSummary") },
+          },
+        },
+        "/v1/accounts/{accountId}/subscriptions": {
+          parameters: [pathParam("accountId")],
+          get: {
+            operationId: "listAccountSubscriptions",
+            summary: "List items narrow plan to an invoice slice",
+            responses: { "200": listOf("SubscriptionInvoiceSummary") },
+          },
+        },
+        "/v1/subscriptions/{subscriptionId}": {
+          parameters: [pathParam("subscriptionId")],
+          get: {
+            operationId: "getSubscription",
+            summary: "Subscription canonical GET",
+            responses: { "200": jsonResponse({ $ref: "#/components/schemas/Subscription" }) },
+          },
+        },
+        "/v1/pets": {
+          get: {
+            operationId: "listPets",
+            summary: "Polymorphic snapshots",
+            responses: { "200": listOf("PetSnapshot") },
+          },
+        },
+        "/v1/pets/{petId}": {
+          parameters: [pathParam("petId")],
+          get: {
+            operationId: "getPet",
+            summary: "Polymorphic canonical",
+            responses: { "200": jsonResponse({ $ref: "#/components/schemas/PetRecord" }) },
+          },
+        },
+      },
+      components: {
+        schemas: {
+          Plan: {
+            "x-photon-resource": { type: "billing.plan" },
+            type: "object",
+            required: ["id", "name"],
+            properties: { id: { type: "string" }, name: { type: "string" } },
+          },
+          PlanSummary: {
+            "x-photon-resource": { role: "slice", canonical: "#/components/schemas/Plan" },
+            type: "object",
+            required: ["id"],
+            properties: { id: { type: "string" } },
+          },
+          CreatePlanRequest: {
+            "x-photon-resource": { role: "create", canonical: "#/components/schemas/Plan" },
+            type: "object",
+            properties: { name: { type: "string" } },
+          },
+          Invoice: {
+            "x-photon-resource": { type: "billing.invoice" },
+            type: "object",
+            required: ["id"],
+            properties: { id: { type: "string" }, total: { type: "integer" } },
+          },
+          InvoiceSummary: {
+            "x-photon-resource": { role: "slice", canonical: "#/components/schemas/Invoice" },
+            type: "object",
+            properties: { id: { type: "string" } },
+          },
+          Cat: {
+            "x-photon-resource": { type: "pets.cat" },
+            type: "object",
+            required: ["id", "lives"],
+            properties: { id: { type: "string" }, lives: { type: "integer" } },
+          },
+          Dog: {
+            "x-photon-resource": { type: "pets.dog" },
+            type: "object",
+            required: ["id", "breed"],
+            properties: { id: { type: "string" }, breed: { type: "string" } },
+          },
+          CatSummary: {
+            "x-photon-resource": { role: "slice", canonical: "#/components/schemas/Cat" },
+            type: "object",
+            properties: { id: { type: "string" } },
+          },
+          Subscription: {
+            "x-photon-resource": { type: "billing.subscription" },
+            type: "object",
+            required: ["id", "plan", "companion"],
+            properties: {
+              id: { type: "string" },
+              plan: { $ref: "#/components/schemas/Plan" },
+              companion: {
+                oneOf: [{ $ref: "#/components/schemas/Cat" }, { $ref: "#/components/schemas/Dog" }],
+              },
+            },
+          },
+          SubscriptionSummary: {
+            "x-photon-resource": {
+              role: "slice",
+              canonical: "#/components/schemas/Subscription",
+            },
+            type: "object",
+            properties: {
+              id: { type: "string" },
+              plan: { $ref: "#/components/schemas/PlanSummary" },
+              companion: { $ref: "#/components/schemas/CatSummary" },
+            },
+          },
+          SubscriptionInvoiceSummary: {
+            "x-photon-resource": {
+              role: "slice",
+              canonical: "#/components/schemas/Subscription",
+            },
+            type: "object",
+            properties: {
+              id: { type: "string" },
+              plan: { $ref: "#/components/schemas/InvoiceSummary" },
+            },
+          },
+          SubscriptionInputSummary: {
+            "x-photon-resource": {
+              role: "slice",
+              canonical: "#/components/schemas/Subscription",
+            },
+            type: "object",
+            properties: { plan: { $ref: "#/components/schemas/CreatePlanRequest" } },
+          },
+          PetRecord: {
+            "x-photon-resource": { type: "pets.pet" },
+            oneOf: [petVariant("cat", true), petVariant("dog", true)],
+          },
+          PetSnapshot: {
+            "x-photon-resource": { role: "slice", canonical: "#/components/schemas/PetRecord" },
+            oneOf: [petVariant("cat", false), petVariant("dog", false)],
+          },
+        },
+      },
+    });
+
+    const { report } = await lintOpenApi(doc);
+    const sliceMsgs = ads0007ProblemsFor(report, "ads-0007-collection-slice-subset").map(
+      (p) => p.message,
+    );
+    const derivMsgs = ads0007ProblemsFor(report, "ads-0007-derived-schema-compatibility").map(
+      (p) => p.message,
+    );
+    const derivedFor = (schemaName: string) =>
+      derivMsgs.filter((m) => m.includes(`"${schemaName}"`));
+    const wrongTarget = 'property "plan" embeds canonical resource "Invoice"';
+
+    expect(derivedFor("SubscriptionSummary")).toEqual([]);
+    expect(derivedFor("PetSnapshot")).toEqual([]);
+    expect(derivedFor("SubscriptionInvoiceSummary").some((m) => m.includes(wrongTarget))).toBe(
+      true,
+    );
+    expect(
+      derivedFor("SubscriptionInputSummary").some((m) =>
+        m.includes('property "plan" embeds a "create" input schema of "Plan"'),
+      ),
+    ).toBe(true);
+    expect(sliceMsgs.filter((m) => m.includes('"/v1/subscriptions"'))).toEqual([]);
+    expect(sliceMsgs.filter((m) => m.includes('"/v1/pets"'))).toEqual([]);
+    expect(
+      sliceMsgs.some(
+        (m) => m.includes('"/v1/accounts/{accountId}/subscriptions"') && m.includes(wrongTarget),
       ),
     ).toBe(true);
   });

@@ -16,7 +16,7 @@ describe("photon-ads Redocly plugin exports", () => {
   it("exports plugin metadata, catalog helpers, ignore types, and Redocly plugin factory", () => {
     expect(PLUGIN_ID).toBe("photon-ads");
     expect(ADS_STANDARDS).toHaveLength(6);
-    expect(ADS_RULES).toHaveLength(23);
+    expect(ADS_RULES).toHaveLength(24);
 
     expect(getStandardByNumber("0001")?.folder).toBe("0001-resource-identifiers");
     expect(getStandardByNumber("0002")?.folder).toBe("0002-top-level-json-response");
@@ -49,6 +49,7 @@ describe("photon-ads Redocly plugin exports", () => {
     expect(getRuleById("photon-ads/ads-0007-mutation-input-symmetry")?.severity).toBe("error");
     expect(getRuleById("photon-ads/ads-0007-resource-annotation-valid")?.severity).toBe("error");
     expect(getRuleById("photon-ads/ads-0007-derived-schema-compatibility")?.severity).toBe("error");
+    expect(getRuleById("photon-ads/ads-0007-no-polymorphic-expand")?.severity).toBe("error");
     expect(getRuleById("photon-ads/does-not-exist")).toBeUndefined();
 
     const recommended = getRecommendedRulesConfig();
@@ -76,6 +77,7 @@ describe("photon-ads Redocly plugin exports", () => {
       "photon-ads/ads-0007-mutation-input-symmetry": "error",
       "photon-ads/ads-0007-resource-annotation-valid": "error",
       "photon-ads/ads-0007-derived-schema-compatibility": "error",
+      "photon-ads/ads-0007-no-polymorphic-expand": "error",
     });
 
     const ignoreEntry: AdsIgnoreEntry = {
@@ -118,6 +120,7 @@ describe("photon-ads Redocly plugin exports", () => {
       "ads-0007-collection-slice-subset",
       "ads-0007-derived-schema-compatibility",
       "ads-0007-mutation-input-symmetry",
+      "ads-0007-no-polymorphic-expand",
       "ads-0007-resource-annotation-valid",
       "ads-0007-response-representation-consistency",
     ]);

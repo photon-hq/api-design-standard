@@ -13,7 +13,7 @@ Each standard in **Photon API Design Standards (ADS)** defines a service-agnosti
 | [ADS-0004](./ads/0004-long-running-operations/index.md) | Long-Running Operations | Approved | `photon-ads/ads-0004-operation-resource-shape`, `photon-ads/ads-0004-operation-status-invariants`, `photon-ads/ads-0004-accepted-operation-headers`, `photon-ads/ads-0004-operation-cancel-method` |
 | [ADS-0005](./ads/0005-standard-resource-methods/index.md) | Standard Resource Methods and Lifecycle | Approved | `photon-ads/ads-0005-addressable-resource-read`, `photon-ads/ads-0005-standard-http-methods`, `photon-ads/ads-0005-standard-status-codes`, `photon-ads/ads-0005-url-path-naming`, `photon-ads/ads-0005-patch-merge-semantics` |
 | [ADS-0006](./ads/0006-list-pagination/index.md) | List Pagination | Approved | `photon-ads/ads-0006-standard-pagination-params`, `photon-ads/ads-0006-page-size-bounds`, `photon-ads/ads-0006-pagination-response-shape` |
-| [ADS-0007](./ads/0007-resource-representation/index.md) | Resource Representation Consistency | Approved | `photon-ads/ads-0007-response-representation-consistency`, `photon-ads/ads-0007-collection-slice-subset`, `photon-ads/ads-0007-mutation-input-symmetry`, `photon-ads/ads-0007-resource-annotation-valid`, `photon-ads/ads-0007-derived-schema-compatibility` |
+| [ADS-0007](./ads/0007-resource-representation/index.md) | Resource Representation Consistency | Approved | `photon-ads/ads-0007-response-representation-consistency`, `photon-ads/ads-0007-collection-slice-subset`, `photon-ads/ads-0007-mutation-input-symmetry`, `photon-ads/ads-0007-resource-annotation-valid`, `photon-ads/ads-0007-derived-schema-compatibility`, `photon-ads/ads-0007-no-polymorphic-expand` |
 
 ### Status Lifecycle
 
@@ -96,6 +96,7 @@ rules:
   photon-ads/ads-0007-mutation-input-symmetry: error
   photon-ads/ads-0007-resource-annotation-valid: error
   photon-ads/ads-0007-derived-schema-compatibility: error
+  photon-ads/ads-0007-no-polymorphic-expand: error
 ```
 
 Each `ignore` entry accepts `path`, `method`, `schema`, and an optional `reason` string:

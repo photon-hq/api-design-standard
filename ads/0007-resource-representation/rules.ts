@@ -34,6 +34,7 @@ import {
   QUERY_OR_ACTION_POST_SEGMENTS,
   SERVER_MANAGED_CREATE_KEYS,
   SERVER_MANAGED_MUTATION_KEYS,
+  schemaEmbedsResource,
   structuralPathKey,
   type VariantSubsetOptions,
   variantsOverlapForHoistedPairing,
@@ -145,6 +146,13 @@ export const ADS_0007_METADATA: AdsStandardMetadata = {
       severity: "error",
       summary:
         "Schemas declaring a derived x-photon-resource role (slice, create, patch, or replace) must strictly satisfy that role's field, type, readOnly, and merge-patch compatibility guarantees against their canonical resource schema.",
+    },
+    {
+      name: "ads-0007-no-polymorphic-expand",
+      id: `${PLUGIN_ID}/ads-0007-no-polymorphic-expand`,
+      severity: "error",
+      summary:
+        "anyOf and oneOf unions must not combine a string identifier branch with an embedded canonical resource or slice (string | Object expand unions); pair a flat <resource>Id field with the embedded object instead.",
     },
   ],
 };
@@ -1177,11 +1185,38 @@ interface DiscoveredResourceAnnotation {
   readonly label: string;
 }
 
+function schemaLabel(loc: RedoclyLocation, componentSchemaName?: string): string {
+  return componentSchemaName
+    ? `Component schema "${componentSchemaName}"`
+    : `Schema at "${loc.pointer}"`;
+}
+
 function collectResourceAnnotations(
   root: UnknownRecord,
   ctx: RedoclyUserContext,
 ): DiscoveredResourceAnnotation[] {
   const discovered: DiscoveredResourceAnnotation[] = [];
+  forEachDocumentSchema(root, ctx, (node, loc, componentSchemaName) => {
+    if (!Object.hasOwn(node, PHOTON_RESOURCE_EXTENSION)) {
+      return;
+    }
+    discovered.push({
+      schemaNode: node,
+      schemaLocation: loc,
+      extValue: node[PHOTON_RESOURCE_EXTENSION],
+      extLocation: loc.child([PHOTON_RESOURCE_EXTENSION]),
+      ...(componentSchemaName !== undefined ? { componentSchemaName } : {}),
+      label: schemaLabel(loc, componentSchemaName),
+    });
+  });
+  return discovered;
+}
+
+function forEachDocumentSchema(
+  root: UnknownRecord,
+  ctx: RedoclyUserContext,
+  visit: (node: UnknownRecord, loc: RedoclyLocation, componentSchemaName?: string) => void,
+): void {
   const visitedSchemas = new Set<object>();
 
   const walkSchema = (node: unknown, loc: RedoclyLocation, componentSchemaName?: string): void => {
@@ -1189,20 +1224,7 @@ function collectResourceAnnotations(
       return;
     }
     visitedSchemas.add(node);
-
-    if (Object.hasOwn(node, PHOTON_RESOURCE_EXTENSION)) {
-      const label = componentSchemaName
-        ? `Component schema "${componentSchemaName}"`
-        : `Schema at "${loc.pointer}"`;
-      discovered.push({
-        schemaNode: node,
-        schemaLocation: loc,
-        extValue: node[PHOTON_RESOURCE_EXTENSION],
-        extLocation: loc.child([PHOTON_RESOURCE_EXTENSION]),
-        ...(componentSchemaName !== undefined ? { componentSchemaName } : {}),
-        label,
-      });
-    }
+    visit(node, loc, componentSchemaName);
 
     for (const kw of SCHEMA_MAP_KEYWORDS) {
       const mapVal = node[kw];
@@ -1424,9 +1446,56 @@ function collectResourceAnnotations(
       walkPathItem(pathItem, webhooksLoc.child([name]));
     }
   }
-
-  return discovered;
 }
+
+function isStringishSchema(
+  schema: unknown,
+  resolve: ResolverFn,
+  from: string | undefined,
+): boolean {
+  const allowed = computeTypeConstraint(schema, resolve, from).allowed;
+  if (allowed.size === ALL_JSON_TYPE_SET.size) {
+    return false;
+  }
+  if (allowed.has("string")) {
+    return true;
+  }
+  if (!allowed.has("array") || !isRecord(schema)) {
+    return false;
+  }
+  const resolved = safeResolveSchema(resolve, schema, from);
+  const node = resolved ? resolved.node : schema;
+  return isRecord(node) && node.items !== undefined
+    ? isStringishSchema(node.items, resolve, resolved?.location?.source?.absoluteRef ?? from)
+    : false;
+}
+
+export const ads0007NoPolymorphicExpand: RedoclyOas3Rule = createRootRule(
+  ({ root, ctx, ignoreMatcher, reportOnce: report }) => {
+    forEachDocumentSchema(root, ctx, (node, loc, componentSchemaName) => {
+      if (isPointerContextIgnored(ignoreMatcher, extractPointerContext(loc.pointer))) {
+        return;
+      }
+      const from = loc.source?.absoluteRef;
+      for (const keyword of ["anyOf", "oneOf"] as const) {
+        const branches = node[keyword];
+        if (
+          !Array.isArray(branches) ||
+          !branches.some((branch) => isStringishSchema(branch, ctx.resolve, from)) ||
+          !branches.some((branch) => schemaEmbedsResource(branch, ctx.resolve, from))
+        ) {
+          continue;
+        }
+        report(
+          `polymorphic-expand:${keyword}`,
+          loc.child([keyword]),
+          `${schemaLabel(loc, componentSchemaName)} combines a string branch with an embedded canonical resource or slice in "${keyword}" (polymorphic expand union). Return the embedded object alone and pair it with a flat "<resource>Id" string field instead (ADS-0007).`,
+        );
+      }
+    });
+  },
+  { requirePaths: false },
+);
 
 function lookupLocalComponentSchema(
   root: UnknownRecord,
@@ -1891,4 +1960,5 @@ export const ads0007Rules: Record<string, RedoclyOas3Rule> = {
   "ads-0007-mutation-input-symmetry": ads0007MutationInputSymmetry,
   "ads-0007-resource-annotation-valid": ads0007ResourceAnnotationValid,
   "ads-0007-derived-schema-compatibility": ads0007DerivedSchemaCompatibility,
+  "ads-0007-no-polymorphic-expand": ads0007NoPolymorphicExpand,
 };
