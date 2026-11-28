@@ -248,6 +248,16 @@ components:
               type: string
               readOnly: true
 paths:
+  /v1/projects/{projectId}:
+    get:
+      summary: Get a project
+      responses:
+        "200":
+          description: Canonical project representation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Project"
   /v1/projects/{projectId}/api-keys/{apiKeyId}:
     get:
       summary: Get an API key

@@ -1612,7 +1612,7 @@ function compareAdditionalPropertiesAgainstCanonicals(
     sourceVariant.additionalPropertiesSchemas.length > 0 ||
     sourceVariant.openAdditionalProperties ||
     isFreeFormOpenSource;
-  if (!sourceAllowsExtra) {
+  if (!sourceAllowsExtra || sourceVariant.forbidsAdditionalProperties) {
     return null;
   }
   const allowsAnyTarget = canonicals.some(

@@ -806,12 +806,24 @@ describe("shared schema and OpenAPI utilities", () => {
   });
   it("memoizes boolean annotation lookups across shared acyclic schema DAGs", () => {
     const resolve: ResolverFn = (() => ({ error: new Error("no refs") })) as unknown as ResolverFn;
-    let node: Record<string, unknown> = { type: "string" };
+    const visitBudget = 1000;
+    let annotationReads = 0;
+    const countedNode = (fields: Record<string, unknown>): Record<string, unknown> =>
+      Object.defineProperty(fields, "readOnly", {
+        enumerable: false,
+        get() {
+          annotationReads += 1;
+          if (annotationReads > visitBudget) {
+            throw new Error("annotation lookup exceeded visit budget");
+          }
+          return undefined;
+        },
+      });
+    let node = countedNode({ type: "string" });
     for (let depth = 0; depth < 40; depth += 1) {
-      node = { allOf: [node, node] };
+      node = countedNode({ allOf: [node, node] });
     }
-    const started = performance.now();
     expect(isSchemaReadOnly(node, resolve)).toBe(false);
-    expect(performance.now() - started).toBeLessThan(1000);
+    expect(annotationReads).toBeLessThanOrEqual(41);
   });
 });

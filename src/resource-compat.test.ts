@@ -576,6 +576,29 @@ describe("shared resource compatibility helpers", () => {
       expect(checkPatchObjectVariantConstraints(scopedClosure)).toEqual([]);
     }
 
+    // A closed allOf branch keeps a full response closed against a closed canonical schema
+    const closedCanonical = {
+      type: "object",
+      additionalProperties: false,
+      required: ["id"],
+      properties: { id: { type: "string" } },
+    };
+    const closedAllOfResponse = {
+      allOf: [closedCanonical, { type: "object", additionalProperties: true }],
+    };
+    expect(
+      checkResponseCompatibleWithCanonical(
+        closedAllOfResponse,
+        loc,
+        closedCanonical,
+        loc,
+        resolve,
+        {
+          allowCreationSecret: false,
+        },
+      ).mismatches,
+    ).toEqual([]);
+
     // Adjacent additionalProperties: true still keeps unevaluatedProperties: false open
     const adjacentOpen = collectFlattenedObjectVariants(
       { type: "object", additionalProperties: true, unevaluatedProperties: false },

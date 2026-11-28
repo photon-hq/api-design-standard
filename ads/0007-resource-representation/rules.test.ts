@@ -103,6 +103,7 @@ async function writeRedoclyConfig(rules: Record<string, unknown>): Promise<strin
 function baseOpenApi(overrides: {
   openapi?: string;
   paths?: Record<string, unknown>;
+  webhooks?: Record<string, unknown>;
   components?: Record<string, unknown>;
 }): Record<string, unknown> {
   return {
@@ -118,6 +119,7 @@ function baseOpenApi(overrides: {
     },
     servers: [{ url: "https://api.example.com" }],
     paths: overrides.paths ?? {},
+    ...(overrides.webhooks ? { webhooks: overrides.webhooks } : {}),
     ...(overrides.components ? { components: overrides.components } : {}),
   };
 }
@@ -1601,6 +1603,17 @@ describe("ADS-0007 Redocly rules", () => {
           },
         },
       },
+      webhooks: {
+        "x-order-completed": {
+          post: {
+            requestBody: jsonRequestBody({
+              type: "object",
+              "x-photon-resource": { type: "BAD_WEBHOOK_NAME" },
+            }),
+            responses: { "200": { description: "Received" } },
+          },
+        },
+      },
       components: {
         schemas: {
           Gadget: {
@@ -1641,6 +1654,7 @@ describe("ADS-0007 Redocly rules", () => {
       ),
     ).toBe(true);
     expect(annotMsgs.some((m) => m.includes("BAD_EXTENSION_PATH"))).toBe(false);
+    expect(annotMsgs.some((m) => m.includes("BAD_WEBHOOK_NAME"))).toBe(true);
     expect(
       derivMsgs.some((m) => m.includes("NullablePatchGadget") && m.includes("non-object type")),
     ).toBe(true);

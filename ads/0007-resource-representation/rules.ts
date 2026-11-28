@@ -46,6 +46,7 @@ import {
   MAX_OBJECT_VARIANTS,
   propertyTypeConstraint,
   type ResolverFn,
+  safeResolveSchema,
   selectPropertyReportLocation,
   type UnknownRecord,
   unescapeJsonPointerToken,
@@ -233,24 +234,32 @@ function extractCanonicalGetSchemas(
   return results;
 }
 
+interface DeclaredCanonicalPointer {
+  readonly pointer: string;
+  readonly from: string | undefined;
+}
+
 function resolveCanonicalPointerFromSchema(
   schema: unknown,
   resolve: ResolverFn,
   from?: string,
-): string | undefined {
+): DeclaredCanonicalPointer | undefined {
   if (!isRecord(schema)) {
     return undefined;
   }
   const ext = schema[PHOTON_RESOURCE_EXTENSION];
   if (isRecord(ext) && typeof ext.canonical === "string") {
-    return ext.canonical;
+    return { pointer: ext.canonical, from };
   }
   if (typeof schema.$ref === "string") {
-    const resolved = resolve<UnknownRecord>({ $ref: schema.$ref }, from);
-    if (resolved && !resolved.error && isRecord(resolved.node)) {
+    const resolved = safeResolveSchema(resolve, schema, from);
+    if (resolved && isRecord(resolved.node)) {
       const targetExt = resolved.node[PHOTON_RESOURCE_EXTENSION];
       if (isRecord(targetExt) && typeof targetExt.canonical === "string") {
-        return targetExt.canonical;
+        return {
+          pointer: targetExt.canonical,
+          from: resolved.location?.source?.absoluteRef ?? from,
+        };
       }
     }
   }
@@ -258,15 +267,14 @@ function resolveCanonicalPointerFromSchema(
 }
 
 function matchesCanonicalPointer(
-  pointer: string,
-  sourceFrom: string | undefined,
+  declared: DeclaredCanonicalPointer,
   canonRef: ComponentRefIdentity | null,
   resolve: ResolverFn,
 ): boolean {
-  if (!canonRef || !LOCAL_COMPONENT_SCHEMA_REF_RE.test(pointer)) {
+  if (!canonRef || !LOCAL_COMPONENT_SCHEMA_REF_RE.test(declared.pointer)) {
     return false;
   }
-  const declaredRef = extractSingleComponentRef({ $ref: pointer }, resolve, sourceFrom);
+  const declaredRef = extractSingleComponentRef({ $ref: declared.pointer }, resolve, declared.from);
   return areComponentRefsSame(declaredRef, canonRef);
 }
 
@@ -286,9 +294,9 @@ function matchExplicitCanonicalPairing(
   if (areComponentRefsSame(srcRef, canonRef)) {
     return true;
   }
-  const declaredCanonicalPtr = resolveCanonicalPointerFromSchema(sourceSchema, resolve, sourceFrom);
-  if (declaredCanonicalPtr && LOCAL_COMPONENT_SCHEMA_REF_RE.test(declaredCanonicalPtr)) {
-    return matchesCanonicalPointer(declaredCanonicalPtr, sourceFrom, canonRef, resolve);
+  const declared = resolveCanonicalPointerFromSchema(sourceSchema, resolve, sourceFrom);
+  if (declared && LOCAL_COMPONENT_SCHEMA_REF_RE.test(declared.pointer)) {
+    return matchesCanonicalPointer(declared, canonRef, resolve);
   }
   return null;
 }
@@ -537,9 +545,12 @@ function pairCanonicalsByRequestBodyOrSingle(
     if (!mediaEntry.isJson || mediaEntry.schema === undefined) {
       continue;
     }
-    const mediaFrom = mediaEntry.schemaLocation.source?.absoluteRef;
-    const ptr = resolveCanonicalPointerFromSchema(mediaEntry.schema, resolve, mediaFrom);
-    if (!ptr || !LOCAL_COMPONENT_SCHEMA_REF_RE.test(ptr)) {
+    const declared = resolveCanonicalPointerFromSchema(
+      mediaEntry.schema,
+      resolve,
+      mediaEntry.schemaLocation.source?.absoluteRef,
+    );
+    if (!declared || !LOCAL_COMPONENT_SCHEMA_REF_RE.test(declared.pointer)) {
       continue;
     }
     for (const canon of canonicals) {
@@ -548,7 +559,7 @@ function pairCanonicalsByRequestBodyOrSingle(
         resolve,
         canon.schemaLocation.source?.absoluteRef,
       );
-      if (matchesCanonicalPointer(ptr, mediaFrom, canonRef, resolve)) {
+      if (matchesCanonicalPointer(declared, canonRef, resolve)) {
         explicitMatches.add(canon);
       }
     }
@@ -680,7 +691,7 @@ export const ads0007ResponseRepresentationConsistency: RedoclyOas3Rule = createR
             (v) =>
               v.typeConstraint.allowed.has("object") && !isStrictlyNullConstraint(v.typeConstraint),
           );
-          if (isOperationResponseVariants(objVariants202, ctx.resolve)) {
+          if (!collected202.truncated && isOperationResponseVariants(objVariants202, ctx.resolve)) {
             op202Targets.push({
               ref: extractSingleComponentRef(
                 s202.schema,
@@ -1293,7 +1304,7 @@ function collectResourceAnnotations(
       return;
     }
     for (const [cbName, cbObj] of Object.entries(callbacks)) {
-      if (cbName.startsWith("x-") || !isRecord(cbObj)) {
+      if (!isRecord(cbObj)) {
         continue;
       }
       const cbLoc = loc.child([cbName]);
@@ -1408,9 +1419,6 @@ function collectResourceAnnotations(
   if (isRecord(root.webhooks)) {
     const webhooksLoc = ctx.location.child(["webhooks"]);
     for (const [name, pathItem] of Object.entries(root.webhooks)) {
-      if (name.startsWith("x-")) {
-        continue;
-      }
       walkPathItem(pathItem, webhooksLoc.child([name]));
     }
   }
