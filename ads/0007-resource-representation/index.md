@@ -24,6 +24,7 @@ This standard governs schema consistency across every representation of a resour
 - Strict subset guarantees for collection `GET` item slices.
 - Field-name, type, and writability symmetry for `POST`, `PATCH`, and `PUT` request bodies.
 - Declarative schema roles through the `x-photon-resource` OpenAPI extension.
+- Embedded resources, nested slices, and owned value objects inside a parent resource's fields.
 
 Related concerns are governed by separate standards:
 
@@ -81,6 +82,7 @@ Request bodies for `PATCH`, `PUT`, and collection `POST` **MUST** stay symmetric
 - **No server-managed or `readOnly` inputs**:
   - `PATCH` and `PUT` request bodies **MUST NOT** accept `id`, `createdAt`, `updatedAt`, or any canonical property marked `readOnly: true`.
   - Collection `POST` request bodies **MUST NOT** accept `createdAt`, `updatedAt`, or any canonical property marked `readOnly: true`. Client-supplied `id` on creation is permitted only when `id` is writable (not marked `readOnly: true`) on `C`.
+  - Request bodies **MUST NOT** accept embedded canonical resources or slices as writable inputs (see §7).
 - **Merge Patch compliance on `PATCH`**: Every `PATCH` request body **MUST** additionally satisfy RFC 7396 JSON Merge Patch rules in `ADS-0005` §6 (no required top-level fields outside an explicit union discriminator, and `additionalProperties: false` or `unevaluatedProperties: false`).
 - **Non-resource creation inputs**: Collection `POST` request bodies **MAY** accept creation-only input fields that are consumed during resource creation and not stored directly on `C` (for example `templateId`, `initialPlanId`, or `sendInviteEmail`). When the schema carries `x-photon-resource`, declare those inputs explicitly in `nonResourceInputs` (see §6).
 
@@ -124,9 +126,22 @@ Each derived `role` enforces a strict contract against its canonical schema `C`:
 | Role | Allowed properties | `readOnly` / server-managed fields | Additional constraints |
 | --- | --- | --- | --- |
 | `slice` | Strict subset of `C` with compatible types (recursively) | Allowed (`id`, `createdAt`, etc.) | Used for list summaries and reduced projections |
-| `create` | Subset of `C` with compatible types, plus properties listed in `nonResourceInputs` | Forbidden (`readOnly: true`, `createdAt`, `updatedAt`) | Unlisted extra properties are rejected |
-| `patch` | Strict subset of `C` with compatible types (recursively) | Forbidden (`readOnly: true`, `id`, `createdAt`, `updatedAt`) | No top-level `required` (except an explicit union discriminator); `additionalProperties: false` (or `unevaluatedProperties: false`) required per `ADS-0005` §6 |
-| `replace` | Strict subset of `C` with compatible types (recursively) | Forbidden (`readOnly: true`, `id`, `createdAt`, `updatedAt`) | Full-replacement `PUT` input |
+| `create` | Subset of `C` with compatible types, plus properties listed in `nonResourceInputs` | Forbidden (`readOnly: true`, `createdAt`, `updatedAt`, embedded resources per §7) | Unlisted extra properties are rejected |
+| `patch` | Strict subset of `C` with compatible types (recursively) | Forbidden (`readOnly: true`, `id`, `createdAt`, `updatedAt`, embedded resources per §7) | No top-level `required` (except an explicit union discriminator); `additionalProperties: false` (or `unevaluatedProperties: false`) required per `ADS-0005` §6 |
+| `replace` | Strict subset of `C` with compatible types (recursively) | Forbidden (`readOnly: true`, `id`, `createdAt`, `updatedAt`, embedded resources per §7) | Full-replacement `PUT` input |
+
+### 7. Embedded Resources and Owned Value Objects
+
+A parent resource's JSON fields **MAY** contain sub-objects. How a sub-object behaves depends on whether it has an identity of its own:
+
+- **Owned value objects**: A 1:1 sub-object owned exclusively by the parent, with no independent identity, endpoint, or `x-photon-resource` annotation (for example `notifications` or `scheduledPlanChange`), lives inline in `C`. Mutable owned value objects are writable in `create`, `patch`, and `replace` inputs and merge recursively on `PATCH` per `ADS-0005` §6.
+- **Embedded canonical resources and slices**: When a parent embeds another resource (for example `Subscription.plan` embedding `Plan`) or a projection of one (for example `PaymentAction.operation` embedding `OperationSummary`), the embedded property:
+  - **MUST** reuse the target's canonical schema or a strict `slice` of it, never an ad-hoc third shape.
+  - **MUST NOT** embed unbounded child collections; expose a separate paginated collection endpoint per `ADS-0006` instead.
+  - **MUST NOT** use polymorphic expand unions that return either an identifier string or the object (`string | Object`); pair a flat `<resource>Id` field with the embedded object instead.
+  - **MUST** remain read-only on parent mutations: collection `POST`, `PATCH`, and `PUT` request bodies, and `create`, `patch`, and `replace` schemas, **MUST NOT** accept embedded canonical or `slice` resources as writable inputs, even when the embedded property on `C` is not marked `readOnly: true`. Change the relationship through the flat `<resource>Id` field or through the embedded resource's own endpoints.
+- **Nested slicing**: A parent `slice` (such as a collection list item) **MAY** omit an embedded resource or narrow it to a strict `slice` of the embedded resource's canonical schema.
+- A property embeds a resource when its schema, directly or through `$ref`, an `allOf` member, an `anyOf` or `oneOf` branch (including a nullable branch), or array `items`, resolves to a schema that declares canonical `x-photon-resource: { type }` or derived `x-photon-resource: { role: "slice" }`.
 
 ## Examples
 
@@ -354,6 +369,92 @@ components:
                   type: "null"
 ```
 
+### Embedded resources, nested slices, and owned value objects
+
+**Good** — `Subscription` embeds the canonical `Plan` next to a flat `planId` and owns an inline `notifications` value object. The list slice narrows `plan` to `PlanSummary`, and the `patch` input changes the plan only through `planId` while `notifications` stays recursively optional:
+
+```yaml
+components:
+  schemas:
+    Plan:
+      x-photon-resource:
+        type: billing.plan
+      type: object
+      required: [id, name, amount]
+      properties:
+        id: { type: string, readOnly: true }
+        name: { type: string }
+        amount: { type: integer }
+
+    PlanSummary:
+      x-photon-resource:
+        role: slice
+        canonical: "#/components/schemas/Plan"
+      type: object
+      required: [id, name]
+      properties:
+        id: { type: string, readOnly: true }
+        name: { type: string }
+
+    Subscription:
+      x-photon-resource:
+        type: billing.subscription
+      type: object
+      required: [id, planId, plan, notifications]
+      properties:
+        id: { type: string, readOnly: true }
+        planId: { type: string }
+        plan:
+          $ref: "#/components/schemas/Plan"
+        notifications:
+          type: object
+          additionalProperties: false
+          properties:
+            email: { type: boolean }
+            sms: { type: boolean }
+
+    SubscriptionSummary:
+      x-photon-resource:
+        role: slice
+        canonical: "#/components/schemas/Subscription"
+      type: object
+      required: [id, plan]
+      properties:
+        id: { type: string, readOnly: true }
+        plan:
+          $ref: "#/components/schemas/PlanSummary"
+
+    UpdateSubscriptionRequest:
+      x-photon-resource:
+        role: patch
+        canonical: "#/components/schemas/Subscription"
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        planId: { type: string }
+        notifications:
+          type: object
+          additionalProperties: false
+          properties:
+            email: { type: boolean }
+            sms: { type: boolean }
+```
+
+**Bad** — a `patch` input that accepts the embedded `Plan` as a writable object instead of `planId`:
+
+```yaml
+UpdateSubscriptionRequest:
+  x-photon-resource:
+    role: patch
+    canonical: "#/components/schemas/Subscription"
+  type: object
+  additionalProperties: false
+  properties:
+    plan:
+      $ref: "#/components/schemas/Plan"
+```
+
 ### Non-conformant patterns
 
 **Bad** — list item with extra list-only property and type drift, `PATCH` accepting `readOnly` `createdAt` and missing `additionalProperties: false`, `PATCH 200` returning a mismatched shape, and invalid `x-photon-resource` pointers:
@@ -411,10 +512,10 @@ The `@photon-hq/api-design-standards` Redocly plugin (`photon-ads`) enforces ADS
 | --- | --- | --- |
 | `photon-ads/ads-0007-response-representation-consistency` | `error` | Requires `PATCH 200`, `PUT 200`/`201`, and synchronous collection `POST 200`/`201` JSON responses to be structurally consistent with the resource's canonical single-resource `GET 200` schema (allowing flat one-time creation secrets per `ADS-0002` §3 and excluding `ADS-0004` `Operation` responses and `204` responses). |
 | `photon-ads/ads-0007-collection-slice-subset` | `error` | Requires every collection `GET 200` list item schema to be a strict property and type subset of its corresponding direct or hoisted canonical single-resource `GET 200` schema (recursively across nested objects and arrays). |
-| `photon-ads/ads-0007-mutation-input-symmetry` | `error` | Requires every `PATCH`, `PUT`, and collection `POST` JSON request body property overlapping with the canonical `GET 200` schema to use a compatible type recursively, and rejects `readOnly: true` canonical properties as well as server-managed `createdAt`/`updatedAt` (and `id` on `PATCH`/`PUT`). |
+| `photon-ads/ads-0007-mutation-input-symmetry` | `error` | Requires every `PATCH`, `PUT`, and collection `POST` JSON request body property overlapping with the canonical `GET 200` schema to use a compatible type recursively, and rejects `readOnly: true` canonical properties, embedded canonical resources and slices (§7), and server-managed `createdAt`/`updatedAt` (and `id` on `PATCH`/`PUT`). |
 | `photon-ads/ads-0007-resource-annotation-valid` | `error` | Validates every `x-photon-resource` extension: enforces canonical `type` format (`^[a-z][a-z0-9-]*\.[a-z][a-z0-9-]*$`) and document-wide uniqueness, validates derived `role` (`slice`, `create`, `patch`, `replace`) and local `#/components/schemas/<Name>` pointer to an existing canonical schema (no dangling refs, self-refs, or derived chains), and validates `nonResourceInputs` (allowed only on `create`, non-empty unique strings declared on the derived schema and absent from the canonical schema). |
-| `photon-ads/ads-0007-derived-schema-compatibility` | `error` | Enforces strict role compatibility for every derived `x-photon-resource` schema against its canonical schema: property/type subsetting (excluding declared `nonResourceInputs` on `create`), `readOnly`/server-managed field rejection on `create`/`patch`/`replace`, and RFC 7396 optional-fields plus `additionalProperties: false` (or `unevaluatedProperties: false`) checks on `patch`. |
+| `photon-ads/ads-0007-derived-schema-compatibility` | `error` | Enforces strict role compatibility for every derived `x-photon-resource` schema against its canonical schema: property/type subsetting (excluding declared `nonResourceInputs` on `create`), `readOnly`/server-managed field and embedded canonical resource or slice rejection on `create`/`patch`/`replace`, and RFC 7396 optional-fields plus `additionalProperties: false` (or `unevaluatedProperties: false`) checks on `patch`. |
 
 ## Changelog
 
-- **2026-11-28**: Approved and published as `ADS-0007`, defining the canonical resource model, per-service `Operation` canonical resources, cross-method response consistency, collection slices, mutation input symmetry, and the `x-photon-resource` OpenAPI extension.
+- **2026-11-28**: Approved and published as `ADS-0007`, defining the canonical resource model, per-service `Operation` canonical resources, cross-method response consistency, collection slices, mutation input symmetry, the `x-photon-resource` OpenAPI extension, and embedded resource and owned value object rules.

@@ -1659,4 +1659,231 @@ describe("ADS-0007 Redocly rules", () => {
       derivMsgs.some((m) => m.includes("NullablePatchGadget") && m.includes("non-object type")),
     ).toBe(true);
   });
+  it("rejects writable embedded canonical resources and slices while allowing owned value objects and nested slices", async () => {
+    const configPath = await writeRedoclyConfig({
+      "photon-ads/ads-0007-response-representation-consistency": "error",
+      "photon-ads/ads-0007-collection-slice-subset": "error",
+      "photon-ads/ads-0007-mutation-input-symmetry": "error",
+      "photon-ads/ads-0007-resource-annotation-valid": "error",
+      "photon-ads/ads-0007-derived-schema-compatibility": "error",
+    });
+    const notifications = {
+      type: "object",
+      additionalProperties: false,
+      properties: { email: { type: "boolean" }, sms: { type: "boolean" } },
+    };
+    const doc = baseOpenApi({
+      paths: {
+        "/v1/subscriptions": {
+          get: {
+            operationId: "listSubscriptions",
+            summary: "List subscriptions with nested plan slices",
+            responses: {
+              "200": jsonResponse({
+                type: "object",
+                required: ["items"],
+                properties: {
+                  items: {
+                    type: "array",
+                    items: { $ref: "#/components/schemas/SubscriptionSummary" },
+                  },
+                },
+              }),
+            },
+          },
+          post: {
+            operationId: "createSubscription",
+            summary: "Create a subscription with a writable embedded plan",
+            requestBody: jsonRequestBody({
+              type: "object",
+              properties: {
+                planId: { type: "string" },
+                plan: { $ref: "#/components/schemas/Plan" },
+                notifications,
+              },
+            }),
+            responses: { "201": jsonResponse({ $ref: "#/components/schemas/Subscription" }) },
+          },
+        },
+        "/v1/subscriptions/{subscriptionId}": {
+          parameters: [pathParam("subscriptionId")],
+          get: {
+            operationId: "getSubscription",
+            summary: "Subscription canonical GET",
+            responses: { "200": jsonResponse({ $ref: "#/components/schemas/Subscription" }) },
+          },
+          patch: {
+            operationId: "patchSubscription",
+            summary: "PATCH with a writable embedded plan slice",
+            requestBody: jsonRequestBody({
+              type: "object",
+              additionalProperties: false,
+              properties: {
+                plan: { $ref: "#/components/schemas/PlanSummary" },
+                notifications,
+              },
+            }),
+            responses: { "200": jsonResponse({ $ref: "#/components/schemas/Subscription" }) },
+          },
+        },
+      },
+      components: {
+        schemas: {
+          Plan: {
+            "x-photon-resource": { type: "billing.plan" },
+            type: "object",
+            required: ["id", "name"],
+            properties: {
+              id: { type: "string" },
+              name: { type: "string" },
+              amount: { type: "integer" },
+            },
+          },
+          PlanSummary: {
+            "x-photon-resource": { role: "slice", canonical: "#/components/schemas/Plan" },
+            type: "object",
+            required: ["id", "name"],
+            properties: { id: { type: "string" }, name: { type: "string" } },
+          },
+          Addon: {
+            "x-photon-resource": { type: "billing.addon" },
+            type: "object",
+            required: ["id"],
+            properties: { id: { type: "string" }, name: { type: "string" } },
+          },
+          Subscription: {
+            "x-photon-resource": { type: "billing.subscription" },
+            type: "object",
+            required: ["id", "planId", "plan", "notifications"],
+            properties: {
+              id: { type: "string", readOnly: true },
+              planId: { type: "string" },
+              plan: { $ref: "#/components/schemas/Plan" },
+              previousPlan: {
+                oneOf: [{ $ref: "#/components/schemas/PlanSummary" }, { type: "null" }],
+              },
+              addons: { type: "array", items: { $ref: "#/components/schemas/Addon" } },
+              notifications,
+            },
+          },
+          SubscriptionSummary: {
+            "x-photon-resource": {
+              role: "slice",
+              canonical: "#/components/schemas/Subscription",
+            },
+            type: "object",
+            required: ["id", "plan"],
+            properties: {
+              id: { type: "string" },
+              plan: { $ref: "#/components/schemas/PlanSummary" },
+              notifications,
+            },
+          },
+          SubscriptionSummaryWithExtra: {
+            "x-photon-resource": {
+              role: "slice",
+              canonical: "#/components/schemas/Subscription",
+            },
+            type: "object",
+            properties: {
+              id: { type: "string" },
+              plan: {
+                type: "object",
+                properties: { id: { type: "string" }, legacyCode: { type: "string" } },
+              },
+            },
+          },
+          CreateSubscriptionRequest: {
+            "x-photon-resource": { role: "create", canonical: "#/components/schemas/Subscription" },
+            type: "object",
+            properties: {
+              planId: { type: "string" },
+              plan: { $ref: "#/components/schemas/Plan" },
+              notifications,
+            },
+          },
+          PatchSubscriptionRequest: {
+            "x-photon-resource": { role: "patch", canonical: "#/components/schemas/Subscription" },
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              previousPlan: {
+                oneOf: [{ $ref: "#/components/schemas/PlanSummary" }, { type: "null" }],
+              },
+              notifications: {
+                type: "object",
+                additionalProperties: false,
+                properties: { email: { type: "boolean" } },
+              },
+            },
+          },
+          ReplaceSubscriptionRequest: {
+            "x-photon-resource": {
+              role: "replace",
+              canonical: "#/components/schemas/Subscription",
+            },
+            type: "object",
+            properties: {
+              planId: { type: "string" },
+              addons: { type: "array", items: { $ref: "#/components/schemas/Addon" } },
+              notifications,
+            },
+          },
+        },
+      },
+    });
+
+    const { report } = await lintOpenApi(doc, configPath);
+    const sliceMsgs = ads0007ProblemsFor(report, "ads-0007-collection-slice-subset").map(
+      (e) => e.message,
+    );
+    const mutMsgs = ads0007ProblemsFor(report, "ads-0007-mutation-input-symmetry").map(
+      (e) => e.message,
+    );
+    const derivMsgs = ads0007ProblemsFor(report, "ads-0007-derived-schema-compatibility").map(
+      (e) => e.message,
+    );
+    const embedded = "embeds a canonical resource or slice";
+
+    expect(sliceMsgs).toEqual([]);
+    expect(
+      mutMsgs.some(
+        (m) => m.startsWith('POST "/v1/subscriptions"') && m.includes(`"plan" ${embedded}`),
+      ),
+    ).toBe(true);
+    expect(
+      mutMsgs.some(
+        (m) =>
+          m.startsWith('PATCH "/v1/subscriptions/{subscriptionId}"') &&
+          m.includes(`"plan" ${embedded}`),
+      ),
+    ).toBe(true);
+    expect(mutMsgs.some((m) => m.includes("notifications") || m.includes("planId"))).toBe(false);
+
+    const derivedFor = (schemaName: string) =>
+      derivMsgs.filter((m) => m.includes(`"${schemaName}"`));
+    expect(
+      derivedFor("CreateSubscriptionRequest").some((m) =>
+        m.includes(`property "plan" ${embedded}`),
+      ),
+    ).toBe(true);
+    expect(
+      derivedFor("PatchSubscriptionRequest").some((m) =>
+        m.includes(`property "previousPlan" ${embedded}`),
+      ),
+    ).toBe(true);
+    expect(
+      derivedFor("ReplaceSubscriptionRequest").some((m) =>
+        m.includes(`property "addons" ${embedded}`),
+      ),
+    ).toBe(true);
+    expect(derivMsgs.some((m) => m.includes("notifications") || m.includes("planId"))).toBe(false);
+    expect(derivedFor("SubscriptionSummary")).toEqual([]);
+    expect(derivedFor("PlanSummary")).toEqual([]);
+    expect(
+      derivedFor("SubscriptionSummaryWithExtra").some((m) =>
+        m.includes('property "plan.legacyCode" does not exist'),
+      ),
+    ).toBe(true);
+  });
 });

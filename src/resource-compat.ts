@@ -25,6 +25,7 @@ import {
   type ResolverFn,
   type SchemaFragment,
   safeResolveSchema,
+  type TrackedProperty,
   type TypeConstraint,
   type UnknownRecord,
 } from "./schema-utils.js";
@@ -38,6 +39,53 @@ import {
   schemaNodeIdentity,
 } from "./schema-variants.js";
 import type { RedoclyLocation, RedoclyUserContext } from "./types.js";
+
+export const PHOTON_RESOURCE_EXTENSION = "x-photon-resource";
+
+function schemaEmbedsResource(
+  schema: unknown,
+  resolve: ResolverFn,
+  from: string | undefined,
+  seen: ReadonlySet<unknown>,
+): boolean {
+  if (!isRecord(schema) || seen.has(schema)) {
+    return false;
+  }
+  const ext = schema[PHOTON_RESOURCE_EXTENSION];
+  if (isRecord(ext) && (typeof ext.type === "string" || ext.role === "slice")) {
+    return true;
+  }
+  const nextSeen = new Set(seen);
+  nextSeen.add(schema);
+  if (typeof schema.$ref === "string") {
+    const resolved = safeResolveSchema(resolve, schema, from);
+    if (
+      resolved &&
+      schemaEmbedsResource(resolved.node, resolve, resolved.location?.source?.absoluteRef, nextSeen)
+    ) {
+      return true;
+    }
+  }
+  for (const key of ["allOf", "anyOf", "oneOf"] as const) {
+    const branches = schema[key];
+    if (
+      Array.isArray(branches) &&
+      branches.some((branch) => schemaEmbedsResource(branch, resolve, from, nextSeen))
+    ) {
+      return true;
+    }
+  }
+  return schemaEmbedsResource(schema.items, resolve, from, nextSeen);
+}
+
+export function isTrackedPropertyEmbeddedResource(
+  prop: TrackedProperty,
+  resolve: ResolverFn,
+): boolean {
+  return prop.fragments.some((frag) =>
+    schemaEmbedsResource(frag.node, resolve, frag.from, new Set()),
+  );
+}
 
 const FULL_PARAM_SEGMENT_RE = /^\{([^}]+)\}$/;
 const LEADING_VERSION_SEGMENT_RE = /^v[0-9]+$/;
@@ -1557,19 +1605,31 @@ function evaluateKeysAgainstCanonicals(
       continue;
     }
 
-    if (
-      options.forbidReadOnly &&
-      matchingTargets.every(({ cv }) => {
-        const targetProp = cv.properties.get(key);
-        return targetProp !== undefined && isTrackedPropertyReadOnly(targetProp, resolve);
-      })
-    ) {
-      mismatches.push({
-        path: fieldPath,
-        reason:
-          "is marked readOnly on the canonical schema and must not be accepted in write payloads",
-      });
-      continue;
+    if (options.forbidReadOnly) {
+      const targetProps = matchingTargets.map(({ cv }) => cv.properties.get(key));
+      if (targetProps.every((p) => p !== undefined && isTrackedPropertyReadOnly(p, resolve))) {
+        mismatches.push({
+          path: fieldPath,
+          reason:
+            "is marked readOnly on the canonical schema and must not be accepted in write payloads",
+        });
+        continue;
+      }
+      if (
+        targetProps.every(
+          (p) =>
+            p !== undefined &&
+            (isTrackedPropertyReadOnly(p, resolve) ||
+              isTrackedPropertyEmbeddedResource(p, resolve)),
+        )
+      ) {
+        mismatches.push({
+          path: fieldPath,
+          reason:
+            "embeds a canonical resource or slice on the canonical schema and must not be accepted in write payloads; reference it by its identifier field instead",
+        });
+        continue;
+      }
     }
 
     if (matchingTargets.some(({ target }) => target === "any")) {

@@ -30,6 +30,7 @@ import {
   isCustomActionSubRoute,
   isParamSegment,
   isSchemaOrVariantIgnored,
+  PHOTON_RESOURCE_EXTENSION,
   QUERY_OR_ACTION_POST_SEGMENTS,
   SERVER_MANAGED_CREATE_KEYS,
   SERVER_MANAGED_MUTATION_KEYS,
@@ -63,7 +64,7 @@ import type {
 } from "../../src/types.js";
 import { PLUGIN_ID } from "../0001-resource-identifiers/rules.js";
 
-export const PHOTON_RESOURCE_EXTENSION = "x-photon-resource";
+export { PHOTON_RESOURCE_EXTENSION };
 
 export const CANONICAL_RESOURCE_TYPE_RE = /^[a-z][a-z0-9-]*\.[a-z][a-z0-9-]*$/;
 
