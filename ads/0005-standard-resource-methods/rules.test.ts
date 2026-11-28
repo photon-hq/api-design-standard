@@ -172,7 +172,7 @@ afterAll(async () => {
 });
 
 describe("ADS-0005 unit helpers", () => {
-  it("exports metadata for all four error-level ADS-0005 rules", () => {
+  it("exports metadata for all five error-level ADS-0005 rules", () => {
     expect(ADS_0005_METADATA.ads).toBe("0005");
     expect(ADS_0005_METADATA.slug).toBe("ads-0005");
     expect(ADS_0005_METADATA.folder).toBe("0005-standard-resource-methods");
@@ -181,6 +181,7 @@ describe("ADS-0005 unit helpers", () => {
       "photon-ads/ads-0005-standard-http-methods",
       "photon-ads/ads-0005-standard-status-codes",
       "photon-ads/ads-0005-url-path-naming",
+      "photon-ads/ads-0005-patch-merge-semantics",
     ]);
     expect(ADS_0005_METADATA.rules.every((r) => r.severity === "error")).toBe(true);
   });
@@ -3284,5 +3285,314 @@ describe("ADS-0005 Redocly CLI end-to-end linting", () => {
     expect(allAds0005Errors).toHaveLength(1);
     expect(allAds0005Errors[0]?.ruleId).toBe("photon-ads/ads-0005-standard-http-methods");
     expect(allAds0005Errors[0]?.message).toContain('GET "/v1/integrations/resume"');
+  });
+
+  it("enforces ads-0005-patch-merge-semantics across valid and invalid RFC 7396 PATCH contracts", async () => {
+    const okProject = jsonResponse({
+      type: "object",
+      required: ["id", "name"],
+      properties: {
+        id: { type: "string" },
+        name: { type: "string" },
+        description: { type: ["string", "null"] },
+      },
+    });
+
+    const validDoc = baseOpenApi({
+      paths: {
+        "/v1/projects/{projectId}": {
+          parameters: [pathParam("projectId")],
+          get: {
+            operationId: "getProject",
+            summary: "Get project",
+            responses: { "200": okProject },
+          },
+          patch: {
+            operationId: "patchProject",
+            summary: "Valid RFC 7396 merge patch with additionalProperties: false",
+            requestBody: {
+              required: true,
+              content: {
+                "application/json": {
+                  schema: {
+                    type: "object",
+                    additionalProperties: false,
+                    minProperties: 1,
+                    properties: {
+                      name: { type: "string" },
+                      description: { type: ["string", "null"] },
+                    },
+                  },
+                },
+                "application/merge-patch+json": {
+                  schema: {
+                    type: "object",
+                    unevaluatedProperties: false,
+                    properties: {
+                      name: { type: "string" },
+                    },
+                  },
+                },
+              },
+            },
+            responses: { "200": okProject },
+          },
+        },
+        "/v1/projects/{projectId}/metadata": {
+          parameters: [pathParam("projectId")],
+          get: {
+            operationId: "getMetadata",
+            summary: "Get open dictionary",
+            responses: {
+              "200": jsonResponse({ type: "object", additionalProperties: { type: "string" } }),
+            },
+          },
+          patch: {
+            operationId: "patchMetadata",
+            summary: "Valid open dictionary merge patch",
+            requestBody: {
+              required: true,
+              content: {
+                "application/json": {
+                  schema: {
+                    type: "object",
+                    additionalProperties: { type: ["string", "null"] },
+                  },
+                },
+              },
+            },
+            responses: {
+              "200": jsonResponse({ type: "object", additionalProperties: { type: "string" } }),
+            },
+          },
+        },
+        "/v1/projects/{projectId}/channels/{channelId}": {
+          parameters: [pathParam("projectId"), pathParam("channelId")],
+          get: {
+            operationId: "getChannel",
+            summary: "Get discriminated channel",
+            responses: { "200": jsonResponse({ $ref: "#/components/schemas/ChannelPatchUnion" }) },
+          },
+          patch: {
+            operationId: "patchChannel",
+            summary: "Valid discriminated oneOf patch requiring only discriminator propertyName",
+            requestBody: {
+              required: true,
+              content: {
+                "application/json": {
+                  schema: { $ref: "#/components/schemas/ChannelPatchUnion" },
+                },
+              },
+            },
+            responses: { "200": jsonResponse({ $ref: "#/components/schemas/ChannelPatchUnion" }) },
+          },
+        },
+      },
+      components: {
+        schemas: {
+          ChannelPatchUnion: {
+            oneOf: [
+              {
+                type: "object",
+                additionalProperties: false,
+                required: ["kind"],
+                properties: {
+                  kind: { type: "string", const: "sms" },
+                  senderId: { type: "string" },
+                },
+              },
+              {
+                type: "object",
+                additionalProperties: false,
+                required: ["kind"],
+                properties: {
+                  kind: { type: "string", const: "email" },
+                  fromAddress: { type: "string" },
+                },
+              },
+            ],
+            discriminator: { propertyName: "kind" },
+          },
+        },
+      },
+    });
+
+    const validRes = await lintOpenApi(validDoc);
+    expect(ads0005ProblemsFor(validRes.report, "ads-0005-patch-merge-semantics")).toEqual([]);
+
+    const invalidDoc = baseOpenApi({
+      paths: {
+        "/v1/projects/{projectId}": {
+          parameters: [pathParam("projectId")],
+          get: {
+            operationId: "getProject",
+            summary: "Get project",
+            responses: { "200": okProject },
+          },
+          patch: {
+            operationId: "patchBadProject",
+            summary: "Violates all RFC 7396 PATCH checks",
+            parameters: [{ name: "updateMask", in: "query", schema: { type: "string" } }],
+            requestBody: {
+              required: true,
+              content: {
+                "application/json-patch+json": {
+                  schema: { type: "array", items: { type: "object" } },
+                },
+                "application/json": {
+                  schema: {
+                    type: "object",
+                    required: ["name"],
+                    properties: {
+                      name: { type: "string" },
+                      fieldMask: { type: "array", items: { type: "string" } },
+                    },
+                  },
+                },
+              },
+            },
+            responses: { "200": okProject },
+          },
+        },
+        "/v1/projects/{projectId}/array-patch": {
+          parameters: [pathParam("projectId")],
+          get: { operationId: "getArrayPatch", summary: "Get", responses: { "200": okProject } },
+          patch: {
+            operationId: "patchWithArrayBody",
+            summary: "JSON Patch array under application/json",
+            requestBody: {
+              required: true,
+              content: {
+                "application/json": {
+                  schema: {
+                    type: "array",
+                    items: {
+                      type: "object",
+                      properties: { op: { type: "string" }, path: { type: "string" } },
+                    },
+                  },
+                },
+              },
+            },
+            responses: { "200": okProject },
+          },
+        },
+        "/v1/projects/{projectId}/discriminated-extra-req": {
+          parameters: [pathParam("projectId")],
+          get: { operationId: "getDisc", summary: "Get", responses: { "200": okProject } },
+          patch: {
+            operationId: "patchDiscExtraReq",
+            summary: "Discriminated union requiring extra non-discriminator field",
+            requestBody: {
+              required: true,
+              content: {
+                "application/json": {
+                  schema: {
+                    oneOf: [
+                      {
+                        type: "object",
+                        additionalProperties: false,
+                        required: ["kind", "senderId"],
+                        properties: {
+                          kind: { type: "string", const: "sms" },
+                          senderId: { type: "string" },
+                        },
+                      },
+                    ],
+                    discriminator: { propertyName: "kind" },
+                  },
+                },
+              },
+            },
+            responses: { "200": okProject },
+          },
+        },
+      },
+    });
+
+    const invalidRes = await lintOpenApi(invalidDoc);
+    expect(invalidRes.exitCode).toBe(1);
+    const patchErrors = ads0005ProblemsFor(invalidRes.report, "ads-0005-patch-merge-semantics");
+    const messages = patchErrors.map((e) => e.message);
+
+    expect(messages.some((m) => m.includes('query parameter "updateMask"'))).toBe(true);
+    expect(
+      messages.some((m) => m.includes('uses "application/json-patch+json" (RFC 6902 JSON Patch)')),
+    ).toBe(true);
+    expect(
+      messages.some((m) => m.includes('must not declare top-level mask property "fieldMask"')),
+    ).toBe(true);
+    expect(
+      messages.some((m) => m.includes('declares required top-level properties ("name")')),
+    ).toBe(true);
+    expect(messages.some((m) => m.includes("without forbidding unknown fields"))).toBe(true);
+    expect(messages.some((m) => m.includes("accepts a top-level JSON array"))).toBe(true);
+    expect(
+      messages.some((m) => m.includes('declares required top-level properties ("senderId")')),
+    ).toBe(true);
+
+    // Ignore support by path and schema
+    const ignoreConfigPath = await writeRedoclyConfig({
+      "photon-ads/ads-0005-patch-merge-semantics": {
+        severity: "error",
+        ignore: [
+          { path: "/v1/projects/{projectId}", method: "patch", reason: "Legacy patch" },
+          { schema: "LegacyPatchBody", reason: "Legacy schema" },
+        ],
+      },
+    });
+    const ignoreDoc = baseOpenApi({
+      paths: {
+        "/v1/projects/{projectId}": {
+          parameters: [pathParam("projectId")],
+          get: { operationId: "getProj", summary: "Get", responses: { "200": okProject } },
+          patch: {
+            operationId: "patchProjIgnored",
+            summary: "Ignored by path",
+            requestBody: {
+              required: true,
+              content: {
+                "application/json": {
+                  schema: {
+                    type: "object",
+                    required: ["name"],
+                    properties: { name: { type: "string" } },
+                  },
+                },
+              },
+            },
+            responses: { "200": okProject },
+          },
+        },
+        "/v1/projects/{projectId}/profile": {
+          parameters: [pathParam("projectId")],
+          get: { operationId: "getProf", summary: "Get", responses: { "200": okProject } },
+          patch: {
+            operationId: "patchProfIgnoredBySchema",
+            summary: "Ignored by schema",
+            requestBody: {
+              required: true,
+              content: {
+                "application/json": {
+                  schema: { $ref: "#/components/schemas/LegacyPatchBody" },
+                },
+              },
+            },
+            responses: { "200": okProject },
+          },
+        },
+      },
+      components: {
+        schemas: {
+          LegacyPatchBody: {
+            type: "object",
+            required: ["name"],
+            properties: { name: { type: "string" } },
+          },
+        },
+      },
+    });
+    const ignoreRes = await lintOpenApi(ignoreDoc, ignoreConfigPath);
+    expect(ads0005ProblemsFor(ignoreRes.report, "ads-0005-patch-merge-semantics")).toEqual([]);
   });
 });

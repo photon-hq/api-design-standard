@@ -3,6 +3,7 @@ import { ads0002Rules } from "../ads/0002-top-level-json-response/rules.js";
 import { ads0004Rules } from "../ads/0004-long-running-operations/rules.js";
 import { ads0005Rules } from "../ads/0005-standard-resource-methods/rules.js";
 import { ads0006Rules } from "../ads/0006-list-pagination/rules.js";
+import { ads0007Rules } from "../ads/0007-resource-representation/rules.js";
 import { getRecommendedRulesConfig, PLUGIN_ID } from "./catalog.js";
 import type { RedoclyPlugin } from "./types.js";
 
@@ -21,6 +22,7 @@ export function createPhotonAdsPlugin(): RedoclyPlugin {
         ...ads0004Rules,
         ...ads0005Rules,
         ...ads0006Rules,
+        ...ads0007Rules,
       },
     },
   };

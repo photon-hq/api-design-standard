@@ -41,13 +41,17 @@ export interface RootRuleContext {
   readonly reportOnce: (dedupeTag: string, location: RedoclyLocation, message: string) => void;
 }
 
-export function createRootRule(run: (context: RootRuleContext) => void): RedoclyOas3Rule {
+export function createRootRule(
+  run: (context: RootRuleContext) => void,
+  ruleOptions?: { readonly requirePaths?: boolean },
+): RedoclyOas3Rule {
+  const requirePaths = ruleOptions?.requirePaths ?? true;
   return (options = {}) => {
     const ignoreMatcher = createRuleIgnoreMatcher(options);
     return {
       Root: {
         leave(root, ctx) {
-          if (!isRecord(root) || !isRecord(root.paths)) {
+          if (!isRecord(root) || (requirePaths && !isRecord(root.paths))) {
             return;
           }
           const reported = new Set<string>();
@@ -265,6 +269,7 @@ export function iterateRootPathItems(
 }
 
 export interface ResponseJsonSchemaEntry {
+  readonly statusCode?: string;
   readonly mediaType: string;
   readonly schema: unknown;
   readonly schemaLocation: RedoclyLocation;
@@ -277,6 +282,7 @@ export function extractResponseJsonSchemas(
   rawResponse: unknown,
   responseUsageLocation: RedoclyLocation,
   resolve: ResolverFn,
+  statusCode?: string,
 ): ResponseJsonSchemaEntry[] {
   if (!isRecord(rawResponse)) {
     return [];
@@ -294,6 +300,7 @@ export function extractResponseJsonSchemas(
       continue;
     }
     results.push({
+      ...(statusCode !== undefined ? { statusCode } : {}),
       mediaType,
       schema: mediaObj.schema,
       schemaLocation: resolved.location.child(["content", mediaType, "schema"]),
@@ -310,10 +317,12 @@ export function extractOperationJsonResponseSchemas(
   operationLocation: RedoclyLocation,
   resolve: ResolverFn,
   statusCodes: readonly string[],
+  options?: { readonly firstMatchingOnly?: boolean },
 ): ResponseJsonSchemaEntry[] {
   if (!isRecord(operation.responses)) {
     return [];
   }
+  const firstMatchingOnly = options?.firstMatchingOnly ?? true;
   const responses = operation.responses;
   const declaredExplicitClasses = new Set<string>();
   for (const statusCode of statusCodes) {
@@ -334,11 +343,56 @@ export function extractOperationJsonResponseSchemas(
       responses[statusCode],
       operationLocation.child(["responses", statusCode]),
       resolve,
+      statusCode,
     );
     if (entries.length > 0) {
       results.push(...entries);
-      break;
+      if (firstMatchingOnly) {
+        break;
+      }
     }
+  }
+  return results;
+}
+
+export interface RequestBodyMediaSchemaEntry {
+  readonly mediaType: string;
+  readonly isJson: boolean;
+  readonly schema: unknown;
+  readonly mediaTypeLocation: RedoclyLocation;
+  readonly schemaLocation: RedoclyLocation;
+  readonly requestBodyNode: UnknownRecord;
+  readonly requestBodyLocation: RedoclyLocation;
+  readonly requestBodyFromRef: boolean;
+}
+
+export function extractRequestBodyMediaSchemas(
+  operation: UnknownRecord,
+  operationLocation: RedoclyLocation,
+  resolve: ResolverFn,
+): RequestBodyMediaSchemaEntry[] {
+  if (!isRecord(operation.requestBody)) {
+    return [];
+  }
+  const usageLocation = operationLocation.child(["requestBody"]);
+  const resolved = resolveRecordWithLocation(resolve, operation.requestBody, usageLocation);
+  if (!resolved || !isRecord(resolved.node.content)) {
+    return [];
+  }
+  const results: RequestBodyMediaSchemaEntry[] = [];
+  for (const [mediaType, mediaObj] of Object.entries(resolved.node.content)) {
+    const mediaTypeLocation = resolved.location.child(["content", mediaType]);
+    const schema = isRecord(mediaObj) ? mediaObj.schema : undefined;
+    results.push({
+      mediaType,
+      isJson: JSON_MEDIA_TYPE_RE.test(mediaType),
+      schema,
+      mediaTypeLocation,
+      schemaLocation: mediaTypeLocation.child(["schema"]),
+      requestBodyNode: resolved.node,
+      requestBodyLocation: resolved.location,
+      requestBodyFromRef: resolved.resolvedFromRef,
+    });
   }
   return results;
 }

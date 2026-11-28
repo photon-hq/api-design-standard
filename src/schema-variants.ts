@@ -65,6 +65,7 @@ export interface SchemaVariantWalkOps<T> {
     unionId: string,
     branchIndex: number,
     branchVariants: readonly T[],
+    unionNode?: UnknownRecord,
   ): readonly T[];
   finalizeNode?(node: UnknownRecord, variants: readonly T[]): readonly T[];
 }
@@ -221,7 +222,7 @@ export function walkSchemaVariants<T>(
             truncated = true;
           }
           const tagged = ops.tagUnionBranch
-            ? ops.tagUnionBranch(unionKey, unionId, index, branchRes.variants)
+            ? ops.tagUnionBranch(unionKey, unionId, index, branchRes.variants, node)
             : branchRes.variants;
           unionVariants.push(...tagged);
         }
@@ -275,8 +276,11 @@ export interface FlattenedObjectVariant {
   readonly isObjectLike: boolean;
   readonly openAdditionalProperties: boolean;
   readonly hasSchemaAdditionalProperties: boolean;
+  readonly additionalPropertiesSchemas: readonly SchemaFragment[];
+  readonly forbidsAdditionalProperties: boolean;
   readonly properties: ReadonlyMap<string, TrackedProperty>;
   readonly required: ReadonlySet<string>;
+  readonly discriminatorProperties: ReadonlySet<string>;
   readonly schemaNames: ReadonlySet<string>;
   readonly oneOfBranches: ReadonlyMap<string, ReadonlySet<number>>;
 }
@@ -286,8 +290,11 @@ export const EMPTY_SEED_VARIANT: FlattenedObjectVariant = {
   isObjectLike: false,
   openAdditionalProperties: false,
   hasSchemaAdditionalProperties: false,
+  additionalPropertiesSchemas: [],
+  forbidsAdditionalProperties: false,
   properties: new Map(),
   required: new Set(),
+  discriminatorProperties: new Set(),
   schemaNames: new Set(),
   oneOfBranches: new Map(),
 };
@@ -347,12 +354,15 @@ export function defaultFlattenedVariantSignature(
     return [key, pTypes] as const;
   });
   const reqKeys = [...variant.required].sort();
+  const discKeys = [...variant.discriminatorProperties].sort();
   return JSON.stringify([
     types,
     variant.isObjectLike ? 1 : 0,
     variant.hasSchemaAdditionalProperties ? 1 : 0,
+    variant.forbidsAdditionalProperties ? 1 : 0,
     propEntries,
     reqKeys,
+    discKeys,
   ]);
 }
 
@@ -383,6 +393,10 @@ export function mergeFlattenedVariants(
   for (const name of addition.required) {
     required.add(name);
   }
+  const discriminatorProperties = new Set<string>(base.discriminatorProperties);
+  for (const name of addition.discriminatorProperties) {
+    discriminatorProperties.add(name);
+  }
   const schemaNames = new Set<string>(base.schemaNames);
   for (const name of addition.schemaNames) {
     schemaNames.add(name);
@@ -390,14 +404,29 @@ export function mergeFlattenedVariants(
   const isObjectLike =
     typeConstraint.allowed.has("object") &&
     (base.isObjectLike || addition.isObjectLike || isNonNullObjectConstraint(typeConstraint));
+  const additionalPropertiesSchemas =
+    base.additionalPropertiesSchemas.length === 0
+      ? addition.additionalPropertiesSchemas
+      : addition.additionalPropertiesSchemas.length === 0
+        ? base.additionalPropertiesSchemas
+        : [
+            ...base.additionalPropertiesSchemas,
+            ...addition.additionalPropertiesSchemas.filter(
+              (frag) => !base.additionalPropertiesSchemas.some((b) => b.node === frag.node),
+            ),
+          ];
   const merged: FlattenedObjectVariant = {
     typeConstraint,
     isObjectLike,
     openAdditionalProperties: base.openAdditionalProperties || addition.openAdditionalProperties,
     hasSchemaAdditionalProperties:
       base.hasSchemaAdditionalProperties || addition.hasSchemaAdditionalProperties,
+    additionalPropertiesSchemas,
+    forbidsAdditionalProperties:
+      base.forbidsAdditionalProperties || addition.forbidsAdditionalProperties,
     properties,
     required,
+    discriminatorProperties,
     schemaNames,
     oneOfBranches:
       base.oneOfBranches.size > 0 || addition.oneOfBranches.size > 0
@@ -496,11 +525,23 @@ function extractLocalFlattenedVariant(
   }
 
   const hasSchemaAdditionalProperties = isRecord(node.additionalProperties);
+  const additionalPropertiesSchemas: readonly SchemaFragment[] = hasSchemaAdditionalProperties
+    ? [
+        {
+          node: node.additionalProperties as UnknownRecord,
+          ...(from !== undefined ? { from } : {}),
+          ...(location ? { location: location.child(["additionalProperties"]) } : {}),
+        },
+      ]
+    : [];
   const openAdditionalProperties =
     node.additionalProperties === true || hasSchemaAdditionalProperties;
+  const forbidsAdditionalProperties =
+    node.additionalProperties === false || node.unevaluatedProperties === false;
   const hasObjectShape =
     properties.size > 0 ||
     node.additionalProperties !== undefined ||
+    node.unevaluatedProperties !== undefined ||
     required.size > 0 ||
     isNonNullObjectConstraint(typeConstraint) ||
     (typeConstraint.allowed.has("object") &&
@@ -512,11 +553,22 @@ function extractLocalFlattenedVariant(
     isObjectLike: hasObjectShape,
     openAdditionalProperties,
     hasSchemaAdditionalProperties,
+    additionalPropertiesSchemas,
+    forbidsAdditionalProperties,
     properties,
     required,
+    discriminatorProperties: new Set(),
     schemaNames,
     oneOfBranches: new Map(),
   };
+}
+
+function extractDiscriminatorPropertyName(node: UnknownRecord | undefined): string | undefined {
+  if (!node || !isRecord(node.discriminator)) {
+    return undefined;
+  }
+  const propName = node.discriminator.propertyName;
+  return typeof propName === "string" && propName.trim().length > 0 ? propName.trim() : undefined;
 }
 
 export function collectFlattenedObjectVariants(
@@ -539,22 +591,28 @@ export function collectFlattenedObjectVariants(
       ],
       combine: (current, incoming) =>
         combineFlattenedVariantSets(current, incoming, resolve, options),
-      ...(options?.trackOneOfBranches
-        ? {
-            tagUnionBranch: (unionKey, unionId, branchIndex, branchVariants) => {
-              if (unionKey !== "oneOf") {
-                return branchVariants;
-              }
-              const branchTag = new Map<string, ReadonlySet<number>>([
-                [unionId, new Set([branchIndex])],
-              ]);
-              return branchVariants.map((variant) => ({
-                ...variant,
-                oneOfBranches: mergeOneOfBranchMaps(variant.oneOfBranches, branchTag),
-              }));
-            },
-          }
-        : {}),
+      tagUnionBranch: (unionKey, unionId, branchIndex, branchVariants, unionNode) => {
+        const discProp = extractDiscriminatorPropertyName(unionNode);
+        const trackBranch = options?.trackOneOfBranches === true && unionKey === "oneOf";
+        if (!discProp && !trackBranch) {
+          return branchVariants;
+        }
+        const branchTag = trackBranch
+          ? new Map<string, ReadonlySet<number>>([[unionId, new Set([branchIndex])]])
+          : null;
+        return branchVariants.map((variant) => {
+          const nextDisc = discProp
+            ? new Set<string>([...variant.discriminatorProperties, discProp])
+            : variant.discriminatorProperties;
+          return {
+            ...variant,
+            discriminatorProperties: nextDisc,
+            ...(branchTag
+              ? { oneOfBranches: mergeOneOfBranchMaps(variant.oneOfBranches, branchTag) }
+              : {}),
+          };
+        });
+      },
       finalizeNode: (node, currentVariants) =>
         node.nullable === true
           ? currentVariants.map((variant) => ({

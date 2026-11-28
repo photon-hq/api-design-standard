@@ -224,6 +224,10 @@ export function formatAllowedTypes(allowed: ReadonlySet<JsonSchemaType>, separat
   return ALL_JSON_TYPES.filter((t) => allowed.has(t)).join(separator);
 }
 
+export function formatTypeSummary(allowed: ReadonlySet<JsonSchemaType>): string {
+  return allowed.size > 0 ? formatAllowedTypes(allowed) : "never";
+}
+
 export function extractNodeDeclaredTypeSets(
   node: UnknownRecord,
   includeNullableOnType = false,
@@ -907,10 +911,15 @@ export function computeIntegerBounds(
   });
 }
 
-export function isSchemaDeprecated(schema: unknown, resolve: ResolverFn, from?: string): boolean {
+function hasBooleanSchemaAnnotation(
+  schema: unknown,
+  resolve: ResolverFn,
+  from: string | undefined,
+  key: "deprecated" | "readOnly" | "writeOnly",
+): boolean {
   const seen = new Set<unknown>();
 
-  const hasDeprecatedAllOf = (node: UnknownRecord, currentFrom: string | undefined): boolean => {
+  const hasInAllOf = (node: UnknownRecord, currentFrom: string | undefined): boolean => {
     if (!Array.isArray(node.allOf)) {
       return false;
     }
@@ -928,8 +937,9 @@ export function isSchemaDeprecated(schema: unknown, resolve: ResolverFn, from?: 
     }
     seen.add(node);
 
-    if (typeof node.deprecated === "boolean") {
-      return node.deprecated;
+    const direct = node[key];
+    if (typeof direct === "boolean") {
+      return direct;
     }
 
     if (typeof node.$ref === "string") {
@@ -937,14 +947,15 @@ export function isSchemaDeprecated(schema: unknown, resolve: ResolverFn, from?: 
       if (resolved) {
         let refDecided = false;
         for (const hop of getRefIntermediateHops(node, resolved, { reverse: false })) {
-          if (typeof hop.node.deprecated === "boolean") {
-            if (hop.node.deprecated) {
+          const hopValue = hop.node[key];
+          if (typeof hopValue === "boolean") {
+            if (hopValue) {
               return true;
             }
             refDecided = true;
             break;
           }
-          if (hasDeprecatedAllOf(hop.node, hop.location?.source?.absoluteRef)) {
+          if (hasInAllOf(hop.node, hop.location?.source?.absoluteRef)) {
             return true;
           }
         }
@@ -954,12 +965,24 @@ export function isSchemaDeprecated(schema: unknown, resolve: ResolverFn, from?: 
       }
     }
 
-    return hasDeprecatedAllOf(node, currentFrom);
+    return hasInAllOf(node, currentFrom);
   };
 
   return visit(schema, from);
 }
 
+export function isSchemaDeprecated(schema: unknown, resolve: ResolverFn, from?: string): boolean {
+  return hasBooleanSchemaAnnotation(schema, resolve, from, "deprecated");
+}
+
+export function isSchemaReadOnly(schema: unknown, resolve: ResolverFn, from?: string): boolean {
+  return hasBooleanSchemaAnnotation(schema, resolve, from, "readOnly");
+}
+
 export function isTrackedPropertyDeprecated(prop: TrackedProperty, resolve: ResolverFn): boolean {
   return prop.fragments.some((frag) => isSchemaDeprecated(frag.node, resolve, frag.from));
+}
+
+export function isTrackedPropertyReadOnly(prop: TrackedProperty, resolve: ResolverFn): boolean {
+  return prop.fragments.some((frag) => isSchemaReadOnly(frag.node, resolve, frag.from));
 }

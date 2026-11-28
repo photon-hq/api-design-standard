@@ -1,16 +1,16 @@
 ---
 title: "ADS-0005: Standard Resource Methods and Lifecycle"
 sidebarTitle: "ADS-0005 · Standard Resource Methods"
-description: "Standard HTTP methods, read symmetry for addressable resources, canonical success status codes, representation consistency, and URL path naming across Photon public HTTP APIs."
+description: "Standard HTTP methods, read symmetry for addressable resources, canonical success status codes, representation consistency, URL path naming, and RFC 7396 JSON Merge Patch semantics across Photon public HTTP APIs."
 ads: "0005"
 status: "Approved"
-updated: "2026-11-27"
+updated: "2026-11-28"
 ---
 
 # ADS-0005: Standard Resource Methods and Lifecycle
 
 - **Status**: Approved
-- **Updated**: 2026-11-27
+- **Updated**: 2026-11-28
 
 Consistent HTTP methods, read symmetry, status codes, and URL structure let callers, generated SDKs, dashboards, CLIs, and automated agents navigate every Photon resource lifecycle without endpoint-specific special cases. This standard is part of Photon API Design Standards and uses the keywords **MUST**, **MUST NOT**, **SHOULD**, and **MAY** as described in RFC 2119.
 
@@ -22,6 +22,7 @@ This standard defines the lifecycle contract for resource collections, addressab
 - Read symmetry for mutable resources, custom actions, and addressable collections.
 - Canonical `2xx` success status codes and representation consistency.
 - URL path segment casing and noun conventions.
+- Partial-update (`PATCH`) wire semantics using JSON Merge Patch (RFC 7396).
 
 Related concerns are governed by separate standards:
 
@@ -111,6 +112,25 @@ Standard resource methods **MUST** use predictable `2xx` HTTP status codes:
 - Every static URL path segment (excluding `{param}` placeholders, leading version prefixes such as `v1`, and `.well-known`) **MUST** use lowercase `kebab-case` (for example `/v1/projects/{projectId}/api-keys` and `/v1/projects/{projectId}/agent-profile`).
 - Static segments **MUST NOT** use `camelCase` (`/apiKeys`), `snake_case` (`/api_keys`), uppercase letters (`/Projects`), dots, or spaces.
 - Collection path segments **SHOULD** use plural nouns (for example `projects`, `webhooks`, `api-keys`, `members`, `invoices`), and singleton sub-resource path segments **SHOULD** use singular nouns (for example `agent-profile`).
+
+### 6. Partial updates (`PATCH`)
+
+Every `PATCH` endpoint **MUST** implement **JSON Merge Patch ([RFC 7396](https://www.rfc-editor.org/rfc/rfc7396))** semantics over `Content-Type: application/json`:
+
+- **Media type and payload shape**: `PATCH` requests **MUST** accept a JSON object over `application/json` (or a compatible JSON media type). Endpoints **MUST NOT** use JSON Patch ([RFC 6902](https://www.rfc-editor.org/rfc/rfc6902), `application/json-patch+json`, or a top-level patch-operation array) and **MUST NOT** accept or require field-mask query parameters or body fields (`fieldMask`, `updateMask`, `field_mask`, `update_mask`, `fieldsMask`, `fields_mask`).
+- **Three-state field semantics**:
+  - **Omitted field**: Leave the current stored value unchanged.
+  - **Explicit `null`**: Clear the field (set its stored value to `null`). Explicit `null` is valid **only** on fields whose canonical representation allows `null`; sending `null` for a non-nullable field **MUST** be rejected with `400 Bad Request`.
+  - **Non-null value**: Set or replace the field with the supplied value.
+- **Nested objects, arrays, and maps**:
+  - Plain nested objects (fixed-schema sub-objects such as `notifications` or `settings`) **MUST** merge recursively under the same three-state rules so omitting a sibling nested field leaves that sibling unchanged.
+  - Arrays **MUST** replace wholesale—supplying an array replaces the entire stored list rather than appending or element-diffing.
+  - Arbitrary key-value maps (open dictionaries with dynamic keys such as `labels` or `metadata`) **MUST** replace wholesale unless an endpoint explicitly documents per-key merge semantics.
+- **Atomicity**: Every `PATCH` request **MUST** execute atomically (all-or-nothing). If any field fails schema validation, authorization, or a domain invariant, the server **MUST** return an error without committing a partial subset of changes.
+- **Wire contract constraints**:
+  - `PATCH` request schemas **MUST NOT** declare top-level `required` properties, except an explicit `discriminator.propertyName` on a polymorphic `oneOf` or `anyOf` union schema. Every mutable field **MUST** be optional so callers can update any subset.
+  - `PATCH` request schemas **MUST** reject unknown properties (`additionalProperties: false`, or `unevaluatedProperties: false` on composed schemas) so typos and unsupported fields fail explicitly with `400 Bad Request` rather than being silently dropped. Intentional open-dictionary maps that declare typed `additionalProperties` without fixed resource `properties` are exempt.
+  - `PATCH` request schemas **SHOULD** reject empty patch payloads (`{}`) with `minProperties: 1` unless the endpoint explicitly documents empty-patch no-op behavior.
 
 ## Examples
 
@@ -322,6 +342,86 @@ paths:
           description: Revoked API key
 ```
 
+### Partial updates (`PATCH`)
+
+**Good** — RFC 7396 JSON Merge Patch over `application/json`: updating `displayName`, clearing nullable `bio` with explicit `null`, and recursively merging `notifications.emailEnabled` while leaving omitted fields (such as `notifications.smsEnabled`) untouched:
+
+```http
+PATCH /v1/projects/prj_01h455vb4pex5vsknk084sn02q/agent-profile HTTP/1.1
+Host: api.photon.codes
+Content-Type: application/json
+```
+
+```json
+{
+  "displayName": "Support Assistant",
+  "bio": null,
+  "notifications": {
+    "emailEnabled": false
+  }
+}
+```
+
+Its request schema keeps every mutable field optional, marks clearable fields nullable, forbids unknown properties, and rejects empty patches:
+
+```yaml
+UpdateAgentProfileRequest:
+  type: object
+  additionalProperties: false
+  minProperties: 1
+  properties:
+    displayName:
+      type: string
+      minLength: 1
+    bio:
+      type:
+        - string
+        - "null"
+    notifications:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        emailEnabled:
+          type: boolean
+        smsEnabled:
+          type: boolean
+```
+
+**Bad** — RFC 6902 `application/json-patch+json`, `updateMask` parameters or fields, required top-level `PATCH` properties, or open schemas that silently accept unknown fields:
+
+```yaml
+paths:
+  /v1/projects/{projectId}:
+    patch:
+      summary: Uses RFC 6902 patch array, updateMask, required fields, and open properties
+      parameters:
+        - name: updateMask
+          in: query
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json-patch+json:
+            schema:
+              type: array
+              items:
+                type: object
+          application/json:
+            schema:
+              type: object
+              required:
+                - name
+              properties:
+                name:
+                  type: string
+                fieldMask:
+                  type: array
+                  items:
+                    type: string
+```
+
 ### Non-conformant patterns
 
 **Bad** — CRUD verbs in URL segments, `camelCase`/`snake_case` paths, both `PUT` and `PATCH` on one path, `GET` with `requestBody`, collection `DELETE` with `requestBody`, collection `POST` returning only `200`, `PATCH 204`, `DELETE 204` with a response body, and an addressable list with no item `GET`:
@@ -395,7 +495,7 @@ paths:
 
 ## Lint Rules
 
-The `@photon-hq/api-design-standards` Redocly plugin (`photon-ads`) enforces ADS-0005 with the following deterministic OpenAPI 3 rules. All four rules run at `error` severity in `photon-ads/recommended` and support declarative rule-level `ignore` entries (`path` and optional `method`).
+The `@photon-hq/api-design-standards` Redocly plugin (`photon-ads`) enforces ADS-0005 with the following deterministic OpenAPI 3 rules. All five rules run at `error` severity in `photon-ads/recommended` and support declarative rule-level `ignore` entries (`path` and optional `method`, plus optional `schema` on `photon-ads/ads-0005-patch-merge-semantics`).
 
 **Collection-envelope and hoisted-route heuristic**: `photon-ads/ads-0005-addressable-resource-read` classifies a `GET` endpoint on a non-parameterized path as an addressable collection only when its `200` (or fallback `2XX`) JSON response resolves to an object without a top-level `id`, containing exactly one top-level array property whose item object schema declares a scalar `id`, with all other top-level properties limited to standard collection/pagination metadata (`nextPageToken`, `prevPageToken`, `previousPageToken`, `cursor`, `nextCursor`, `hasMore`, `totalCount`, `total`, `count`, `limit`, `pageSize`, `page`, `pageInfo`, and related pagination fields). Non-resource lookup lists without `id` and composite summaries are excluded automatically. Hoisted canonical `GET` routes are matched by stripping one or more leading `/<scope>/{<scopeParam>}` pairs immediately after any leading version prefix (`v1`, `v2`, etc.) and checking schema compatibility (matching component `$ref` or compatible `id` type, required list-item property subset, and non-`id` property overlap).
 
@@ -405,9 +505,11 @@ The `@photon-hq/api-design-standards` Redocly plugin (`photon-ads`) enforces ADS
 | `photon-ads/ads-0005-standard-http-methods` | `error` | Rejects CRUD verbs in static URL path segments (`create`, `get`, `list`, `update`, `delete`, `remove`, `fetch`, `edit`, `add` and their kebab/snake/camel prefixes), rejects declaring both `PUT` and `PATCH` on the same path, rejects `GET` with `requestBody`, rejects collection-level `DELETE` (paths not ending in `{param}`) with `requestBody`, rejects non-deprecated `Idempotency-Key` header parameters on `GET` and `HEAD`, and rejects unmistakable state-mutating action verbs as the terminal static path segment on `GET` and `HEAD`. |
 | `photon-ads/ads-0005-standard-status-codes` | `error` | Rejects `201` and `202` on `GET`; requires `201` or `202` on collection creation `POST` endpoints (paths not ending in `{param}` that also declare `GET` or a `{param}` child path); rejects `204` and bodyless `200` on `PATCH`; and rejects `201` and `204` with a response `content` body on `DELETE`. |
 | `photon-ads/ads-0005-url-path-naming` | `error` | Requires every static URL path segment (excluding `{param}` placeholders, leading version prefixes `v[0-9]+`, and `.well-known`) to use lowercase `kebab-case`. |
+| `photon-ads/ads-0005-patch-merge-semantics` | `error` | Enforces RFC 7396 JSON Merge Patch wire semantics on `PATCH` operations: rejects `application/json-patch+json` media types and top-level JSON Patch array schemas, rejects `fieldMask`/`updateMask`/`field_mask`/`update_mask`/`fieldsMask`/`fields_mask` query parameters and top-level body properties, rejects top-level `required` properties on concrete object variants (exempting only an explicit `discriminator.propertyName` on discriminated `oneOf`/`anyOf` unions), and requires `additionalProperties: false` (or `unevaluatedProperties: false`) on concrete object variants declaring `properties`. |
 
 ## Changelog
 
 - **2026-11-26**: Approved and published as `ADS-0005`.
 - **2026-11-26**: Codified RFC 9110 safe, side-effect-free semantics for `GET` and `HEAD` in §1, added browser redirect handoff guidance, and prohibited `Idempotency-Key` header parameters and unmistakable state-mutating terminal action verbs on `GET` and `HEAD`.
 - **2026-11-27**: Clarified the narrow exception for protocol-mandated inbound browser callbacks (`GET .../callback` per RFC 6749 OAuth, SSO, and third-party integration redirects) with single-use initiator-bound correlation, convergent replay, and non-cacheable `302` redirect guardrails, while keeping outbound `/redirect` relays and regular `GET` operations strictly side-effect-free.
+- **2026-11-28**: Codified RFC 7396 JSON Merge Patch semantics for `PATCH` partial updates in §6 (three-state omitted/`null`/value rules, recursive plain-object merge vs wholesale array/map replacement, atomicity, prohibition of RFC 6902 JSON Patch and field masks, optional top-level fields, and strict unknown-property rejection).

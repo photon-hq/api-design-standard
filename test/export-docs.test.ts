@@ -273,10 +273,10 @@ describe("docs-reference export", () => {
     expect(ads0005?.title).toBe("ADS-0005: Standard Resource Methods and Lifecycle");
     expect(ads0005?.sidebarTitle).toBe("ADS-0005 · Standard Resource Methods");
     expect(ads0005?.description).toBe(
-      "Standard HTTP methods, read symmetry for addressable resources, canonical success status codes, representation consistency, and URL path naming across Photon public HTTP APIs.",
+      "Standard HTTP methods, read symmetry for addressable resources, canonical success status codes, representation consistency, URL path naming, and RFC 7396 JSON Merge Patch semantics across Photon public HTTP APIs.",
     );
     expect(ads0005?.status).toBe("Approved");
-    expect(ads0005?.updated).toBe("2026-11-27");
+    expect(ads0005?.updated).toBe("2026-11-28");
     expect(ads0005?.rules).toEqual([
       {
         id: "photon-ads/ads-0005-addressable-resource-read",
@@ -302,6 +302,12 @@ describe("docs-reference export", () => {
         summary:
           "Static URL path segments (excluding path parameters and leading version prefixes) must use lowercase kebab-case.",
       },
+      {
+        id: "photon-ads/ads-0005-patch-merge-semantics",
+        severity: "error",
+        summary:
+          "PATCH operations must use RFC 7396 JSON Merge Patch over JSON without RFC 6902 patch arrays, field/update mask parameters or properties, top-level required properties (outside explicit union discriminators), or open undeclared properties.",
+      },
     ]);
     expect(ads0005?.body).not.toMatch(/^---/);
     expect(ads0005?.body).not.toMatch(/^#\s+/);
@@ -314,6 +320,8 @@ describe("docs-reference export", () => {
       "#### Protocol-mandated browser callbacks (`GET .../callback`)",
     );
     expect(ads0005?.body).toContain("RFC 6749 Section 4.1.2");
+    expect(ads0005?.body).toContain("### 6. Partial updates (`PATCH`)");
+    expect(ads0005?.body).toContain("JSON Merge Patch (RFC 7396)");
     expect(ads0005?.body).toContain('"nextPageToken": "eyJjIjoiMjAyNi0xMS0yNiJ9"');
     expect(ads0005?.body).not.toContain('"nextPageToken": null');
     expect(ads0005?.body).not.toMatch(/^##\s+(?:Deterministic\s+)?Lint\s+Rules\b/im);

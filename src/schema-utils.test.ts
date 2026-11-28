@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   extractOperationJsonResponseSchemas,
+  extractRequestBodyMediaSchemas,
   hasHeaderCaseInsensitive,
   inspectResponseContent,
   resolveOperationParameters,
@@ -12,13 +13,16 @@ import {
   computeMinLength,
   computeTypeConstraint,
   extractComponentSchemaName,
+  formatTypeSummary,
   intersectTypeSets,
   isNonNullIntegerConstraint,
   isNonNullObjectConstraint,
   isNonNullStringConstraint,
   isSchemaDeprecated,
+  isSchemaReadOnly,
   isStrictlyNullConstraint,
   isTrackedPropertyDeprecated,
+  isTrackedPropertyReadOnly,
   jsonTypeOfValue,
   mergeTrackedProperty,
   type ResolverFn,
@@ -628,5 +632,79 @@ describe("shared schema and OpenAPI utilities", () => {
         resolve,
       ),
     ).toBe(true);
+  });
+
+  it("evaluates formatTypeSummary, readOnly annotations, variant flags, and requestBody media schemas", () => {
+    expect(formatTypeSummary(new Set(["string", "null"]))).toBe("string|null");
+    expect(formatTypeSummary(new Set())).toBe("never");
+
+    const readOnlyTarget = { type: "string", readOnly: true };
+    const resolve = makeResolver({
+      "#/components/schemas/ReadOnlyId": {
+        node: readOnlyTarget,
+        pointer: "#/components/schemas/ReadOnlyId",
+      },
+      "#/components/requestBodies/PatchBody": {
+        node: {
+          content: {
+            "application/merge-patch+json": {
+              schema: {
+                type: "object",
+                additionalProperties: false,
+                properties: { name: { type: "string" } },
+              },
+            },
+            "text/plain": { schema: { type: "string" } },
+          },
+        },
+        pointer: "#/components/requestBodies/PatchBody",
+      },
+    });
+
+    expect(isSchemaReadOnly({ $ref: "#/components/schemas/ReadOnlyId" }, resolve)).toBe(true);
+    expect(
+      isSchemaReadOnly({ $ref: "#/components/schemas/ReadOnlyId", readOnly: false }, resolve),
+    ).toBe(false);
+    expect(
+      isTrackedPropertyReadOnly(
+        {
+          name: "id",
+          fragments: [
+            { node: { type: "string" } },
+            { node: { $ref: "#/components/schemas/ReadOnlyId" } },
+          ],
+        },
+        resolve,
+      ),
+    ).toBe(true);
+
+    const media = extractRequestBodyMediaSchemas(
+      { requestBody: { $ref: "#/components/requestBodies/PatchBody" } },
+      makeLocation("#/paths/~1v1~1projects~1{projectId}/patch"),
+      resolve,
+    );
+    expect(media).toHaveLength(2);
+    expect(media[0]?.mediaType).toBe("application/merge-patch+json");
+    expect(media[0]?.isJson).toBe(true);
+    expect(media[0]?.requestBodyFromRef).toBe(true);
+    expect(media[1]?.isJson).toBe(false);
+
+    const variants = collectFlattenedObjectVariants(
+      {
+        oneOf: [
+          {
+            type: "object",
+            additionalProperties: false,
+            required: ["kind"],
+            properties: { kind: { type: "string", const: "a" } },
+          },
+        ],
+        discriminator: { propertyName: "kind" },
+      },
+      resolve,
+    ).variants;
+    expect(variants).toHaveLength(1);
+    expect(variants[0]?.forbidsAdditionalProperties).toBe(true);
+    expect([...(variants[0]?.discriminatorProperties ?? [])]).toEqual(["kind"]);
   });
 });
